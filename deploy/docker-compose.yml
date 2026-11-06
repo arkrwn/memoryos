@@ -1,12 +1,14 @@
-# Start with: docker compose -f deploy/docker-compose.yml up -d --build
-# Setup, upgrades, backups and incidents are in docs/runbook.md.
+# `memoryos setup` runs this file for you, from a copy under your config directory.
+# By hand: docker compose -f deploy/docker-compose.yml up -d --build
+# Upgrades, backups and incidents are in docs/runbook.md.
 
 name: memoryos
 
 x-image: &image
   image: ${MEMORYOS_IMAGE:-memoryos:local}
   build:
-    context: ..
+    # `memoryos setup` points this at the checkout, because its copy of this file is elsewhere.
+    context: ${MEMORYOS_BUILD_CONTEXT:-..}
     dockerfile: Dockerfile
 
 # `:?` stops Compose with this message when the password is unset. No password lives in this file.
@@ -44,7 +46,8 @@ services:
       POSTGRES_DB: memoryos
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env, see deploy/.env.example}
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      # A named volume by default. `memoryos setup` sets a directory under your config directory.
+      - ${MEMORYOS_PGDATA:-pgdata}:/var/lib/postgresql/data
     stop_grace_period: 60s
     healthcheck:
       test: [CMD-SHELL, pg_isready -U memoryos -d memoryos]
@@ -66,13 +69,12 @@ services:
     healthcheck:
       disable: true
 
-  # Host mode: no LLM key. The host's own model extracts facts and sends them to /v1/commits.
+  # No LLM key. The agent's own model extracts facts and sends them to /v1/commits.
   memoryos:
     <<: *server
     command: [serve]
-    environment: &server-environment
+    environment:
       DATABASE_URL: *database-url
-      MEMORYOS_MODE: host
       # Spelled out because an empty RUST_LOG would silence everything below errors.
       RUST_LOG: ${RUST_LOG:-info,opentelemetry=warn,opentelemetry_sdk=warn,hyper=warn}
       MEMORYOS_RATE_LIMIT_RPS: ${MEMORYOS_RATE_LIMIT_RPS:-}
@@ -88,45 +90,6 @@ services:
       retries: 3
       start_period: 15m
       start_interval: 5s
-
-  # Worker mode instead of host mode: `docker compose up -d memoryos-worker`. The server and the
-  # job worker run in one process, and it needs provider keys from .env. Do not run this next to
-  # `memoryos` on one database: their embedding models differ, and they publish the same port.
-  memoryos-worker:
-    <<: *server
-    profiles: [worker]
-    command: [serve]
-    environment: &worker-environment
-      <<: *server-environment
-      MEMORYOS_MODE: worker
-      MEMORYOS_EMBEDDER: ${MEMORYOS_WORKER_EMBEDDER:-openai}
-      MEMORYOS_LLM_PROVIDER: ${MEMORYOS_LLM_PROVIDER:-}
-      MEMORYOS_LLM_MODEL: ${MEMORYOS_LLM_MODEL:-}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
-      MEMORYOS_EMBEDDING_MODEL: ${MEMORYOS_EMBEDDING_MODEL:-}
-      MEMORYOS_WORKER_CONCURRENCY: ${MEMORYOS_WORKER_CONCURRENCY:-}
-      MEMORYOS_TURN_TIMEOUT_SECS: ${MEMORYOS_TURN_TIMEOUT_SECS:-}
-    healthcheck:
-      test: [CMD, /usr/local/bin/memoryos-healthcheck]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 60s
-      start_interval: 5s
-
-  # Extra job capacity for worker mode: `docker compose up -d memoryos-worker memoryos-job-worker`.
-  # It serves no HTTP, so it has no healthcheck, no published port and no /metrics.
-  memoryos-job-worker:
-    <<: *server
-    profiles: [worker]
-    command: [worker]
-    environment: *worker-environment
-    ports: []
-    healthcheck:
-      disable: true
 
 volumes:
   pgdata:
