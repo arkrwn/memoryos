@@ -9,6 +9,7 @@ use memoryos_core::{
     Result, Scope, Trust,
 };
 use serde_json::{json, Value};
+use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
@@ -326,6 +327,17 @@ fn surviving_successor(exits: &HashMap<Uuid, ChainExit>, start: Option<Uuid>) ->
     current
 }
 
+/// Where approval of a fact pending on `id` should now point, once `id` has left the chain: a
+/// survivor that followed it, or else the predecessor that was reopened. `None` when neither exists.
+fn chain_target(
+    exits: &HashMap<Uuid, ChainExit>,
+    reopened: &HashMap<Uuid, Uuid>,
+    id: Uuid,
+) -> Option<Uuid> {
+    let start = exits.get(&id).and_then(|exit| exit.superseded_by);
+    surviving_successor(exits, start).or_else(|| reopened.get(&id).copied())
+}
+
 /// What a purge did, including the part `PurgeReport` has no field for.
 pub(crate) struct PurgeOutcome {
     pub(crate) report: PurgeReport,
@@ -345,8 +357,9 @@ fn highest_trust(trusts: Vec<String>) -> Result<Option<Trust>> {
 }
 
 /// Deletes one episode and what only it supports. Facts that keep other sources take the highest
-/// trust among them, so a poisoned fact cannot stay active on the trust of the source that was
-/// purged. The caller holds the episode row lock.
+/// trust among them, capped at their current trust, so a poisoned fact cannot stay active on the
+/// trust of the source that was purged and no fact gains trust. The caller holds the episode row
+/// lock.
 pub(crate) async fn purge_episode(conn: &mut PgConnection, id: Uuid) -> Result<PurgeOutcome> {
     // Lock before deciding: a concurrent corroboration holds these rows until it commits, and the
     // next statement then sees the source it added.
@@ -360,7 +373,7 @@ pub(crate) async fn purge_episode(conn: &mut PgConnection, id: Uuid) -> Result<P
     .map_err(db)?;
 
     let rows = sqlx::query(
-        "SELECT f.id, f.scope, f.status, f.valid_from, f.valid_to, f.superseded_by, f.subject_id, \
+        "SELECT f.id, f.scope, f.status, f.trust, f.valid_from, f.valid_to, f.superseded_by, f.subject_id, \
              f.object_id, ARRAY(SELECT e.trust FROM fact_sources o \
                  JOIN episodes e ON e.id = o.episode_id \
                  WHERE o.fact_id = f.id AND o.episode_id <> $1) AS remaining_trusts \
@@ -375,7 +388,8 @@ pub(crate) async fn purge_episode(conn: &mut PgConnection, id: Uuid) -> Result<P
     let mut exits: HashMap<Uuid, ChainExit> = HashMap::new();
     let mut doomed_ids = Vec::new();
     let mut requarantined = Vec::new();
-    let mut retrusted = Vec::new();
+    let mut retrusted = HashMap::new();
+    let mut lowered = HashMap::new();
     let mut touched_entities = BTreeSet::new();
     for row in &rows {
         let fact_id: Uuid = row.try_get("id").map_err(db)?;
@@ -384,7 +398,7 @@ pub(crate) async fn purge_episode(conn: &mut PgConnection, id: Uuid) -> Result<P
             valid_to: row.try_get("valid_to").map_err(db)?,
             superseded_by: row.try_get("superseded_by").map_err(db)?,
         };
-        let Some(trust) = highest_trust(row.try_get("remaining_trusts").map_err(db)?)? else {
+        let Some(highest) = highest_trust(row.try_get("remaining_trusts").map_err(db)?)? else {
             touched_entities.insert(row.try_get::<Uuid, _>("subject_id").map_err(db)?);
             if let Some(object_id) = row.try_get::<Option<Uuid>, _>("object_id").map_err(db)? {
                 touched_entities.insert(object_id);
@@ -393,21 +407,68 @@ pub(crate) async fn purge_episode(conn: &mut PgConnection, id: Uuid) -> Result<P
             exits.insert(fact_id, exit);
             continue;
         };
+        let current: Trust = row
+            .try_get::<String, _>("trust")
+            .map_err(db)?
+            .parse()
+            .map_err(|_| Error::Storage("fact has an invalid trust".into()))?;
+        let trust = highest.min(current);
         let scope: Scope = row
             .try_get::<String, _>("scope")
             .map_err(db)?
             .parse()
             .map_err(|_| Error::Storage("fact has an invalid scope".into()))?;
         let status: String = row.try_get("status").map_err(db)?;
-        if status == FactStatus::Active.as_str() && source_requires_quarantine(&scope, trust) {
+        let active = status == FactStatus::Active.as_str();
+        if active && source_requires_quarantine(&scope, trust) {
             requarantined.push((fact_id, trust));
             exits.insert(fact_id, exit);
         } else {
-            retrusted.push((fact_id, trust));
+            if active && trust < current {
+                lowered.insert(fact_id, exit);
+            }
+            retrusted.insert(fact_id, trust);
+        }
+    }
+
+    // Contradiction rule: a fact whose trust fell may have closed a fact it could not close today.
+    // Each one leaving changes what the others closed, so repeat until nothing moves.
+    let closed = closed_facts(conn, &rows).await?;
+    loop {
+        let outranked: Vec<Uuid> = lowered
+            .keys()
+            .copied()
+            .filter(|id| closes_higher_trust(&closed, &exits, &retrusted, *id))
+            .collect();
+        if outranked.is_empty() {
+            break;
+        }
+        for fact_id in outranked {
+            if let (Some(trust), Some(exit)) =
+                (retrusted.remove(&fact_id), lowered.remove(&fact_id))
+            {
+                requarantined.push((fact_id, trust));
+                exits.insert(fact_id, exit);
+            }
         }
     }
 
     let reopened = restore_predecessors(conn, &exits).await?;
+
+    // Links to a fact being deleted would otherwise go NULL, and approval would then close nothing
+    // and leave two current facts. With no target, the foreign key clears a deleted fact's links.
+    for exit_id in exits.keys() {
+        if let Some(target) = chain_target(&exits, &reopened, *exit_id) {
+            sqlx::query(
+                "UPDATE facts SET pending_supersede_of = $2 WHERE pending_supersede_of = $1",
+            )
+            .bind(exit_id)
+            .bind(target)
+            .execute(&mut *conn)
+            .await
+            .map_err(db)?;
+        }
+    }
 
     for (fact_id, trust) in &retrusted {
         sqlx::query("UPDATE facts SET trust = $2 WHERE id = $1")
@@ -420,8 +481,7 @@ pub(crate) async fn purge_episode(conn: &mut PgConnection, id: Uuid) -> Result<P
     for (fact_id, trust) in &requarantined {
         // Approval puts it back where it was: behind a survivor that followed it, or else closing
         // the predecessor that was just reopened.
-        let start = exits.get(fact_id).and_then(|exit| exit.superseded_by);
-        let pending = surviving_successor(&exits, start).or_else(|| reopened.get(fact_id).copied());
+        let pending = chain_target(&exits, &reopened, *fact_id);
         sqlx::query(
             "UPDATE facts SET status = 'quarantined', trust = $2, pending_supersede_of = $3, \
                  valid_to = CASE WHEN superseded_by IS NULL THEN valid_to END, \
@@ -458,6 +518,73 @@ pub(crate) async fn purge_episode(conn: &mut PgConnection, id: Uuid) -> Result<P
         },
         facts_requarantined: requarantined.len() as u64,
     })
+}
+
+/// A fact whose `superseded_by` is the key it is stored under in `closed_facts`.
+struct ClosedFact {
+    id: Uuid,
+    trust: Trust,
+    /// Active and not retracted, so reopening it would make it current again.
+    live: bool,
+}
+
+/// The facts closed by any fact in `rows`, grouped by the fact that closed them.
+async fn closed_facts(
+    conn: &mut PgConnection,
+    rows: &[PgRow],
+) -> Result<HashMap<Uuid, Vec<ClosedFact>>> {
+    let ids = rows
+        .iter()
+        .map(|row| row.try_get("id").map_err(db))
+        .collect::<Result<Vec<Uuid>>>()?;
+    let found = sqlx::query(
+        "SELECT id, trust, superseded_by, status = 'active' AND invalidated_at IS NULL AS live \
+         FROM facts WHERE superseded_by = ANY($1)",
+    )
+    .bind(&ids)
+    .fetch_all(conn)
+    .await
+    .map_err(db)?;
+    let mut closed: HashMap<Uuid, Vec<ClosedFact>> = HashMap::new();
+    for row in &found {
+        closed
+            .entry(row.try_get("superseded_by").map_err(db)?)
+            .or_default()
+            .push(ClosedFact {
+                id: row.try_get("id").map_err(db)?,
+                trust: row
+                    .try_get::<String, _>("trust")
+                    .map_err(db)?
+                    .parse()
+                    .map_err(|_| Error::Storage("fact has an invalid trust".into()))?,
+                live: row.try_get("live").map_err(db)?,
+            });
+    }
+    Ok(closed)
+}
+
+/// Whether `id` closed a live fact of higher trust, looking through facts leaving the chain, whose
+/// predecessors it takes over. `retrusted` holds the trust each staying fact has after this purge.
+fn closes_higher_trust(
+    closed: &HashMap<Uuid, Vec<ClosedFact>>,
+    exits: &HashMap<Uuid, ChainExit>,
+    retrusted: &HashMap<Uuid, Trust>,
+    id: Uuid,
+) -> bool {
+    let Some(&trust) = retrusted.get(&id) else {
+        return false;
+    };
+    let mut stack = vec![id];
+    while let Some(closer) = stack.pop() {
+        for fact in closed.get(&closer).into_iter().flatten() {
+            if exits.contains_key(&fact.id) {
+                stack.push(fact.id);
+            } else if fact.live && retrusted.get(&fact.id).copied().unwrap_or(fact.trust) > trust {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// A fact leaving the chain must not leave its effects behind: a fact it closed takes over its end
