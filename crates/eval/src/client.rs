@@ -13,17 +13,16 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
-const MAX_REQUEST_SECS: u64 = 30;
+use crate::dataset::{EntityRef, FactSpec};
+
 const MAX_RATE_LIMIT_RETRIES: u32 = 8;
-const POLL_START: Duration = Duration::from_millis(250);
-const POLL_MAX: Duration = Duration::from_secs(2);
+const BACKOFF_START: Duration = Duration::from_millis(250);
+const BACKOFF_MAX: Duration = Duration::from_secs(2);
 const QUARANTINE_PAGE: &str = "200";
 
 /// A case that could not reach a verdict. Never counted as a pass.
 #[derive(Debug, Error)]
 pub enum CaseError {
-    #[error("timeout: episode {episode} not processed after {secs}s")]
-    NotProcessed { episode: Uuid, secs: u64 },
     #[error("http: {method} {path} returned {status}: {body}")]
     Status {
         method: String,
@@ -43,6 +42,9 @@ pub enum CaseError {
         path: String,
         detail: String,
     },
+    /// A failure from an earlier phase of the suite, carried over as text.
+    #[error("{0}")]
+    Earlier(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,30 +56,49 @@ pub enum Trust {
     System,
 }
 
+/// One request fact. The field names follow `CommitRequest` in `docs/openapi.yaml`.
 #[derive(Debug, Serialize)]
-pub struct NewEpisode<'a> {
+pub struct CommitFact<'a> {
+    pub statement: &'a str,
+    pub subject: &'a EntityRef,
+    pub predicate: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<Uuid>,
+}
+
+impl<'a> CommitFact<'a> {
+    pub fn new(spec: &'a FactSpec, supersedes: Option<Uuid>) -> Self {
+        Self {
+            statement: &spec.statement,
+            subject: &spec.subject,
+            predicate: &spec.predicate,
+            valid_from: spec.valid_from,
+            supersedes,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct CommitRequest<'a> {
     pub scope: &'a str,
     pub source: &'a str,
-    pub trust: Trust,
     pub content: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub occurred_at: Option<DateTime<Utc>>,
-    pub metadata: Value,
     pub idempotency_key: String,
+    pub facts: Vec<CommitFact<'a>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct Episode {
+pub struct CommittedFact {
     pub id: Uuid,
-    pub scope: String,
-    pub source: String,
-    pub trust: Trust,
-    pub content: String,
-    pub metadata: Value,
-    pub occurred_at: DateTime<Utc>,
-    pub created_at: DateTime<Utc>,
-    #[serde(default)]
-    pub processed_at: Option<DateTime<Utc>>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CommitResponse {
+    pub episode_id: Uuid,
+    pub facts: Vec<CommittedFact>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -90,7 +111,13 @@ pub struct Fact {
     pub trust: Trust,
     pub status: String,
     pub valid_from: DateTime<Utc>,
+    #[serde(default)]
+    pub valid_to: Option<DateTime<Utc>>,
     pub recorded_at: DateTime<Utc>,
+    #[serde(default)]
+    pub superseded_by: Option<Uuid>,
+    #[serde(default)]
+    pub pending_supersede_of: Option<Uuid>,
     pub source_episode_ids: Vec<Uuid>,
 }
 
@@ -100,16 +127,10 @@ pub struct ScoredFact {
     pub score: f64,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ScoredEpisode {
-    pub episode: Episode,
-    pub score: f64,
-}
-
+/// The body of both `POST /v1/recall` and `POST /v1/candidates`.
 #[derive(Debug, Deserialize)]
 pub struct RecallResponse {
     pub facts: Vec<ScoredFact>,
-    pub pending_episodes: Vec<ScoredEpisode>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -133,79 +154,94 @@ struct RecallBody<'a> {
     as_of: Option<DateTime<Utc>>,
 }
 
+#[derive(Serialize)]
+struct CandidatesBody<'a> {
+    scopes: [&'a str; 1],
+    statement: &'a str,
+    limit: u32,
+}
+
+/// The three keys the suites need. Commit trust comes from the key, never from the request.
+pub struct ApiKeys {
+    /// `max_trust` of `agent`: the host. Its commits have trust `agent`.
+    pub agent: String,
+    /// `max_trust` of `external`: its commits have trust `external`.
+    pub external: String,
+    /// `is_admin`: quarantine listing, approval and purge.
+    pub admin: String,
+}
+
 pub struct Client {
     http: reqwest::Client,
     base_url: String,
-    api_key: String,
-    admin_api_key: String,
-    processing_timeout: Duration,
+    keys: ApiKeys,
 }
 
 impl Client {
-    pub fn new(
-        base_url: &str,
-        api_key: &str,
-        admin_api_key: &str,
-        timeout_secs: u64,
-    ) -> Result<Self, reqwest::Error> {
+    pub fn new(base_url: &str, keys: ApiKeys, timeout_secs: u64) -> Result<Self, reqwest::Error> {
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(timeout_secs.min(MAX_REQUEST_SECS)))
+            .timeout(Duration::from_secs(timeout_secs))
             .build()?;
         Ok(Self {
             http,
             base_url: base_url.trim_end_matches('/').to_owned(),
-            api_key: api_key.to_owned(),
-            admin_api_key: admin_api_key.to_owned(),
-            processing_timeout: Duration::from_secs(timeout_secs),
+            keys,
         })
     }
 
-    pub async fn post_episode(&self, episode: &NewEpisode<'_>) -> Result<Episode, CaseError> {
-        let body = to_body(episode);
-        let (status, text) = self
-            .send(
-                &self.api_key,
-                Method::POST,
-                "/v1/episodes",
-                &[],
-                Some(&body),
-            )
-            .await?;
-        decode(
-            Method::POST,
-            "/v1/episodes",
-            StatusCode::ACCEPTED,
-            status,
-            text,
-        )
-    }
-
-    pub async fn get_episode(&self, id: Uuid) -> Result<Episode, CaseError> {
-        let path = format!("/v1/episodes/{id}");
-        let (status, text) = self
-            .send(&self.api_key, Method::GET, &path, &[], None)
-            .await?;
-        decode(Method::GET, &path, StatusCode::OK, status, text)
-    }
-
-    /// Polls until `processed_at` is set. Running out of time is an error, never a result.
-    pub async fn wait_processed(&self, id: Uuid) -> Result<Episode, CaseError> {
-        let deadline = tokio::time::Instant::now() + self.processing_timeout;
-        let mut delay = POLL_START;
-        loop {
-            let episode = self.get_episode(id).await?;
-            if episode.processed_at.is_some() {
-                return Ok(episode);
-            }
-            if tokio::time::Instant::now() + delay >= deadline {
-                return Err(CaseError::NotProcessed {
-                    episode: id,
-                    secs: self.processing_timeout.as_secs(),
-                });
-            }
-            tokio::time::sleep(delay).await;
-            delay = (delay * 2).min(POLL_MAX);
+    /// The key whose commits carry `trust`. Only `external` is lower than the host's `agent`.
+    fn key_for(&self, trust: Trust) -> &str {
+        if trust == Trust::External {
+            &self.keys.external
+        } else {
+            &self.keys.agent
         }
+    }
+
+    /// Commits as the key for `trust`. A response without one entry per request fact breaks the
+    /// contract, so it is an error here and callers can rely on the lengths matching.
+    pub async fn commit(
+        &self,
+        trust: Trust,
+        request: &CommitRequest<'_>,
+    ) -> Result<CommitResponse, CaseError> {
+        let path = "/v1/commits";
+        let body = to_body(request);
+        let (status, text) = self
+            .send(self.key_for(trust), Method::POST, path, &[], Some(&body))
+            .await?;
+        let response: CommitResponse = decode(Method::POST, path, StatusCode::OK, status, text)?;
+        if response.facts.len() != request.facts.len() {
+            return Err(CaseError::Decode {
+                method: Method::POST.to_string(),
+                path: path.to_owned(),
+                detail: format!(
+                    "{} facts for a request of {}",
+                    response.facts.len(),
+                    request.facts.len()
+                ),
+            });
+        }
+        Ok(response)
+    }
+
+    pub async fn candidates(
+        &self,
+        trust: Trust,
+        scope: &str,
+        statement: &str,
+        limit: u32,
+    ) -> Result<RecallResponse, CaseError> {
+        let path = "/v1/candidates";
+        let body = to_body(&CandidatesBody {
+            scopes: [scope],
+            statement,
+            limit,
+        });
+        let (status, text) = self
+            .send(self.key_for(trust), Method::POST, path, &[], Some(&body))
+            .await?;
+        decode(Method::POST, path, StatusCode::OK, status, text)
     }
 
     pub async fn recall(
@@ -222,7 +258,13 @@ impl Client {
             as_of,
         });
         let (status, text) = self
-            .send(&self.api_key, Method::POST, "/v1/recall", &[], Some(&body))
+            .send(
+                &self.keys.agent,
+                Method::POST,
+                "/v1/recall",
+                &[],
+                Some(&body),
+            )
             .await?;
         decode(Method::POST, "/v1/recall", StatusCode::OK, status, text)
     }
@@ -231,18 +273,34 @@ impl Client {
         let path = "/v1/quarantine";
         let query = [("scopes", scope), ("limit", QUARANTINE_PAGE)];
         let (status, text) = self
-            .send(&self.admin_api_key, Method::GET, path, &query, None)
+            .send(&self.keys.admin, Method::GET, path, &query, None)
             .await?;
         let list: FactList = decode(Method::GET, path, StatusCode::OK, status, text)?;
         Ok(list.facts)
     }
 
+    pub async fn approve(&self, id: Uuid) -> Result<Fact, CaseError> {
+        let path = format!("/v1/quarantine/{id}/approve");
+        let (status, text) = self
+            .send(&self.keys.admin, Method::POST, &path, &[], None)
+            .await?;
+        decode(Method::POST, &path, StatusCode::OK, status, text)
+    }
+
     pub async fn purge_episode(&self, id: Uuid) -> Result<PurgeReport, CaseError> {
         let path = format!("/v1/episodes/{id}/purge");
         let (status, text) = self
-            .send(&self.admin_api_key, Method::POST, &path, &[], None)
+            .send(&self.keys.admin, Method::POST, &path, &[], None)
             .await?;
         decode(Method::POST, &path, StatusCode::OK, status, text)
+    }
+
+    pub async fn get_fact(&self, id: Uuid) -> Result<Fact, CaseError> {
+        let path = format!("/v1/facts/{id}");
+        let (status, text) = self
+            .send(&self.keys.agent, Method::GET, &path, &[], None)
+            .await?;
+        decode(Method::GET, &path, StatusCode::OK, status, text)
     }
 
     pub async fn episode_exists(&self, id: Uuid) -> Result<bool, CaseError> {
@@ -255,7 +313,7 @@ impl Client {
 
     async fn exists(&self, path: &str) -> Result<bool, CaseError> {
         let (status, text) = self
-            .send(&self.api_key, Method::GET, path, &[], None)
+            .send(&self.keys.agent, Method::GET, path, &[], None)
             .await?;
         match status {
             StatusCode::OK => Ok(true),
@@ -275,7 +333,7 @@ impl Client {
         body: Option<&Value>,
     ) -> Result<(StatusCode, String), CaseError> {
         let url = format!("{}{path}", self.base_url);
-        let mut delay = POLL_START;
+        let mut delay = BACKOFF_START;
         let mut retries = 0;
         loop {
             let mut request = self
@@ -297,7 +355,7 @@ impl Client {
             if status == StatusCode::TOO_MANY_REQUESTS && retries < MAX_RATE_LIMIT_RETRIES {
                 retries += 1;
                 tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(POLL_MAX);
+                delay = (delay * 2).min(BACKOFF_MAX);
                 continue;
             }
             return Ok((status, text));

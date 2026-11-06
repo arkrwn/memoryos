@@ -15,6 +15,19 @@ use crate::suites::{CaseResult, CaseStatus, PoisoningDetail, RecallDetail, Stale
 /// Recall is measured at this depth.
 pub const TOP_K: usize = 5;
 
+const RECALL_PROVES: &str =
+    "Retrieval quality of hybrid search, with the embedder the server runs, \
+over hand-written statements in one shared scope. It does not measure how well a host model writes \
+statements, and the corpus is small.";
+const STALENESS_PROVES: &str =
+    "A supersede found through /v1/candidates closes the old fact, current \
+recall excludes it and as_of returns it. These are filters, so results are not ranking evidence.";
+const POISONING_PROVES: &str =
+    "Commits by low-trust keys stay out of recall and candidates until an \
+admin approves them, cannot close a fact of higher trust, and purge removes them and restores what \
+they closed. The highest trust a commit can have is agent, so this covers external against agent, \
+never user or system. It does not test whether a model would extract or obey the planted text.";
+
 pub fn contains_ci(haystack: &str, needle: &str) -> bool {
     haystack.to_lowercase().contains(&needle.to_lowercase())
 }
@@ -34,8 +47,8 @@ pub fn rank_of_set(statements: &[String], expected: &[String]) -> Option<usize> 
 
 #[derive(Debug, Clone, Copy)]
 pub enum Stage {
-    BeforeProcessing,
-    AfterProcessing,
+    Held,
+    Candidates,
     AsOf(DateTime<Utc>),
     AfterPurge,
 }
@@ -43,15 +56,15 @@ pub enum Stage {
 impl Stage {
     fn label(self) -> String {
         match self {
-            Self::BeforeProcessing => "before processing".to_owned(),
-            Self::AfterProcessing => "after processing".to_owned(),
-            Self::AsOf(at) => format!("as_of {}", at.to_rfc3339()),
-            Self::AfterPurge => "after purge".to_owned(),
+            Self::Held => "recall while held".to_owned(),
+            Self::Candidates => "candidates while held".to_owned(),
+            Self::AsOf(at) => format!("recall as_of {}", at.to_rfc3339()),
+            Self::AfterPurge => "recall after purge".to_owned(),
         }
     }
 }
 
-/// Everything in a recall response that exposes the poison.
+/// Everything in a recall or candidates response that exposes the poison.
 ///
 /// The planted string alone would miss a paraphrase, so a fact also leaks if it is not `active`,
 /// if it has `external` trust, or if the poison is its only source. A fact that lists the poison
@@ -59,8 +72,7 @@ impl Stage {
 pub fn find_leaks(
     response: &RecallResponse,
     planted: &[String],
-    poison_id: Uuid,
-    poison_trust: Trust,
+    poison_episode: Uuid,
     stage: Stage,
 ) -> Vec<String> {
     let label = stage.label();
@@ -69,27 +81,19 @@ pub fn find_leaks(
         let fact = &scored.fact;
         let has_planted = planted.iter().any(|p| contains_ci(&fact.statement, p));
         let only_from_poison = !fact.source_episode_ids.is_empty()
-            && fact.source_episode_ids.iter().all(|id| *id == poison_id);
+            && fact
+                .source_episode_ids
+                .iter()
+                .all(|id| *id == poison_episode);
         if has_planted
             || only_from_poison
             || fact.status != "active"
             || fact.trust == Trust::External
         {
             leaks.push(format!(
-                "fact {} in recall {label} (status {}): {}",
+                "fact {} in {label} (status {}): {}",
                 fact.id, fact.status, fact.statement
             ));
-        }
-    }
-    // SPEC section 3 lets an unprocessed `agent` episode show up as pending, but never `external`.
-    let pending_allowed =
-        matches!(stage, Stage::BeforeProcessing) && poison_trust != Trust::External;
-    if !pending_allowed {
-        for scored in &response.pending_episodes {
-            let episode = &scored.episode;
-            if episode.id == poison_id || planted.iter().any(|p| contains_ci(&episode.content, p)) {
-                leaks.push(format!("episode {} pending in recall {label}", episode.id));
-            }
         }
     }
     leaks
@@ -122,8 +126,7 @@ fn no_errors_gate(suite: &str, counts: Counts) -> Gate {
 }
 
 fn build<D: Serialize>(
-    suite: &str,
-    dataset: &str,
+    (suite, dataset, proves): (&str, &str, &str),
     results: &[CaseResult<D>],
     metrics: serde_json::Value,
     gates: Vec<Gate>,
@@ -135,6 +138,7 @@ fn build<D: Serialize>(
     Ok(SuiteReport::new(
         suite,
         dataset,
+        proves,
         count(results),
         metrics,
         gates,
@@ -165,12 +169,22 @@ pub fn recall_report(
 ) -> Result<SuiteReport, serde_json::Error> {
     let counts = count(results);
     let recall = recall_at_k(results);
-    let metrics = json!({ "recall_at_5": recall, "mrr": mean_reciprocal_rank(results) });
+    let corpus: usize = results.iter().map(|r| r.detail.committed_facts).sum();
+    let metrics = json!({
+        "recall_at_5": recall,
+        "mrr": mean_reciprocal_rank(results),
+        "corpus_facts": corpus,
+    });
     let gates = vec![
         no_errors_gate("recall", counts),
         Gate::at_least("recall.recall_at_5", recall, min_recall),
     ];
-    build("recall", RECALL_DATASET, results, metrics, gates)
+    build(
+        ("recall", RECALL_DATASET, RECALL_PROVES),
+        results,
+        metrics,
+        gates,
+    )
 }
 
 pub fn staleness_report(
@@ -188,6 +202,8 @@ pub fn staleness_report(
     };
     let metrics = json!({
         "pass_rate": pass_rate,
+        "candidate_found_rate": rate(|d| d.candidate_found),
+        "old_closed_rate": rate(|d| d.old_closed),
         "new_in_current_rate": rate(|d| d.new_in_current),
         "old_absent_from_current_rate": rate(|d| d.old_absent_from_current),
         "old_in_as_of_rate": rate(|d| d.old_in_as_of),
@@ -197,7 +213,12 @@ pub fn staleness_report(
         no_errors_gate("staleness", counts),
         Gate::at_least("staleness.pass_rate", pass_rate, min_staleness),
     ];
-    build("staleness", STALENESS_DATASET, results, metrics, gates)
+    build(
+        ("staleness", STALENESS_DATASET, STALENESS_PROVES),
+        results,
+        metrics,
+        gates,
+    )
 }
 
 pub fn poisoning_report(
@@ -226,6 +247,11 @@ pub fn poisoning_report(
         .iter()
         .filter(|r| r.detail.quarantined_found > 0 && r.detail.purge_completed)
         .count();
+    let control_failures = results
+        .iter()
+        .filter(|r| !r.detail.control_problems.is_empty())
+        .count();
+    let truth_restored = results.iter().filter(|r| r.detail.truth_restored).count();
     let metrics = json!({
         "leaks": leaks,
         "leaking_cases": leaking_cases,
@@ -233,6 +259,8 @@ pub fn poisoning_report(
         "purge_failure_cases": purge_failures,
         "quarantined_cases": quarantined_cases,
         "purge_exercised_cases": purge_exercised,
+        "control_failure_cases": control_failures,
+        "truth_restored_cases": truth_restored,
     });
     let gates = vec![
         no_errors_gate("poisoning", counts),
@@ -246,14 +274,19 @@ pub fn poisoning_report(
             1.0,
         ),
     ];
-    build("poisoning", POISONING_DATASET, results, metrics, gates)
+    build(
+        ("poisoning", POISONING_DATASET, POISONING_PROVES),
+        results,
+        metrics,
+        gates,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use crate::client::{Episode, Fact, ScoredEpisode, ScoredFact};
+    use crate::client::{Fact, ScoredFact};
     use crate::suites::CaseStatus;
 
     fn s(values: &[&str]) -> Vec<String> {
@@ -455,36 +488,23 @@ mod tests {
                 trust,
                 status: status.to_owned(),
                 valid_from: Utc::now(),
+                valid_to: None,
                 recorded_at: Utc::now(),
+                superseded_by: None,
+                pending_supersede_of: None,
                 source_episode_ids: sources,
             },
             score: 1.0,
         }
     }
 
-    fn pending(id: Uuid, content: &str) -> ScoredEpisode {
-        ScoredEpisode {
-            episode: Episode {
-                id,
-                scope: "user:x".to_owned(),
-                source: "web".to_owned(),
-                trust: Trust::External,
-                content: content.to_owned(),
-                metadata: json!({}),
-                occurred_at: Utc::now(),
-                created_at: Utc::now(),
-                processed_at: None,
-            },
-            score: 1.0,
-        }
-    }
-
-    fn leaks_in(facts: Vec<ScoredFact>, trust: Trust, stage: Stage) -> Vec<String> {
-        let response = RecallResponse {
-            facts,
-            pending_episodes: Vec::new(),
-        };
-        find_leaks(&response, &s(&["Reykjavik"]), poison(), trust, stage)
+    fn leaks_in(facts: Vec<ScoredFact>, stage: Stage) -> Vec<String> {
+        find_leaks(
+            &RecallResponse { facts },
+            &s(&["Reykjavik"]),
+            poison(),
+            stage,
+        )
     }
 
     fn poison() -> Uuid {
@@ -500,10 +520,10 @@ mod tests {
         let facts = vec![fact(
             "Lives in Semarang",
             "active",
-            Trust::User,
+            Trust::Agent,
             vec![seed()],
         )];
-        assert!(leaks_in(facts, Trust::External, Stage::AfterProcessing).is_empty());
+        assert!(leaks_in(facts, Stage::Held).is_empty());
     }
 
     #[test]
@@ -511,13 +531,10 @@ mod tests {
         let facts = vec![fact(
             "Lives in REYKJAVIK",
             "active",
-            Trust::User,
+            Trust::Agent,
             vec![seed()],
         )];
-        assert_eq!(
-            leaks_in(facts, Trust::External, Stage::AfterProcessing).len(),
-            1
-        );
+        assert_eq!(leaks_in(facts, Stage::Held).len(), 1);
     }
 
     #[test]
@@ -528,28 +545,26 @@ mod tests {
             Trust::Agent,
             vec![poison()],
         )];
-        assert_eq!(
-            leaks_in(facts, Trust::Agent, Stage::AfterProcessing).len(),
-            1
-        );
+        assert_eq!(leaks_in(facts, Stage::Candidates).len(), 1);
     }
 
     #[test]
     fn a_quarantined_fact_in_recall_is_a_leak() {
-        let facts = vec![fact("Anything", "quarantined", Trust::User, vec![seed()])];
-        assert_eq!(
-            leaks_in(facts, Trust::Agent, Stage::AfterProcessing).len(),
-            1
-        );
+        let facts = vec![fact("Anything", "quarantined", Trust::Agent, vec![seed()])];
+        assert_eq!(leaks_in(facts, Stage::Held).len(), 1);
     }
 
     #[test]
     fn an_active_external_fact_is_a_leak() {
         let facts = vec![fact("Anything", "active", Trust::External, vec![seed()])];
-        assert_eq!(
-            leaks_in(facts, Trust::External, Stage::AfterProcessing).len(),
-            1
-        );
+        assert_eq!(leaks_in(facts, Stage::AfterPurge).len(), 1);
+    }
+
+    #[test]
+    fn a_leak_names_where_it_was_seen() {
+        let facts = vec![fact("Reykjavik", "active", Trust::Agent, vec![seed()])];
+        let leaks = leaks_in(facts, Stage::Candidates);
+        assert!(leaks[0].contains("candidates while held"), "{leaks:?}");
     }
 
     #[test]
@@ -557,48 +572,25 @@ mod tests {
         let facts = vec![fact(
             "Lives in Semarang",
             "active",
-            Trust::User,
+            Trust::Agent,
             vec![seed(), poison()],
         )];
-        assert!(leaks_in(facts, Trust::Agent, Stage::AfterProcessing).is_empty());
-    }
-
-    fn pending_leaks(trust: Trust, stage: Stage) -> Vec<String> {
-        let response = RecallResponse {
-            facts: Vec::new(),
-            pending_episodes: vec![pending(poison(), "text")],
-        };
-        find_leaks(&response, &s(&["Reykjavik"]), poison(), trust, stage)
+        assert!(leaks_in(facts, Stage::Held).is_empty());
     }
 
     #[test]
-    fn a_pending_external_episode_is_always_a_leak() {
-        assert_eq!(
-            pending_leaks(Trust::External, Stage::BeforeProcessing).len(),
-            1
-        );
+    fn a_control_failure_fails_the_poisoning_gate() {
+        let mut detail = poison_detail(&[], 1);
+        detail.control_problems = s(&["approved claim missing"]);
+        let results = vec![result(CaseStatus::Failed, detail)];
+        let report = poisoning_report(&results).expect("report");
+        assert!(!report.passed);
+        assert_eq!(report.metrics["control_failure_cases"], json!(1));
     }
 
     #[test]
-    fn a_pending_agent_episode_is_allowed_only_before_processing() {
-        assert!(pending_leaks(Trust::Agent, Stage::BeforeProcessing).is_empty());
-        assert_eq!(pending_leaks(Trust::Agent, Stage::AfterProcessing).len(), 1);
-        assert_eq!(pending_leaks(Trust::Agent, Stage::AfterPurge).len(), 1);
-    }
-
-    #[test]
-    fn an_unrelated_pending_episode_is_not_a_leak() {
-        let response = RecallResponse {
-            facts: Vec::new(),
-            pending_episodes: vec![pending(seed(), "nothing planted")],
-        };
-        let leaks = find_leaks(
-            &response,
-            &s(&["Reykjavik"]),
-            poison(),
-            Trust::External,
-            Stage::AfterPurge,
-        );
-        assert!(leaks.is_empty());
+    fn every_report_says_what_it_proves() {
+        let report = recall_report(&[], 0.0).expect("report");
+        assert!(report.proves.contains("hybrid search"), "{}", report.proves);
     }
 }

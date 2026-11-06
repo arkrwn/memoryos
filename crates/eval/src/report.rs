@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 
-pub const REPORT_SCHEMA_VERSION: u32 = 1;
+pub const REPORT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Gate {
@@ -45,6 +45,8 @@ impl Gate {
 pub struct SuiteReport {
     pub suite: String,
     pub dataset: String,
+    /// What a pass means for this suite, and what it does not establish.
+    pub proves: String,
     pub passed: bool,
     pub total: usize,
     pub cases_passed: usize,
@@ -67,6 +69,7 @@ impl SuiteReport {
     pub fn new(
         suite: &str,
         dataset: &str,
+        proves: &str,
         counts: Counts,
         metrics: Value,
         gates: Vec<Gate>,
@@ -77,6 +80,7 @@ impl SuiteReport {
         Self {
             suite: suite.to_owned(),
             dataset: dataset.to_owned(),
+            proves: proves.to_owned(),
             passed,
             total: counts.total,
             cases_passed: counts.passed,
@@ -195,7 +199,8 @@ mod tests {
     fn suite(gates: Vec<Gate>, total: usize) -> SuiteReport {
         SuiteReport::new(
             "recall",
-            "recall.v1",
+            "recall.v2",
+            "what it proves",
             Counts {
                 total,
                 passed: total,

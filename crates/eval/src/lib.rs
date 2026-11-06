@@ -1,7 +1,8 @@
 //! Black-box evaluation harness for MemoryOS.
 //!
 //! Talks to a running server only through the HTTP contract in `docs/openapi.yaml`, and scores it
-//! against the production gates in `docs/SPEC.md` section 12.
+//! against the production gates in `docs/SPEC.md` section 12. Every fact is a scripted commit, so a
+//! run makes no model call of its own and costs nothing beyond what the server does for itself.
 
 pub mod client;
 pub mod dataset;
@@ -14,7 +15,7 @@ use std::path::PathBuf;
 use chrono::Utc;
 use clap::{Parser, ValueEnum};
 
-use client::Client;
+use client::{ApiKeys, Client};
 use report::{Report, SuiteReport};
 use suites::RunContext;
 
@@ -26,18 +27,21 @@ use suites::RunContext;
 pub struct Args {
     #[arg(long)]
     pub base_url: String,
-    /// Bearer token allowed to use `user:*` scopes with `max_trust` of at least `user`.
+    /// Bearer token of the host: scopes `user:*`, `shared:*`, `agent:*`, `max_trust` of `agent`.
     #[arg(long)]
     pub api_key: String,
-    /// Bearer token with `is_admin`, used for quarantine lookup and purge.
+    /// Bearer token for low-trust commits: the same scopes, `max_trust` of `external`.
+    #[arg(long)]
+    pub external_api_key: String,
+    /// Bearer token with `is_admin` and the same scopes: quarantine lookup, approval and purge.
     #[arg(long)]
     pub admin_api_key: String,
     #[arg(long, value_enum)]
     pub suite: Suite,
     #[arg(long)]
     pub out: PathBuf,
-    /// How long one episode may take to be processed before the case counts as an error.
-    #[arg(long, default_value_t = 180, value_parser = clap::value_parser!(u64).range(1..))]
+    /// How long one HTTP request may take before the case counts as an error.
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
     pub timeout_secs: u64,
     #[arg(long, default_value_t = 0.95, value_parser = parse_ratio)]
     pub min_staleness: f64,
@@ -69,12 +73,12 @@ fn parse_ratio(raw: &str) -> Result<f64, String> {
 /// Runs the selected suites and writes the report. `Report::passed` says whether every gate held.
 pub async fn run(args: &Args) -> Result<Report, Box<dyn std::error::Error>> {
     let started_at = Utc::now();
-    let client = Client::new(
-        &args.base_url,
-        &args.api_key,
-        &args.admin_api_key,
-        args.timeout_secs,
-    )?;
+    let keys = ApiKeys {
+        agent: args.api_key.clone(),
+        external: args.external_api_key.clone(),
+        admin: args.admin_api_key.clone(),
+    };
+    let client = Client::new(&args.base_url, keys, args.timeout_secs)?;
     let ctx = RunContext::new(client);
     let concurrency = usize::try_from(args.concurrency)?;
 
