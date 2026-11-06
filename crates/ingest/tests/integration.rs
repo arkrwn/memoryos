@@ -2116,6 +2116,82 @@ async fn quarantined_worker_episode_adds_no_alias_to_an_existing_entity() {
     assert!(entity.aliases.is_empty(), "{:?}", entity.aliases);
 }
 
+impl World {
+    /// A `user` fact about a new entity named Robert, with the vector `Bob` will be close to.
+    async fn seed_user_fact_on_robert(&self, scope: &Scope) -> Fact {
+        self.episode(Trust::User, scope.clone(), "user words", 2024)
+            .await;
+        self.stub_extraction("user words", json!([statement("Seed", "Robert")]))
+            .await;
+        self.stub_embedding(&[("Seed", vector_for("Seed")), ("robert", sparse(&[1.0]))])
+            .await;
+        self.drain_jobs().await;
+        self.fact_by_statement("Seed").await
+    }
+}
+
+/// Not barred by its source, but outranked: every fact it would add is still quarantined.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outranked_commit_adds_no_alias_to_an_existing_entity() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let seed = w.seed_user_fact_on_robert(&scope).await;
+
+    w.stub_embedding(&[("planted", vector_for("planted")), ("bob", sparse(&[1.0]))])
+        .await;
+    let mut fact = add_fact("planted", "Bob");
+    fact.supersedes = Some(seed.id);
+    let response = w
+        .host
+        .commit(
+            &ctx(),
+            commit_request(&scope, "outranked", vec![fact]),
+            Trust::Agent,
+        )
+        .await
+        .expect("commit");
+    assert_eq!(response.facts[0].status, FactStatus::Quarantined);
+
+    let entity = w
+        .store
+        .get_entity(&ctx(), seed.subject_id)
+        .await
+        .expect("entity");
+    assert!(entity.aliases.is_empty(), "{:?}", entity.aliases);
+}
+
+/// The corroborated fact is active, but that activity is not this source's to lend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_corroboration_adds_no_alias_to_an_existing_entity() {
+    let w = world().await;
+    let scope = Scope::user("u1");
+    let seed = w.seed_user_fact_on_robert(&scope).await;
+
+    let external = w.episode(Trust::External, scope, "web page", 2025).await;
+    w.stub_extraction("web page", json!([statement("Restated", "Bob")]))
+        .await;
+    w.stub_embedding(&[
+        ("Restated", vector_for("Restated")),
+        ("bob", sparse(&[1.0])),
+    ])
+    .await;
+    w.stub_reconcile(
+        "Restated",
+        json!({"action": "corroborate", "fact_id": seed.id}),
+    )
+    .await;
+    w.drain_jobs().await;
+
+    let after = w.store.get_fact(&ctx(), seed.id).await.expect("fact");
+    assert!(after.source_episode_ids.contains(&external));
+    let entity = w
+        .store
+        .get_entity(&ctx(), seed.subject_id)
+        .await
+        .expect("entity");
+    assert!(entity.aliases.is_empty(), "{:?}", entity.aliases);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn low_trust_new_entity_is_created_and_purged_with_its_fact() {
     let w = world().await;
