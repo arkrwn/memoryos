@@ -57,7 +57,10 @@ The `memoryos` binary (crate `server`) has these commands: `serve` (API plus emb
 
 1. `POST /v1/episodes` checks the scope and `trust <= key.max_trust`, then calls
    `insert_episode`, which stores the episode and an `extract` job in one transaction. Returns 202.
-2. The episode is immediately searchable through `search_pending_episodes`, except `external`.
+   Replaying an `idempotency_key` returns 202 with the existing episode; if that episode is in a
+   different scope the server returns 400 `invalid_input` and does not reveal it.
+2. The episode is immediately searchable through `search_pending_episodes`, only when its trust
+   is `user` or `system`.
 3. The worker claims the job and calls `Ingestor::process_episode`:
    a. LLM extraction, forced through one tool, returns entities and statements as JSON.
    b. Entity resolution: same normalized name uses `upsert_entity`; otherwise cosine similarity
@@ -68,6 +71,11 @@ The `memoryos` binary (crate `server`) has these commands: `serve` (API plus emb
    d. Trust gate (section 5) assigns each fact's status.
    e. `apply_extraction` commits everything and sets `processed_at` atomically.
 4. Retries back off exponentially (30s base, 1h cap), and a job goes `dead` after 5 attempts.
+   The worker checks `job.attempts` right after claiming, so a job that keeps crashing workers
+   still goes `dead`. A job whose episode was purged (`NotFound`) is completed, not retried.
+5. Job leases are fenced: `complete_job`, `fail_job` and `renew_job` take effect only when the
+   job is still `running` with the same `locked_by` and `attempts`, and otherwise report `false`.
+   Workers renew the lease while extraction runs.
 
 ## 4. Time semantics
 
@@ -92,6 +100,7 @@ AND (invalidated_at IS NULL OR invalidated_at > K)
 | Rule | Result |
 |---|---|
 | Episode trust is `external` | Every derived fact is `quarantined` |
+| Episode trust is `agent` and scope is `user:*` or `shared:*` | Quarantined, so an agent cannot plant claims in user or shared memory |
 | Statement contradicts a fact of higher trust | Quarantined, with `pending_supersede_of` set |
 | Statement contradicts a fact of equal or lower trust | Active, supersedes it |
 | Otherwise | Active |
@@ -102,7 +111,8 @@ AND (invalidated_at IS NULL OR invalidated_at > K)
 - `reject_fact` sets `rejected`. Rejected and quarantined facts never appear in recall or graph.
 - Extraction and reconciliation prompts wrap content as untrusted data, and they expose only the
   forced output tool. Episode text can never reach a memory-writing tool.
-- `POST /v1/episodes/{id}/purge` removes one bad source and everything derived only from it.
+- `POST /v1/episodes/{id}/purge` removes one bad source and everything derived only from it. A
+  fact closed by a purged fact is reopened or relinked, so purging a poison restores the truth.
 - Approve, reject, invalidate and purge each write an `audit_events` row.
 
 ## 6. Tenancy and authorization
@@ -110,13 +120,15 @@ AND (invalidated_at IS NULL OR invalidated_at > K)
 - Every tenant transaction runs `SET LOCAL ROLE memoryos_app` and
   `SELECT set_config('app.tenant', $1, true)`. Row-level security then applies, even when the
   login role is a superuser. With no tenant set, tables return no rows.
-- Only `claim_job`, `complete_job`, `fail_job`, `*_api_key` and `ping` run outside that role.
+- Only job methods, `*_api_key` and `ping` run outside that role. A non-superuser login needs
+  `GRANT memoryos_app TO <login>`. Fact and pending-episode text search go through the
+  `SECURITY DEFINER` functions in the migration, because GIN indexes are unusable under RLS.
 - API keys: bearer tokens `mos_<43 url-safe chars>` from 32 random bytes. Only the SHA-256 hex is
   stored. Each key has a tenant, scope patterns, `max_trust` and `is_admin`.
 - `server` must check `scope` against the key's patterns on every request, including reads by id,
   where it checks the loaded row's scope and returns 404 on a mismatch.
 - Blocks and sessions for agent `X` require scope `agent:X`.
-- Quarantine approval, purge and `DELETE /v1/users/{id}/memory` require `is_admin`.
+- Quarantine listing and approval, purge and `DELETE /v1/users/{id}/memory` require `is_admin`.
 
 ## 7. Retrieval
 
@@ -133,7 +145,10 @@ AND (invalidated_at IS NULL OR invalidated_at > K)
 
 - Tools given to the model: `block_replace(label, content, expected_version)`,
   `block_append(label, text, expected_version)`, `memory_recall(query)`, `memory_remember(text)`.
-- `memory_remember` writes an episode with trust `agent` into the session's scope.
+- `memory_remember` writes an episode with trust `agent` into scope `agent:<agent_id>`, where its
+  facts can go active. `memory_recall` searches the session's scope and `agent:<agent_id>`.
+- A reply with `StopReason::MaxTokens` is reported in logs, and the turn asks the model to continue
+  once, so truncated text is not silently returned as complete.
 - Context order: system prompt, blocks rendered with label, version and usage, session summary,
   then messages. Block content is delimited and labelled as data in the prompt.
 - Tool-call loop limit is 10 per turn. Tool errors go back to the model as `is_error` results.
@@ -170,7 +185,7 @@ second per key by default. `POST /mcp` exposes MCP tools `remember`, `recall`, `
 | `DATABASE_URL` | required | |
 | `MEMORYOS_BIND` | `0.0.0.0:8080` | |
 | `MEMORYOS_LLM_PROVIDER` | `anthropic` | `anthropic` or `openai` |
-| `MEMORYOS_LLM_MODEL` | `claude-sonnet-5-5` / `gpt-5.1` by provider | Override per deployment |
+| `MEMORYOS_LLM_MODEL` | `claude-haiku-5-5` / `gpt-5.1` by provider | Haiku accepts forced tool calls, which extraction uses. Models that do not fall back to `auto` with one tool |
 | `MEMORYOS_EMBEDDING_MODEL` | `text-embedding-3-small` | Must return 1536 dims |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | | Embeddings need the OpenAI key |
 | `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL` | provider default | Tests point these at WireMock |
@@ -209,3 +224,6 @@ second per key by default. `POST /mcp` exposes MCP tools `remember`, `recall`, `
   search covers those cases when embeddings are available.
 - Embedding width is fixed at 1536. Changing model width needs a migration and re-embedding.
 - The rate limiter is in-process, so the limit applies per server instance.
+- `known_at` is not fully bitemporal: `valid_to` and `status` are not versioned, so a later close or
+  approval shows up in reads at an earlier `known_at`.
+- Thinking blocks are not kept between agent tool calls, so the model loses that reasoning.

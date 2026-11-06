@@ -58,9 +58,19 @@ pub struct CompletionRequest {
     pub max_tokens: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    EndTurn,
+    ToolUse,
+    /// The reply was cut off at `max_tokens`, so its text is incomplete.
+    MaxTokens,
+    Other,
+}
+
 #[derive(Debug, Clone)]
 pub struct CompletionResponse {
     pub content: Vec<ContentBlock>,
+    pub stop_reason: StopReason,
     pub input_tokens: u64,
     pub output_tokens: u64,
 }

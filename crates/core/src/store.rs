@@ -80,7 +80,7 @@ pub trait MemoryStore: Send + Sync {
         limit: i64,
     ) -> Result<Vec<ScoredFact>>;
     /// Full-text search over episodes not yet processed, so writes are readable immediately.
-    /// `external` episodes are excluded: they could carry poisoned content.
+    /// Only `user` and `system` episodes are returned: others could carry poisoned content.
     async fn search_pending_episodes(
         &self,
         ctx: &RequestContext,
@@ -171,15 +171,22 @@ pub trait MemoryStore: Send + Sync {
     /// Claims one due job with `FOR UPDATE SKIP LOCKED`, leased until now + `lease_secs`.
     /// Jobs whose lease expired are claimable, which recovers work from crashed workers.
     async fn claim_job(&self, worker_id: &str, lease_secs: i64) -> Result<Option<Job>>;
-    async fn complete_job(&self, job_id: Uuid) -> Result<()>;
+    /// Extends the lease. Returns `false` if this claim was lost. The fencing rule for the three
+    /// methods below: they apply only while the job is `running` with `locked_by = worker_id`
+    /// and the same `attempts` as `job`.
+    async fn renew_job(&self, job: &Job, worker_id: &str, lease_secs: i64) -> Result<bool>;
+    /// Returns `false` if this claim was lost.
+    async fn complete_job(&self, job: &Job, worker_id: &str) -> Result<bool>;
     /// Reschedules at `run_after`, or marks `dead` once `attempts` reaches `max_attempts`.
+    /// Returns `false` if this claim was lost.
     async fn fail_job(
         &self,
-        job_id: Uuid,
+        job: &Job,
+        worker_id: &str,
         error: &str,
         run_after: DateTime<Utc>,
         max_attempts: i32,
-    ) -> Result<()>;
+    ) -> Result<bool>;
 
     // API keys: cross-tenant, looked up before the tenant is known
     /// `key_hash` is the hex SHA-256 of the presented token. Revoked keys return `None`.

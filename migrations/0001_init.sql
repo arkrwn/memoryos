@@ -67,6 +67,8 @@ CREATE INDEX facts_subject_idx ON facts (tenant, subject_id, predicate);
 CREATE INDEX facts_object_idx ON facts (tenant, object_id);
 CREATE INDEX facts_tsv_idx ON facts USING gin (statement_tsv);
 CREATE INDEX facts_embedding_idx ON facts USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX facts_superseded_by_idx ON facts (superseded_by) WHERE superseded_by IS NOT NULL;
+CREATE INDEX facts_pending_supersede_idx ON facts (pending_supersede_of) WHERE pending_supersede_of IS NOT NULL;
 
 CREATE TABLE fact_sources (
     fact_id    uuid NOT NULL REFERENCES facts (id) ON DELETE CASCADE,
@@ -178,6 +180,54 @@ BEGIN
     END LOOP;
 END
 $$;
+
+-- Text search under RLS cannot use GIN indexes, because `@@` is not leakproof (measured on
+-- 200k facts: 0.5 ms with the index, 29 ms without). These functions run as the table owner and
+-- take the tenant from app.tenant themselves, so callers cannot pass another tenant. They return
+-- ids only; callers load rows under RLS. FORCE is off on these two tables so that a non-superuser
+-- owner can run them. Tenant transactions still use memoryos_app, which stays subject to policy.
+ALTER TABLE facts NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE episodes NO FORCE ROW LEVEL SECURITY;
+
+CREATE FUNCTION search_fact_ids_text(p_scopes text[], p_query text, p_as_of timestamptz, p_known_at timestamptz, p_limit bigint)
+RETURNS TABLE (id uuid, rank real)
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public
+AS $$
+    SELECT f.id, ts_rank(f.statement_tsv, q) AS rank
+    FROM facts f, websearch_to_tsquery('simple', p_query) q
+    WHERE f.tenant = current_setting('app.tenant', true)
+      AND f.scope = ANY (p_scopes)
+      AND f.status = 'active'
+      AND f.statement_tsv @@ q
+      AND f.valid_from <= p_as_of AND (f.valid_to IS NULL OR f.valid_to > p_as_of)
+      AND f.recorded_at <= p_known_at
+      AND (f.invalidated_at IS NULL OR f.invalidated_at > p_known_at)
+    ORDER BY rank DESC, f.id
+    LIMIT p_limit;
+$$;
+
+-- Only `user` and `system` episodes are readable before processing. See SPEC section 3.
+CREATE FUNCTION search_pending_episode_ids(p_scopes text[], p_query text, p_limit bigint)
+RETURNS TABLE (id uuid, rank real)
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public
+AS $$
+    SELECT e.id, ts_rank(e.content_tsv, q) AS rank
+    FROM episodes e, websearch_to_tsquery('simple', p_query) q
+    WHERE e.tenant = current_setting('app.tenant', true)
+      AND e.scope = ANY (p_scopes)
+      AND e.processed_at IS NULL
+      AND e.trust IN ('user', 'system')
+      AND e.content_tsv @@ q
+    ORDER BY rank DESC, e.id
+    LIMIT p_limit;
+$$;
+
+REVOKE ALL ON FUNCTION search_fact_ids_text(text[], text, timestamptz, timestamptz, bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION search_pending_episode_ids(text[], text, bigint) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION search_fact_ids_text(text[], text, timestamptz, timestamptz, bigint) TO memoryos_app;
+GRANT EXECUTE ON FUNCTION search_pending_episode_ids(text[], text, bigint) TO memoryos_app;
 
 -- memoryos_app gets no privileges on jobs or api_keys. insert_episode enqueues through this
 -- function so tenant transactions cannot read or alter other tenants' jobs.

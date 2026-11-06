@@ -449,6 +449,7 @@ components:
         recorded_at: { type: string, format: date-time }
         invalidated_at: { type: [string, "null"], format: date-time }
         superseded_by: { type: [string, "null"], format: uuid }
+        pending_supersede_of: { type: [string, "null"], format: uuid }
         source_episode_ids: { type: array, items: { type: string, format: uuid } }
     RecallRequest:
       type: object

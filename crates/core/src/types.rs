@@ -152,9 +152,13 @@ pub struct NewEpisode {
     pub trust: Trust,
     pub content: String,
     pub occurred_at: Option<DateTime<Utc>>,
-    #[serde(default)]
+    #[serde(default = "empty_object")]
     pub metadata: serde_json::Value,
     pub idempotency_key: Option<String>,
+}
+
+fn empty_object() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,6 +203,8 @@ pub struct Fact {
     pub recorded_at: DateTime<Utc>,
     pub invalidated_at: Option<DateTime<Utc>>,
     pub superseded_by: Option<Uuid>,
+    /// Set on a quarantined fact: the fact that approval will close.
+    pub pending_supersede_of: Option<Uuid>,
     pub source_episode_ids: Vec<Uuid>,
 }
 

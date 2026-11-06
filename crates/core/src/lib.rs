@@ -7,8 +7,8 @@ pub mod types;
 
 pub use error::{Error, Result};
 pub use llm::{
-    CompletionRequest, CompletionResponse, ContentBlock, Embedder, Llm, Message, Role, ToolChoice,
-    ToolDef,
+    CompletionRequest, CompletionResponse, ContentBlock, Embedder, Llm, Message, Role, StopReason,
+    ToolChoice, ToolDef,
 };
 pub use store::MemoryStore;
 pub use types::*;

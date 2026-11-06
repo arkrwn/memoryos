@@ -32,4 +32,15 @@ actually run. States: `todo`, `doing`, `done`, `blocked`.
 
 ## Contract changes
 
-None yet.
+After Wave 1, from agent findings:
+
+- `Fact.pending_supersede_of` added; `NewEpisode.metadata` defaults to `{}`.
+- `CompletionResponse.stop_reason` added.
+- Job methods fenced by worker and attempts; `renew_job` added.
+- `agent` trust facts quarantined in `user:*` and `shared:*` scopes; pending episodes limited to
+  `user` and `system` trust.
+- Text search moved to `SECURITY DEFINER` functions because GIN is unusable under RLS.
+- Indexes added on `superseded_by` and `pending_supersede_of`.
+- Default Anthropic model changed to `claude-haiku-5-5` for forced tool calls. Not verified against
+  the live API because no Anthropic key is available.
+- Work merges to `develop`, not `main`.

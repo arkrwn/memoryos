@@ -27,4 +27,5 @@ Goal: production-grade and ready to use. `docs/SPEC.md` section 12 defines done.
 | 4 | T9 Integration and gates | Lead | Whole repo | T7, T8 |
 | 4 | T10 Independent review | Fresh agent | Read-only | T7, T8 |
 
-The lead merges each wave into `main` and runs the workspace gates before the next wave starts.
+The lead merges each wave into `develop` and runs the workspace gates before the next wave starts.
+`main` holds only the approved baseline until the user confirms a merge.
