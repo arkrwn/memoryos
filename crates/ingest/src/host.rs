@@ -1,6 +1,7 @@
 //! Host-mode commits (SPEC section 14): the host decides the facts, and MemoryOS validates and
 //! gates them with the same code as the worker.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -11,7 +12,7 @@ use memoryos_core::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::entities::embed_and_resolve;
+use crate::entities::{add_earned_aliases, embed_and_resolve, Merge};
 use crate::gate::{build_op, FactDraft, Resolution, Source};
 use crate::validate::{is_blank_or_unstorable, MAX_CONTENT_CHARS};
 
@@ -58,19 +59,13 @@ pub struct CommittedFact {
     pub status: FactStatus,
 }
 
-/// `facts` has one entry per request fact, in order. It is empty when the idempotency key was
-/// already processed: the store has no way to list an episode's facts, and nothing was applied.
+/// `facts` has one entry per request fact, in order, read back from the store. Each status is the
+/// fact's status at the time of the response, so the store's last trust check is reflected, and a
+/// replayed idempotency key returns the original ids with whatever has happened to them since.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitResponse {
     pub episode_id: Uuid,
     pub facts: Vec<CommittedFact>,
-}
-
-/// One request fact's place in the response, known before the ops move into the store.
-enum Slot {
-    New(FactStatus),
-    /// `require_current` established that this fact is active.
-    Corroborated(Uuid),
 }
 
 pub struct HostCommitter {
@@ -113,19 +108,34 @@ impl HostCommitter {
             .await?;
         require_same_request(&episode, &req, trust)?;
         if episode.processed_at.is_some() {
-            return Ok(replayed(&episode));
+            return self.response(ctx, &episode, &req).await;
         }
 
-        let ops = match self.build_ops(ctx, &req, &episode).await {
-            Ok(ops) => ops,
+        let (ops, merges) = match self.build_ops(ctx, &req, &episode).await {
+            Ok(built) => built,
             Err(err) => {
                 self.discard(ctx, episode.id).await;
                 return Err(err);
             }
         };
-        let slots: Vec<Slot> = ops.iter().map(slot_of).collect();
-        let inserted = self.store.apply_extraction(ctx, episode.id, ops).await?;
-        committed(&episode, slots, inserted)
+        // A no-op if a concurrent request with the same key won the episode lock. The response
+        // below then reports that request's facts, the same as any other replay.
+        self.store.apply_extraction(ctx, episode.id, ops).await?;
+        add_earned_aliases(self.store.as_ref(), ctx, &episode, merges).await;
+        self.response(ctx, &episode, &req).await
+    }
+
+    async fn response(
+        &self,
+        ctx: &RequestContext,
+        episode: &Episode,
+        req: &CommitRequest,
+    ) -> Result<CommitResponse> {
+        let facts = self.store.facts_for_episode(ctx, episode.id).await?;
+        Ok(CommitResponse {
+            episode_id: episode.id,
+            facts: in_request_order(req, facts),
+        })
     }
 
     async fn build_ops(
@@ -133,7 +143,7 @@ impl HostCommitter {
         ctx: &RequestContext,
         req: &CommitRequest,
         episode: &Episode,
-    ) -> Result<Vec<FactOp>> {
+    ) -> Result<(Vec<FactOp>, Vec<Merge>)> {
         // Checked before any provider call or entity write, so a rejected commit costs neither.
         let mut targets = Vec::with_capacity(req.facts.len());
         for fact in &req.facts {
@@ -159,6 +169,7 @@ impl HostCommitter {
         )
         .await?;
         let mut embeddings = std::mem::take(&mut batch.statement_embeddings).into_iter();
+        let merges = std::mem::take(&mut batch.merges);
 
         let source = Source {
             scope: &episode.scope,
@@ -195,7 +206,7 @@ impl HostCommitter {
             };
             ops.push(build_op(&source, resolution));
         }
-        Ok(ops)
+        Ok((ops, merges))
     }
 
     /// One message for every failure, so a caller cannot probe which ids exist elsewhere. Row-level
@@ -288,54 +299,27 @@ fn require_same_request(episode: &Episode, req: &CommitRequest, trust: Trust) ->
     }
 }
 
-fn replayed(episode: &Episode) -> CommitResponse {
-    CommitResponse {
-        episode_id: episode.id,
-        facts: Vec::new(),
-    }
-}
-
-fn slot_of(op: &FactOp) -> Slot {
-    match op {
-        FactOp::Add(new) | FactOp::Supersede { new, .. } => Slot::New(new.status),
-        FactOp::Corroborate { fact_id } => Slot::Corroborated(*fact_id),
-    }
-}
-
-/// `inserted` holds only new facts, in op order. An empty list when some were expected can only
-/// mean a concurrent request with the same key won the episode lock and this one was a no-op.
-fn committed(episode: &Episode, slots: Vec<Slot>, inserted: Vec<Uuid>) -> Result<CommitResponse> {
-    let expected = slots.iter().filter(|s| matches!(s, Slot::New(_))).count();
-    if inserted.is_empty() && expected > 0 {
-        return Ok(replayed(episode));
-    }
-    if inserted.len() != expected {
-        return Err(Error::Internal(format!(
-            "store inserted {} facts, expected {expected}",
-            inserted.len()
-        )));
-    }
-    let mut inserted = inserted.into_iter();
-    let mut facts = Vec::with_capacity(slots.len());
-    for slot in slots {
-        let fact = match slot {
-            Slot::New(status) => CommittedFact {
-                id: inserted
-                    .next()
-                    .ok_or_else(|| Error::Internal("inserted id is missing".into()))?,
-                status,
-            },
-            Slot::Corroborated(id) => CommittedFact {
-                id,
-                status: FactStatus::Active,
-            },
+/// Lines the episode's facts up with the request. A request fact that corroborates names its fact.
+/// The others were created in request order, and `facts` lists those in creation order. The key
+/// check does not compare the fact lists, so a replay may not match: whatever is left over is
+/// appended rather than hidden, and a request fact with no match is skipped.
+fn in_request_order(req: &CommitRequest, facts: Vec<Fact>) -> Vec<CommittedFact> {
+    let named: HashSet<Uuid> = req.facts.iter().filter_map(|f| f.corroborates).collect();
+    let as_committed = |fact: &Fact| CommittedFact {
+        id: fact.id,
+        status: fact.status,
+    };
+    let mut created = facts.iter().filter(|fact| !named.contains(&fact.id));
+    let mut ordered = Vec::with_capacity(facts.len());
+    for request_fact in &req.facts {
+        let found = match request_fact.corroborates {
+            Some(id) => facts.iter().find(|fact| fact.id == id),
+            None => created.next(),
         };
-        facts.push(fact);
+        ordered.extend(found.map(as_committed));
     }
-    Ok(CommitResponse {
-        episode_id: episode.id,
-        facts,
-    })
+    ordered.extend(created.map(as_committed));
+    ordered
 }
 
 #[cfg(test)]
@@ -519,19 +503,45 @@ mod tests {
         assert!(require_same_request(&ep, &other_content, Trust::Agent).is_err());
     }
 
+    fn stored(id: Uuid, status: FactStatus) -> Fact {
+        Fact {
+            id,
+            scope: Scope::user("u"),
+            subject_id: Uuid::now_v7(),
+            predicate: "p".into(),
+            object_id: None,
+            statement: "s".into(),
+            trust: Trust::Agent,
+            status,
+            valid_from: Utc::now(),
+            valid_to: None,
+            recorded_at: Utc::now(),
+            invalidated_at: None,
+            superseded_by: None,
+            pending_supersede_of: None,
+            source_episode_ids: Vec::new(),
+        }
+    }
+
+    fn got(committed: &[CommittedFact]) -> Vec<(Uuid, FactStatus)> {
+        committed.iter().map(|f| (f.id, f.status)).collect()
+    }
+
+    /// The corroborated fact is older than both new ones, so id order alone would misplace it.
     #[test]
-    fn response_aligns_corroborations_with_inserted_ids() {
-        let ep = episode();
-        let (first, second, linked) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
-        let slots = vec![
-            Slot::New(FactStatus::Active),
-            Slot::Corroborated(linked),
-            Slot::New(FactStatus::Quarantined),
+    fn response_follows_the_request_and_not_id_order() {
+        let linked = Uuid::now_v7();
+        let (first, second) = (Uuid::now_v7(), Uuid::now_v7());
+        let mut corroborating = fact();
+        corroborating.corroborates = Some(linked);
+        let req = request(vec![fact(), corroborating, fact()]);
+        let facts = vec![
+            stored(linked, FactStatus::Active),
+            stored(first, FactStatus::Active),
+            stored(second, FactStatus::Quarantined),
         ];
-        let response = committed(&ep, slots, vec![first, second]).expect("aligned");
-        let got: Vec<_> = response.facts.iter().map(|f| (f.id, f.status)).collect();
         assert_eq!(
-            got,
+            got(&in_request_order(&req, facts)),
             [
                 (first, FactStatus::Active),
                 (linked, FactStatus::Active),
@@ -541,11 +551,18 @@ mod tests {
     }
 
     #[test]
-    fn losing_a_concurrent_replay_returns_no_facts() {
-        let ep = episode();
-        let response =
-            committed(&ep, vec![Slot::New(FactStatus::Active)], Vec::new()).expect("replay");
-        assert_eq!(response.episode_id, ep.id);
-        assert!(response.facts.is_empty());
+    fn a_replay_that_does_not_match_hides_nothing() {
+        let (first, second) = (Uuid::now_v7(), Uuid::now_v7());
+        let mut gone = fact();
+        gone.corroborates = Some(Uuid::now_v7());
+        let req = request(vec![gone, fact()]);
+        let facts = vec![
+            stored(first, FactStatus::Active),
+            stored(second, FactStatus::Active),
+        ];
+        assert_eq!(
+            got(&in_request_order(&req, facts)),
+            [(first, FactStatus::Active), (second, FactStatus::Active)]
+        );
     }
 }

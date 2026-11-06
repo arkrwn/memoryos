@@ -3,12 +3,13 @@
 use std::collections::HashMap;
 
 use memoryos_core::{
-    Embedder, Entity, Error, MemoryStore, NewEntity, RequestContext, Result, Scope,
+    normalize_name, source_requires_quarantine, Embedder, Entity, Episode, Error, FactStatus,
+    MemoryStore, NewEntity, RequestContext, Result, Scope,
 };
 use uuid::Uuid;
 
 use crate::host::EntityRef;
-use crate::validate::{normalize_kind, normalize_name};
+use crate::validate::normalize_kind;
 
 /// Minimum cosine similarity at which a new name merges into an entity of the same kind.
 const MERGE_SIMILARITY: f64 = 0.90;
@@ -27,6 +28,14 @@ pub(crate) struct ResolvedBatch {
     /// One vector per input statement, in order.
     pub(crate) statement_embeddings: Vec<Vec<f32>>,
     entity_ids: HashMap<EntityKey, Uuid>,
+    /// Names merged into an entity. Written by `add_earned_aliases`, once statuses are known.
+    pub(crate) merges: Vec<Merge>,
+}
+
+/// A name that resolved to an existing entity by similarity.
+pub(crate) struct Merge {
+    entity_id: Uuid,
+    alias: String,
 }
 
 impl ResolvedBatch {
@@ -41,9 +50,7 @@ impl ResolvedBatch {
 /// Embeds `statements` and the distinct entities in one provider call, statements first, then
 /// resolves the entities one at a time, so a later name in the batch can merge into an earlier one.
 ///
-/// Names are embedded in normalized form, so one normalized name always has one vector and an
-/// existing entity with that name ranks first in `similar_entities`. The store trait has no lookup
-/// by name, and this is what lets `choose` see the exact match.
+/// Names are embedded in normalized form, so one normalized name always has one vector.
 pub(crate) async fn embed_and_resolve(
     store: &dyn MemoryStore,
     embedder: &dyn Embedder,
@@ -82,39 +89,69 @@ pub(crate) async fn embed_and_resolve(
 
     let entity_vectors = vectors.split_off(statement_count);
     let mut entity_ids = HashMap::with_capacity(distinct.len());
+    let mut merges = Vec::new();
     for (((kind, normalized), name), embedding) in distinct.into_iter().zip(entity_vectors) {
-        let id = resolve(store, ctx, scope, &kind, &normalized, name, embedding).await?;
+        let id = resolve(store, ctx, scope, &kind, name, embedding, &mut merges).await?;
         entity_ids.insert((kind, normalized), id);
     }
     Ok(ResolvedBatch {
         statement_embeddings: vectors,
         entity_ids,
+        merges,
     })
+}
+
+/// Runs after `apply_extraction`, because only then is each fact's status final. An alias changes
+/// how a shared entity resolves for everyone, so a name is kept only when this episode has an active
+/// fact on that entity. A source whose facts are all quarantined earns none, and its link to a
+/// fact it corroborated does not count. A failure here costs an alias and not the commit, which has
+/// already happened, so it is logged.
+pub(crate) async fn add_earned_aliases(
+    store: &dyn MemoryStore,
+    ctx: &RequestContext,
+    episode: &Episode,
+    merges: Vec<Merge>,
+) {
+    if merges.is_empty() || source_requires_quarantine(&episode.scope, episode.trust) {
+        return;
+    }
+    let facts = match store.facts_for_episode(ctx, episode.id).await {
+        Ok(facts) => facts,
+        Err(err) => {
+            tracing::warn!(episode_id = %episode.id, error = %err, "could not check aliases");
+            return;
+        }
+    };
+    for merge in merges {
+        let earned = facts.iter().any(|fact| {
+            fact.status == FactStatus::Active
+                && (fact.subject_id == merge.entity_id || fact.object_id == Some(merge.entity_id))
+        });
+        if earned {
+            if let Err(err) = store
+                .add_entity_alias(ctx, merge.entity_id, &merge.alias)
+                .await
+            {
+                tracing::warn!(entity_id = %merge.entity_id, error = %err, "could not add alias");
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
 enum Choice {
-    /// The name or a known alias already belongs to this entity.
-    Existing(Uuid),
     /// A different name similar enough to be the same entity.
     Merge(Uuid),
     Create,
 }
 
-/// `similar` is ordered by similarity, highest first, as `similar_entities` promises.
-fn choose(similar: &[(Entity, f64)], kind: &str, normalized: &str) -> Choice {
-    let same_kind = || similar.iter().filter(|(entity, _)| entity.kind == kind);
-    let known = same_kind().find(|(entity, _)| {
-        normalize_name(&entity.name) == normalized
-            || entity
-                .aliases
-                .iter()
-                .any(|alias| normalize_name(alias) == normalized)
-    });
-    if let Some((entity, _)) = known {
-        return Choice::Existing(entity.id);
-    }
-    match same_kind().find(|(_, similarity)| *similarity >= MERGE_SIMILARITY) {
+/// `similar` is ordered by similarity, highest first, as `similar_entities` promises. Exact names
+/// and known aliases never get here: `find_entity` has already answered those.
+fn choose(similar: &[(Entity, f64)], kind: &str) -> Choice {
+    let found = similar
+        .iter()
+        .find(|(entity, similarity)| entity.kind == kind && *similarity >= MERGE_SIMILARITY);
+    match found {
         Some((entity, _)) => Choice::Merge(entity.id),
         None => Choice::Create,
     }
@@ -125,17 +162,22 @@ async fn resolve(
     ctx: &RequestContext,
     scope: &Scope,
     kind: &str,
-    normalized: &str,
     name: &str,
     embedding: Vec<f32>,
+    merges: &mut Vec<Merge>,
 ) -> Result<Uuid> {
+    if let Some(entity) = store.find_entity(ctx, scope, kind, name).await? {
+        return Ok(entity.id);
+    }
     let similar = store
         .similar_entities(ctx, scope, &embedding, SIMILAR_CANDIDATES)
         .await?;
-    match choose(&similar, kind, normalized) {
-        Choice::Existing(id) => Ok(id),
+    match choose(&similar, kind) {
         Choice::Merge(id) => {
-            store.add_entity_alias(ctx, id, name).await?;
+            merges.push(Merge {
+                entity_id: id,
+                alias: name.to_owned(),
+            });
             Ok(id)
         }
         // Also covers two writers creating the same name at once: the store keeps one row.
@@ -172,39 +214,18 @@ mod tests {
     }
 
     #[test]
-    fn exact_name_wins_over_a_closer_similar_entity() {
-        let close = entity("person", "Other", &[]);
-        let exact = entity("person", "Ada  Lovelace", &[]);
-        let similar = [(close, 0.99), (exact.clone(), 0.95)];
-        assert_eq!(
-            choose(&similar, "person", "ada lovelace"),
-            Choice::Existing(exact.id)
-        );
-    }
-
-    #[test]
-    fn known_alias_needs_no_new_alias() {
-        let found = entity("person", "Robert", &["Bob"]);
-        let similar = [(found.clone(), 0.5)];
-        assert_eq!(
-            choose(&similar, "person", "bob"),
-            Choice::Existing(found.id)
-        );
-    }
-
-    #[test]
     fn merges_at_the_threshold_and_not_below() {
         let found = entity("person", "Robert", &[]);
         let at = [(found.clone(), 0.90)];
-        assert_eq!(choose(&at, "person", "bob"), Choice::Merge(found.id));
+        assert_eq!(choose(&at, "person"), Choice::Merge(found.id));
         let below = [(found, 0.8999)];
-        assert_eq!(choose(&below, "person", "bob"), Choice::Create);
+        assert_eq!(choose(&below, "person"), Choice::Create);
     }
 
     #[test]
     fn other_kinds_never_match() {
         let same_name = entity("company", "Apple", &[]);
         let similar = [(same_name, 1.0)];
-        assert_eq!(choose(&similar, "fruit", "apple"), Choice::Create);
+        assert_eq!(choose(&similar, "fruit"), Choice::Create);
     }
 }

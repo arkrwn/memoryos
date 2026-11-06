@@ -35,6 +35,8 @@ CREATE TABLE entities (
     name            text NOT NULL,
     normalized_name text NOT NULL,
     aliases         text[] NOT NULL DEFAULT '{}',
+    -- `aliases` under normalize_name, so lookups do not need that function in SQL.
+    alias_keys      text[] NOT NULL DEFAULT '{}',
     embedding       vector(384) NOT NULL,
     created_at      timestamptz NOT NULL DEFAULT now(),
     UNIQUE (tenant, scope, kind, normalized_name)
@@ -64,7 +66,9 @@ CREATE TABLE facts (
 );
 CREATE INDEX facts_scope_idx ON facts (tenant, scope, status);
 CREATE INDEX facts_subject_idx ON facts (tenant, subject_id, predicate);
-CREATE INDEX facts_object_idx ON facts (tenant, object_id);
+-- Graph walks read a hub entity's newest edges and stop at their limit. Ids are UUIDv7.
+CREATE INDEX facts_subject_recent_idx ON facts (tenant, subject_id, id DESC);
+CREATE INDEX facts_object_recent_idx ON facts (tenant, object_id, id DESC);
 CREATE INDEX facts_tsv_idx ON facts USING gin (statement_tsv);
 CREATE INDEX facts_embedding_idx ON facts USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX facts_superseded_by_idx ON facts (superseded_by) WHERE superseded_by IS NOT NULL;

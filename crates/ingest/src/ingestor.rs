@@ -7,7 +7,7 @@ use memoryos_core::{
 };
 use uuid::Uuid;
 
-use crate::entities::{embed_and_resolve, ResolvedBatch};
+use crate::entities::{add_earned_aliases, embed_and_resolve, ResolvedBatch};
 use crate::extract::{
     extraction_request, parse_decision, parse_extraction, reconciliation_request, Decision,
     ExtractedStatement,
@@ -55,7 +55,7 @@ impl Ingestor {
             .iter()
             .flat_map(|s| std::iter::once(&s.subject).chain(&s.object))
             .collect();
-        let batch = embed_and_resolve(
+        let mut batch = embed_and_resolve(
             self.store.as_ref(),
             self.embedder.as_ref(),
             ctx,
@@ -64,10 +64,12 @@ impl Ingestor {
             &entities,
         )
         .await?;
+        let merges = std::mem::take(&mut batch.merges);
 
         let ops = self.reconcile_all(ctx, &episode, statements, batch).await?;
         let ops_applied = ops.len();
         let inserted = self.store.apply_extraction(ctx, episode_id, ops).await?;
+        add_earned_aliases(self.store.as_ref(), ctx, &episode, merges).await;
         tracing::info!(
             %episode_id,
             ops_applied,

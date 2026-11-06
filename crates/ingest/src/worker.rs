@@ -230,12 +230,22 @@ impl Runner {
             Outcome::LeaseLost => {
                 tracing::warn!(job_id = %job.id, elapsed_ms, "job lease lost, abandoning");
             }
-            // Must not go dead here: shutting down says nothing about the job. The attempt stays
-            // counted, because the store has no way to give it back.
+            // Shutting down says nothing about the job, so this claim does not count as an attempt.
             Outcome::Released => {
-                tracing::info!(job_id = %job.id, elapsed_ms, "job released at shutdown");
-                self.fail(&job, "released at worker shutdown", Utc::now(), i32::MAX)
-                    .await;
+                match self
+                    .store
+                    .release_job(&job, &self.config.worker_id, Utc::now())
+                    .await
+                {
+                    Ok(true) => {
+                        tracing::info!(job_id = %job.id, elapsed_ms, "job released at shutdown");
+                    }
+                    Ok(false) => tracing::warn!(job_id = %job.id, "job not released, claim lost"),
+                    // The lease expires and the job runs again, with this attempt counted.
+                    Err(err) => {
+                        tracing::warn!(job_id = %job.id, error = %err, "could not release job");
+                    }
+                }
             }
             Outcome::Finished(Ok(())) => {
                 match self.store.complete_job(&job, &self.config.worker_id).await {
