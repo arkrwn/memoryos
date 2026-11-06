@@ -292,7 +292,7 @@ paths:
               required: [content]
               properties:
                 content: { type: string }
-                max_chars: { type: integer, default: 2000 }
+                max_chars: { type: integer, default: 2000, maximum: 100000 }
                 expected_version:
                   type: [integer, "null"]
                   description: Omit or null to create. Otherwise the version being replaced
@@ -305,7 +305,7 @@ paths:
         default: { $ref: "#/components/responses/Error" }
   /v1/agents/{agent_id}/blocks/{label}/versions:
     get:
-      summary: Block edit history
+      summary: Block edit history, the latest 100 versions, oldest first
       parameters:
         - { $ref: "#/components/parameters/AgentId" }
         - { $ref: "#/components/parameters/Label" }

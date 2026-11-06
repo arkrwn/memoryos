@@ -504,8 +504,8 @@ pub async fn seed_fact(
         tenant: tenant.to_owned(),
         actor: "test".to_owned(),
     };
-    let episode = store
-        .insert_episode(
+    let (episode, _) = store
+        .claim_episode(
             &ctx,
             NewEpisode {
                 scope: scope.clone(),

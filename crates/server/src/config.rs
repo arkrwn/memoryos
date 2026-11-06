@@ -11,8 +11,6 @@ pub struct Config {
     pub db_max_connections: u32,
     pub rate_limit_rps: u32,
     pub request_timeout: Duration,
-    /// Origins allowed on `POST /mcp` besides localhost.
-    pub mcp_allowed_origins: Vec<String>,
     /// `MEMORYOS_TEST_EMBEDDER`, in milliseconds per call: use the test embedder, not the model.
     #[cfg(feature = "test-embedder")]
     pub test_embedder_delay: Option<Duration>,
@@ -48,14 +46,6 @@ impl Config {
                 "MEMORYOS_REQUEST_TIMEOUT_SECS",
                 30,
             )?),
-            mcp_allowed_origins: get("MEMORYOS_MCP_ALLOWED_ORIGINS")
-                .map(|list| {
-                    list.split(',')
-                        .map(|origin| origin.trim().to_owned())
-                        .filter(|origin| !origin.is_empty())
-                        .collect()
-                })
-                .unwrap_or_default(),
             #[cfg(feature = "test-embedder")]
             test_embedder_delay: get("MEMORYOS_TEST_EMBEDDER")
                 .map(|millis| {

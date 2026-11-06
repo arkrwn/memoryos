@@ -21,6 +21,10 @@ use crate::{db, facts, validate, PgStore};
 /// Hard cap on `neighbors`, so a depth-5 walk through a hub cannot load an unbounded graph, whatever
 /// limit the caller asks for.
 const MAX_GRAPH_EDGES: i64 = 5000;
+/// Hard cap on `current_facts_for_subject`, so a hub entity cannot load without bound.
+const MAX_SUBJECT_FACTS: i64 = 200;
+/// Versions kept per block, and the most `block_versions` returns.
+const MAX_BLOCK_VERSIONS: i64 = 100;
 
 /// Applies pgvector's iterative scan for this transaction, so rows removed by scope and time
 /// filters do not shrink the result below `limit`.
@@ -90,7 +94,11 @@ async fn lock_quarantined(conn: &mut PgConnection, id: Uuid) -> Result<Quarantin
 
 #[async_trait]
 impl MemoryStore for PgStore {
-    async fn insert_episode(&self, ctx: &RequestContext, episode: NewEpisode) -> Result<Episode> {
+    async fn claim_episode(
+        &self,
+        ctx: &RequestContext,
+        episode: NewEpisode,
+    ) -> Result<(Episode, bool)> {
         validate::non_empty("source", &episode.source)?;
         validate::non_empty("content", &episode.content)?;
         let metadata = match episode.metadata {
@@ -118,6 +126,7 @@ impl MemoryStore for PgStore {
             .await
             .map_err(db)?;
 
+        let created = inserted.is_some();
         let row = match inserted {
             Some(row) => row,
             // The conflicting insert has committed by now, so this statement's snapshot sees it.
@@ -135,7 +144,25 @@ impl MemoryStore for PgStore {
         };
         let result = rows::episode(&row)?;
         tx.commit().await.map_err(db)?;
-        Ok(result)
+        Ok((result, created))
+    }
+
+    async fn discard_unprocessed_episode(&self, ctx: &RequestContext, id: Uuid) -> Result<bool> {
+        let mut tx = self.tenant_tx(ctx).await?;
+        // One statement: if `apply_commit` holds the row lock, this waits and then re-reads
+        // `processed_at`, so it cannot delete what that transaction just acknowledged.
+        let deleted = sqlx::query("DELETE FROM episodes WHERE id = $1 AND processed_at IS NULL")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?
+            .rows_affected()
+            > 0;
+        if deleted {
+            facts::audit(&mut tx, ctx, "episode.discard", Some(id), json!({})).await?;
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(deleted)
     }
 
     async fn get_episode(&self, ctx: &RequestContext, id: Uuid) -> Result<Episode> {
@@ -322,7 +349,13 @@ impl MemoryStore for PgStore {
         Ok(result)
     }
 
-    async fn add_entity_alias(&self, ctx: &RequestContext, id: Uuid, alias: &str) -> Result<()> {
+    async fn add_entity_alias(
+        &self,
+        ctx: &RequestContext,
+        id: Uuid,
+        alias: &str,
+        source_episode: Option<Uuid>,
+    ) -> Result<()> {
         validate::non_empty("alias", alias)?;
         let mut tx = self.tenant_tx(ctx).await?;
         let updated = sqlx::query(
@@ -341,6 +374,20 @@ impl MemoryStore for PgStore {
         .map_err(db)?;
         if updated.rows_affected() == 0 {
             return Err(Error::NotFound(format!("entity {id}")));
+        }
+        if let Some(episode_id) = source_episode {
+            sqlx::query(
+                "INSERT INTO entity_alias_sources (entity_id, alias_key, episode_id, tenant, alias) \
+                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+            )
+            .bind(id)
+            .bind(normalize_name(alias))
+            .bind(episode_id)
+            .bind(&ctx.tenant)
+            .bind(alias)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
         }
         tx.commit().await.map_err(db)
     }
@@ -457,6 +504,7 @@ impl MemoryStore for PgStore {
         if updated.rows_affected() == 0 {
             return Err(Error::NotFound(format!("fact {id}")));
         }
+        facts::leave_chain_on_retraction(&mut tx, id).await?;
         facts::audit(
             &mut tx,
             ctx,
@@ -466,6 +514,30 @@ impl MemoryStore for PgStore {
         )
         .await?;
         let result = load_fact(&mut tx, id).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(result)
+    }
+
+    async fn current_fact(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        id: Uuid,
+    ) -> Result<Option<Fact>> {
+        let mut tx = self.tenant_tx(ctx).await?;
+        let filter = visible(3, 4);
+        let sql = format!(
+            "SELECT {FACT_COLS} FROM facts f WHERE f.id = $1 AND f.scope = $2 AND {filter}"
+        );
+        let row = sqlx::query(&sql)
+            .bind(id)
+            .bind(scope.to_string())
+            .bind(None::<DateTime<Utc>>)
+            .bind(None::<DateTime<Utc>>)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db)?;
+        let result = row.as_ref().map(rows::fact).transpose()?;
         tx.commit().await.map_err(db)?;
         Ok(result)
     }
@@ -481,17 +553,19 @@ impl MemoryStore for PgStore {
         let sql = format!(
             "SELECT {FACT_COLS} FROM facts f \
              WHERE f.scope = $1 AND f.subject_id = $2 AND {filter} \
-             ORDER BY f.valid_from, f.id"
+             ORDER BY f.valid_from DESC, f.id DESC LIMIT $5"
         );
         let found = sqlx::query(&sql)
             .bind(scope.to_string())
             .bind(subject_id)
             .bind(None::<DateTime<Utc>>)
             .bind(None::<DateTime<Utc>>)
+            .bind(MAX_SUBJECT_FACTS)
             .fetch_all(&mut *tx)
             .await
             .map_err(db)?;
-        let result = found.iter().map(rows::fact).collect::<Result<_>>()?;
+        let mut result = found.iter().map(rows::fact).collect::<Result<Vec<_>>>()?;
+        result.reverse();
         tx.commit().await.map_err(db)?;
         Ok(result)
     }
@@ -909,6 +983,12 @@ impl MemoryStore for PgStore {
         .execute(&mut *tx)
         .await
         .map_err(db)?;
+        sqlx::query("DELETE FROM block_versions WHERE block_id = $1 AND version <= $2")
+            .bind(block.id)
+            .bind(block.version - MAX_BLOCK_VERSIONS)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
         tx.commit().await.map_err(db)?;
         Ok(block)
     }
@@ -923,10 +1003,11 @@ impl MemoryStore for PgStore {
         let found = sqlx::query(
             "SELECT v.version, v.content, v.edited_by, v.edited_at FROM block_versions v \
              JOIN blocks b ON b.id = v.block_id \
-             WHERE b.agent_id = $1 AND b.label = $2 ORDER BY v.version",
+             WHERE b.agent_id = $1 AND b.label = $2 ORDER BY v.version DESC LIMIT $3",
         )
         .bind(agent_id)
         .bind(label)
+        .bind(MAX_BLOCK_VERSIONS)
         .fetch_all(&mut *tx)
         .await
         .map_err(db)?;
@@ -934,10 +1015,11 @@ impl MemoryStore for PgStore {
         if found.is_empty() {
             return Err(Error::NotFound(format!("block {agent_id}/{label}")));
         }
-        let result = found
+        let mut result = found
             .iter()
             .map(rows::block_version)
-            .collect::<Result<_>>()?;
+            .collect::<Result<Vec<_>>>()?;
+        result.reverse();
         tx.commit().await.map_err(db)?;
         Ok(result)
     }

@@ -41,8 +41,10 @@ Host mode only, by the user's decision (T15):
   sessions, the worker, `POST /v1/episodes`, `/v1/sessions/*`, `POST /v1/agents/{id}/sessions`, MCP
   `remember`, `memoryos worker`, `--no-worker`, and the mode, provider and embedder settings.
 - `memoryos-llm` is now `memoryos-embed`. `apply_extraction` is `apply_commit`, and
-  `insert_unqueued_episode` is `insert_episode`. `RecallResponse` has only `facts`, and `/readyz` no
-  longer reports `not_required`.
+  `claim_unqueued_episode` is `claim_episode`, the only way to store an episode. `RecallResponse` has
+  only `facts`, and `/readyz` no longer reports `not_required`.
+- Approving now also requires `max_trust` to reach the trust of the `pending_supersede_of` target.
+- `entity_alias_sources` moved into `0001_init.sql`, the only migration.
 - The migration lost `jobs`, `sessions`, `session_messages`, `enqueue_job`,
   `search_pending_episode_ids`, `episodes.content_tsv` and the episode search indexes. `episodes` is
   back to `FORCE ROW LEVEL SECURITY`. `episodes.processed_at` stays: it makes a replayed commit a no-op.

@@ -54,6 +54,40 @@ async fn a_key_over_its_rate_gets_429_with_retry_after_and_others_do_not() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn bad_tokens_get_429_once_the_budget_is_spent_and_working_keys_still_pass() {
+    let server = Server::start().await;
+    let working = server.root("guessing").await;
+    let (status, _) = server
+        .call("GET", "/v1/agents/a/blocks", Some(&working), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let bad = crate::common::Key {
+        id: random_uuid(),
+        token: "mos_notARealTokenAtAllButTheRightLengthForOne1234".to_owned(),
+    };
+    let mut limited = None;
+    for _ in 0..2000 {
+        let (status, headers, body) = server
+            .call_full("GET", "/v1/agents/a/blocks", Some(&bad), None)
+            .await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            limited = Some((status, headers, body));
+            break;
+        }
+        assert_error(status, &body, 401, "unauthorized");
+    }
+    let (status, headers, body) = limited.expect("the budget should run out");
+    assert_error(status, &body, 429, "rate_limited");
+    assert!(headers.contains_key(RETRY_AFTER));
+
+    let (status, _) = server
+        .call("GET", "/v1/agents/a/blocks", Some(&working), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn bodies_over_1_mib_are_refused_and_at_1_mib_are_read() {
     let server = Server::start().await;
     let key = server.root("size").await;

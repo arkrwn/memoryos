@@ -113,7 +113,7 @@ dc exec -T postgres psql -U memoryos -d memoryos -Atc "SELECT (SELECT count(*) F
 dc exec -T postgres psql -U memoryos -d memoryos -Atc "SELECT count(*) FROM pg_policies;"
 ```
 
-Expect 7 policies, one per tenant table. The drill ran when there were 9, because `sessions` and
+Expect 8 policies, one per tenant table. The drill ran when there were 9, because `sessions` and
 `session_messages` still existed. It gave the same counts on both sides, `recall` returned both facts
 with the pre-backup token, and a key in another tenant got no facts.
 

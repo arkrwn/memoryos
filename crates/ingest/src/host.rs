@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use memoryos_core::{
     Embedder, Episode, Error, Fact, FactOp, FactStatus, MemoryStore, NewEpisode, RequestContext,
     Result, Scope, Trust,
@@ -16,6 +16,11 @@ use crate::gate::{build_op, FactDraft, Resolution, Source};
 use crate::validate::{is_blank_or_unstorable, MAX_CONTENT_CHARS};
 
 const MAX_FACTS: usize = 50;
+/// Names and keys are in unique indexes, whose rows PostgreSQL limits to about 2700 bytes. At four
+/// bytes a character, a name at this limit and a kind at the next one still fit together.
+const MAX_INDEXED_CHARS: usize = 512;
+const MAX_KIND_CHARS: usize = 64;
+const MAX_FUTURE_VALID_FROM_DAYS: i64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -90,9 +95,9 @@ impl HostCommitter {
 
         // The key can only be looked up by inserting, and a replay must be recognized before the
         // references are checked: the original commit may have closed the fact it superseded.
-        let episode = self
+        let (episode, created) = self
             .store
-            .insert_episode(
+            .claim_episode(
                 ctx,
                 NewEpisode {
                     scope: req.scope.clone(),
@@ -113,14 +118,18 @@ impl HostCommitter {
         let (ops, merges) = match self.build_ops(ctx, &req, &episode).await {
             Ok(built) => built,
             Err(err) => {
-                self.discard(ctx, episode.id).await;
+                // A replay does not own the episode: the request that created it may still be
+                // running, or may already have been acknowledged.
+                if created {
+                    self.discard(ctx, episode.id).await;
+                }
                 return Err(err);
             }
         };
         // A no-op if a concurrent request with the same key won the episode lock. The response
         // below then reports that request's facts, the same as any other replay.
-        self.store.apply_commit(ctx, episode.id, ops).await?;
-        add_earned_aliases(self.store.as_ref(), ctx, &episode, merges).await;
+        let inserted = self.store.apply_commit(ctx, episode.id, ops).await?;
+        add_earned_aliases(self.store.as_ref(), ctx, &episode, merges, &inserted).await;
         self.response(ctx, &episode, &req).await
     }
 
@@ -209,33 +218,25 @@ impl HostCommitter {
     }
 
     /// One message for every failure, so a caller cannot probe which ids exist elsewhere. Row-level
-    /// security makes another tenant's fact `NotFound`. "Current" is the store's own filter.
+    /// security hides another tenant's fact. "Current" is the store's own filter.
     async fn require_current(&self, ctx: &RequestContext, scope: &Scope, id: Uuid) -> Result<Fact> {
-        let rejected = || Error::InvalidInput(format!("fact {id} is not current in this scope"));
-        let fact = match self.store.get_fact(ctx, id).await {
-            Ok(fact) => fact,
-            Err(Error::NotFound(_)) => return Err(rejected()),
-            Err(err) => return Err(err),
-        };
-        if fact.scope != *scope || fact.superseded_by.is_some() {
-            return Err(rejected());
-        }
-        let current = self
-            .store
-            .current_facts_for_subject(ctx, scope, fact.subject_id)
-            .await?;
-        if current.iter().any(|candidate| candidate.id == id) {
-            Ok(fact)
-        } else {
-            Err(rejected())
+        match self.store.current_fact(ctx, scope, id).await? {
+            Some(fact) if fact.superseded_by.is_none() => Ok(fact),
+            _ => Err(Error::InvalidInput(format!(
+                "fact {id} is not current in this scope"
+            ))),
         }
     }
 
     /// A commit refused before `apply_commit` must leave no source behind. The episode holds no
-    /// facts, since `apply_commit` is what links them. If this fails, what remains is an
-    /// unprocessed episode that nothing reads.
+    /// facts, since `apply_commit` is what links them, and if a replay has processed it since, the
+    /// store leaves it alone. If this fails, what remains is an unprocessed episode that nothing reads.
     async fn discard(&self, ctx: &RequestContext, episode_id: Uuid) {
-        if let Err(err) = self.store.purge_episode(ctx, episode_id).await {
+        if let Err(err) = self
+            .store
+            .discard_unprocessed_episode(ctx, episode_id)
+            .await
+        {
             tracing::warn!(%episode_id, error = %err, "could not discard a refused commit");
         }
     }
@@ -256,13 +257,22 @@ fn validate_request(req: &CommitRequest) -> Result<()> {
     non_empty("content", &req.content)?;
     if let Some(key) = &req.idempotency_key {
         non_empty("idempotency_key", key)?;
+        at_most("idempotency_key", key, MAX_INDEXED_CHARS)?;
     }
+    let latest_valid_from = Utc::now() + Duration::days(MAX_FUTURE_VALID_FROM_DAYS);
     for fact in &req.facts {
+        if fact.valid_from.is_some_and(|from| from > latest_valid_from) {
+            return Err(Error::InvalidInput(format!(
+                "valid_from is more than {MAX_FUTURE_VALID_FROM_DAYS} day in the future"
+            )));
+        }
         non_empty("statement", &fact.statement)?;
         non_empty("predicate", &fact.predicate)?;
         for entity in std::iter::once(&fact.subject).chain(&fact.object) {
             non_empty("entity name", &entity.name)?;
             non_empty("entity kind", &entity.kind)?;
+            at_most("entity name", &entity.name, MAX_INDEXED_CHARS)?;
+            at_most("entity kind", &entity.kind, MAX_KIND_CHARS)?;
         }
         if fact.supersedes.is_some() && fact.corroborates.is_some() {
             return Err(Error::InvalidInput(
@@ -277,6 +287,15 @@ fn non_empty(field: &str, value: &str) -> Result<()> {
     if is_blank_or_unstorable(value) {
         return Err(Error::InvalidInput(format!(
             "{field} must not be empty or contain NUL"
+        )));
+    }
+    Ok(())
+}
+
+fn at_most(field: &str, value: &str, max: usize) -> Result<()> {
+    if value.chars().count() > max {
+        return Err(Error::InvalidInput(format!(
+            "{field} exceeds {max} characters"
         )));
     }
     Ok(())
@@ -409,6 +428,56 @@ mod tests {
         assert!(validate_request(&req).is_ok());
         req.content.push('é');
         assert!(validate_request(&req).is_err());
+    }
+
+    #[test]
+    fn refuses_names_and_keys_over_the_limit_counted_in_characters() {
+        let long = "é".repeat(MAX_INDEXED_CHARS);
+        let with_name = |name: String| {
+            let mut one = fact();
+            one.subject.name = name;
+            request(vec![one])
+        };
+        assert!(validate_request(&with_name(long.clone())).is_ok());
+        assert!(matches!(
+            validate_request(&with_name(format!("{long}é"))),
+            Err(Error::InvalidInput(_))
+        ));
+
+        let mut object = fact();
+        object.object = Some(EntityRef {
+            name: format!("{long}é"),
+            kind: "k".into(),
+        });
+        assert!(validate_request(&request(vec![object])).is_err());
+
+        let mut kind = fact();
+        kind.subject.kind = "k".repeat(MAX_KIND_CHARS + 1);
+        assert!(validate_request(&request(vec![kind])).is_err());
+
+        let mut keyed = request(Vec::new());
+        keyed.idempotency_key = Some(long.clone());
+        assert!(validate_request(&keyed).is_ok());
+        keyed.idempotency_key = Some(format!("{long}é"));
+        assert!(matches!(
+            validate_request(&keyed),
+            Err(Error::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn refuses_valid_from_over_a_day_ahead() {
+        let at = |offset: Duration| {
+            let mut one = fact();
+            one.valid_from = Some(Utc::now() + offset);
+            request(vec![one])
+        };
+        assert!(validate_request(&at(Duration::days(-3650))).is_ok());
+        assert!(validate_request(&at(Duration::hours(23))).is_ok());
+        assert!(matches!(
+            validate_request(&at(Duration::hours(25))),
+            Err(Error::InvalidInput(_))
+        ));
     }
 
     #[test]

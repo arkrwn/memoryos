@@ -49,6 +49,124 @@ async fn no_token_and_bad_tokens_get_401_on_every_protected_route() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn writing_a_block_needs_agent_trust_and_max_chars_is_capped() {
+    let server = Server::start().await;
+    let path = "/v1/agents/a1/blocks/notes";
+    let body = json!({"content": "x"});
+
+    let external = server
+        .key("blocks", &["agent:a1"], Trust::External, false)
+        .await;
+    let (status, reply) = server
+        .call("PUT", path, Some(&external), Some(body.clone()))
+        .await;
+    assert_error(status, &reply, 403, "forbidden");
+
+    let agent = server
+        .key("blocks", &["agent:a1"], Trust::Agent, false)
+        .await;
+    let (status, reply) = server.call("PUT", path, Some(&agent), Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    // Reading stays open to the key.
+    let (status, _) = server.call("GET", path, Some(&external), None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let over = json!({"content": "x", "max_chars": 100_001});
+    let (status, reply) = server
+        .call("PUT", "/v1/agents/a1/blocks/big", Some(&agent), Some(over))
+        .await;
+    assert_error(status, &reply, 400, "invalid_input");
+    let at = json!({"content": "x", "max_chars": 100_000});
+    let (status, reply) = server
+        .call("PUT", "/v1/agents/a1/blocks/big", Some(&agent), Some(at))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_rights_stop_at_the_key_max_trust() {
+    let server = Server::start().await;
+    let tenant = "admintrust";
+    let root = server.root(tenant).await;
+    let low_admin = server.key(tenant, &["*"], Trust::Agent, true).await;
+    let scope = Scope::user("u1");
+    let fact = server
+        .seed_fact(tenant, &scope, Trust::User, "user said so", None)
+        .await;
+    let episode = uuid_at(
+        &server.fact_json(&root, fact).await,
+        "/source_episode_ids/0",
+    );
+
+    for action in ["approve", "reject"] {
+        let path = format!("/v1/quarantine/{fact}/{action}");
+        let (status, reply) = server.call("POST", &path, Some(&low_admin), None).await;
+        assert_error(status, &reply, 403, "forbidden");
+        // Past the trust check, the same call fails on the fact's status instead.
+        let (status, reply) = server.call("POST", &path, Some(&root), None).await;
+        assert_error(status, &reply, 400, "invalid_input");
+    }
+    let purge = format!("/v1/episodes/{episode}/purge");
+    let (status, reply) = server.call("POST", &purge, Some(&low_admin), None).await;
+    assert_error(status, &reply, 403, "forbidden");
+    let (status, reply) = server
+        .call("DELETE", "/v1/users/u1/memory", Some(&low_admin), None)
+        .await;
+    assert_error(status, &reply, 403, "forbidden");
+    assert_eq!(server.fact_json(&root, fact).await["status"], "active");
+
+    // At its own level the same key works, and a held agent fact is what it is for.
+    let (held, status, _) = server
+        .commit_one(&low_admin, "user:u2", "agent claim")
+        .await;
+    assert_eq!(status, "quarantined");
+    let (status, reply) = server
+        .call(
+            "POST",
+            &format!("/v1/quarantine/{held}/reject"),
+            Some(&low_admin),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let (status, reply) = server
+        .call("DELETE", "/v1/users/u2/memory", Some(&low_admin), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+
+    let (status, reply) = server.call("POST", &purge, Some(&root), None).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_user_trust_may_invalidate_in_user_and_shared_scopes() {
+    let server = Server::start().await;
+    let tenant = "retract";
+    let agent = server.key(tenant, &["*"], Trust::Agent, false).await;
+    let user = server.key(tenant, &["*"], Trust::User, false).await;
+    let body = json!({"reason": "wrong"});
+    let invalidate = |id: Uuid| format!("/v1/facts/{id}/invalidate");
+
+    for scope in ["user:u1", "shared:s1"] {
+        // Equal trust: the agent wrote this one itself.
+        let (id, _, _) = server.commit_one(&agent, scope, "agent claim").await;
+        let (status, reply) = server
+            .call("POST", &invalidate(id), Some(&agent), Some(body.clone()))
+            .await;
+        assert_error(status, &reply, 403, "forbidden");
+        let (status, reply) = server
+            .call("POST", &invalidate(id), Some(&user), Some(body.clone()))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+    }
+    let (id, _, _) = server.commit_one(&agent, "agent:a1", "own note").await;
+    let (status, reply) = server
+        .call("POST", &invalidate(id), Some(&agent), Some(body))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_revoked_key_stops_working_on_the_next_request() {
     use memoryos_core::MemoryStore;
     let server = Server::start().await;
@@ -419,6 +537,49 @@ async fn one_tenant_sees_nothing_of_another() {
         server.fact_json(&alice, quarantined).await["status"],
         "quarantined"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approving_needs_the_trust_of_the_fact_it_would_close() {
+    let server = Server::start().await;
+    let tenant = "approvetrust";
+    let root = server.root(tenant).await;
+    let low_admin = server.key(tenant, &["*"], Trust::Agent, true).await;
+    let scope = Scope::agent("a1");
+    let user_fact = server
+        .seed_fact(tenant, &scope, Trust::User, "the user said so", None)
+        .await;
+
+    let mut fact = statement("an agent disagrees", "Ada");
+    fact["supersedes"] = json!(user_fact);
+    let (status, reply) = server
+        .call(
+            "POST",
+            "/v1/commits",
+            Some(&low_admin),
+            Some(json!({"scope": "agent:a1", "source": "t", "content": "c", "facts": [fact]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(reply["facts"][0]["status"], "quarantined");
+    let held = uuid_at(&reply, "/facts/0/id");
+    let held_fact = server.fact_json(&root, held).await;
+    assert_eq!(held_fact["trust"], "agent");
+    assert_eq!(held_fact["pending_supersede_of"], json!(user_fact));
+
+    let approve = format!("/v1/quarantine/{held}/approve");
+    let (status, reply) = server.call("POST", &approve, Some(&low_admin), None).await;
+    assert_error(status, &reply, 403, "forbidden");
+    let open = server.fact_json(&root, user_fact).await;
+    assert!(open["valid_to"].is_null(), "{open}");
+    assert!(open["superseded_by"].is_null(), "{open}");
+    assert_eq!(server.fact_json(&root, held).await["status"], "quarantined");
+
+    // A key that reaches the user fact can close it.
+    let (status, reply) = server.call("POST", &approve, Some(&root), None).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let closed = server.fact_json(&root, user_fact).await;
+    assert_eq!(closed["superseded_by"], json!(held));
 }
 
 #[tokio::test(flavor = "multi_thread")]

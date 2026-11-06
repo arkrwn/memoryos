@@ -14,6 +14,7 @@ enum Reply {
     Vector(Vec<f32>),
     Slow(Duration, Vec<f32>),
     Failure,
+    SlowFailure(Duration),
 }
 
 /// Answers each input with `vector_for` unless the test scripted that input, and records every batch.
@@ -46,6 +47,10 @@ impl TestEmbedder {
     /// A batch holding this input fails as a whole.
     pub fn set_failure(&self, input: &str) {
         self.set(input, Reply::Failure);
+    }
+
+    pub fn set_slow_failure(&self, input: &str, delay: Duration) {
+        self.set(input, Reply::SlowFailure(delay));
     }
 
     /// Back to `vector_for`.
@@ -84,13 +89,19 @@ impl Embedder for TestEmbedder {
                     tokio::time::sleep(delay).await;
                     vector
                 }
-                Some(Reply::Failure) => {
-                    return Err(Error::Provider("test embedder: scripted failure".into()))
+                Some(Reply::Failure) => return Err(scripted_failure()),
+                Some(Reply::SlowFailure(delay)) => {
+                    tokio::time::sleep(delay).await;
+                    return Err(scripted_failure());
                 }
             });
         }
         Ok(vectors)
     }
+}
+
+fn scripted_failure() -> Error {
+    Error::Provider("test embedder: scripted failure".into())
 }
 
 /// Deterministic per text, and unrelated between texts, so two names never merge by similarity by

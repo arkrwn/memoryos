@@ -42,6 +42,25 @@ const SLOW_REPLY: Duration = Duration::from_secs(3);
 /// Far from the query direction, behind every filler.
 const FAR: f32 = 170.0;
 
+/// `claim_episode` for a test that does not care which call created the row.
+trait InsertEpisode {
+    async fn insert_episode(
+        &self,
+        ctx: &RequestContext,
+        episode: NewEpisode,
+    ) -> memoryos_core::Result<memoryos_core::Episode>;
+}
+
+impl InsertEpisode for PgStore {
+    async fn insert_episode(
+        &self,
+        ctx: &RequestContext,
+        episode: NewEpisode,
+    ) -> memoryos_core::Result<memoryos_core::Episode> {
+        self.claim_episode(ctx, episode).await.map(|(row, _)| row)
+    }
+}
+
 // ---- Containers ------------------------------------------------------------------------------
 
 fn postgres_url() -> &'static str {

@@ -92,7 +92,8 @@ CLI, using `MEMORYOS_URL` and `MEMORYOS_API_KEY` (any agent without MCP can use 
 - `invalidated_at`: retracted as wrong. Never returned by current or `as_of` reads.
 - Superseding sets `old.valid_to = new.valid_from` and `old.superseded_by = new.id`.
 - Out-of-order input: if a new fact's `valid_from` is before the old fact's, it is stored as a
-  closed historical fact, with `valid_to = old.valid_from`, and the old fact stays current.
+  closed historical fact, with `valid_to` the start of the earliest later live fact in that chain, and
+  the head stays current.
 
 Fact visible at valid time T (default now) and knowledge time K (default now):
 
@@ -111,9 +112,13 @@ AND (invalidated_at IS NULL OR invalidated_at > K)
 | Source trust is `agent` and scope is `user:*` or `shared:*` | Quarantined, so an agent cannot plant claims in user or shared memory |
 | Fact supersedes a fact of higher trust | Quarantined, with `pending_supersede_of` set |
 | Fact supersedes a fact of equal or lower trust | Active, supersedes it |
+| `Add` with the subject and predicate of a current active fact of higher trust in the scope | Quarantined, with no `pending_supersede_of` |
 | Otherwise | Active |
 
 - A fact's trust equals its episode's trust. Corroboration never raises it.
+- The subject and predicate rule is deterministic and uses no model, and the store applies it when it
+  inserts the fact. Multi-valued predicates can get extra review, which is the accepted cost. Approval
+  activates such a fact and closes nothing.
 - A `FactOp::Supersede` whose new fact is quarantined leaves the old fact open and sets
   `pending_supersede_of`. `approve_fact` activates the fact and then performs the close.
 - Superseding rechecks trust at the chain head when it commits. If the head has higher trust than the
@@ -125,6 +130,8 @@ AND (invalidated_at IS NULL OR invalidated_at > K)
   its current trust. It re-quarantines the fact if a source rule in the table above now applies, or if
   the fact closed a live fact of now-higher trust. Pending links move to the surviving successor or
   the reopened predecessor.
+- Invalidating a fact takes it out of its chain as a purge does: what it closed takes over its end and
+  successor, so a current fact's predecessor is current again, and pending links move the same way.
 - `reject_fact` sets `rejected`. Rejected and quarantined facts never appear in recall or graph.
 - `POST /v1/episodes/{id}/purge` removes one bad source and everything derived only from it. A
   fact closed by a purged fact is reopened or relinked, so purging a poison restores the truth.
@@ -142,8 +149,16 @@ AND (invalidated_at IS NULL OR invalidated_at > K)
   stored. Each key has a tenant, scope patterns, `max_trust` and `is_admin`.
 - `server` must check `scope` against the key's patterns on every request, including reads by id,
   where it checks the loaded row's scope and returns 404 on a mismatch.
-- Blocks for agent `X` require scope `agent:X`.
+- Blocks for agent `X` require scope `agent:X`. Writing a block also requires `max_trust` of at least
+  `agent`, through REST and MCP alike.
 - Quarantine listing and approval, purge and `DELETE /v1/users/{id}/memory` require `is_admin`.
+- Admin rights stop at `max_trust`: approve and reject require `fact.trust <= max_trust`, approve also requires it of the
+  `pending_supersede_of` target, episode purge
+  requires `episode.trust <= max_trust` (a fact's trust never exceeds its highest source), and
+  `DELETE /v1/users/{id}/memory` requires it of every fact and episode in the scope. Admin keys meant
+  for people are created with `max_trust` `system`.
+- Invalidating a fact in a `user:*` or `shared:*` scope requires `max_trust` of at least `user`, even at
+  equal trust: an agent must not delete by retraction what it cannot add without review.
 
 ## 7. Retrieval
 
@@ -182,12 +197,16 @@ AND (invalidated_at IS NULL OR invalidated_at > K)
 | Request timed out | 504 | `timeout` |
 
 Limits: request body 1 MiB, commit content 100000 chars, 50 scopes per request, 100 requests per
-second per key by default. `POST /mcp` exposes the MCP tools in section 3 under the same
-authorization. It supports clients on MCP revision 2026-07-28 and earlier, and rejects any `Origin`
-that is not localhost or in `MEMORYOS_MCP_ALLOWED_ORIGINS`.
+second per key by default. Entity names and idempotency keys 512 chars, entity kinds 64. A fact's
+`valid_from` at most 1 day ahead. Block `max_chars` at most 100000, with the latest 100 versions kept
+and returned. Tokens matching no key share one budget per process, a burst of 100 refilling at 20 per
+second, and then get 429 before the database is read, except tokens that have worked since start.
+`POST /mcp` exposes the MCP tools in section 3 under the same authorization. It supports clients on
+MCP revision 2026-07-28 and earlier, and rejects any `Origin` that is not localhost. It has no CORS
+layer, so browser clients on other origins are not supported.
 
-Other rules: `POST /v1/facts/{id}/invalidate` requires `fact.trust <= key.max_trust`. A block update
-that omits `max_chars` keeps its limit.
+Other rules: `POST /v1/facts/{id}/invalidate` requires `fact.trust <= key.max_trust`, and section 6
+adds a scope rule. A block update that omits `max_chars` keeps its limit.
 
 ## 10. Configuration
 
@@ -199,7 +218,6 @@ that omits `max_chars` keeps its limit.
 | `MEMORYOS_RATE_LIMIT_RPS` | `100` | Per key |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Traces are exported only when set |
 | `MEMORYOS_REQUEST_TIMEOUT_SECS` | `30` | |
-| `MEMORYOS_MCP_ALLOWED_ORIGINS` | unset | Comma-separated, in addition to localhost |
 | `MEMORYOS_MODEL_CACHE` | user cache dir | Local model. Leave `HF_HOME` unset, since it overrides this |
 
 ## 11. Testing rules
@@ -244,6 +262,10 @@ to save.
 - `known_at` is not fully bitemporal: `valid_to` and `status` are not versioned, so a later close or
   approval shows up in reads at an earlier `known_at`.
 - `LocalEmbedder` silently truncates inputs over 512 tokens and needs at least 1 GiB of memory.
+- A fact backdated between two facts of a chain ends at the later one but does not close the earlier
+  one, so `as_of` in that gap returns both. Backdating before the whole chain is exact.
+- The subject and predicate rule covers `Add` only. A `supersedes` naming a lower-trust fact is checked
+  against that chain's head, not against other current facts with the same subject and predicate.
 - Purge edge cases with backdated facts (T14), three confirmed by temporary tests and one from reading:
   - Purging a head can reopen both its real predecessor and a backdated fact, leaving two current facts.
   - A backdated higher-trust fact can cause a needless re-quarantine, resolved by approval.

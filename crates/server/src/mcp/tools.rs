@@ -223,7 +223,7 @@ fn block_replace_tool() -> Value {
                 "label": {"type": "string"},
                 "content": {"type": "string"},
                 "expected_version": {"type": "integer", "description": "The version from block_read. Omit to create."},
-                "max_chars": {"type": "integer", "minimum": 1, "description": "Size limit. Defaults to 2000 on create and is kept on update."},
+                "max_chars": {"type": "integer", "minimum": 1, "maximum": 100000, "description": "Size limit. Defaults to 2000 on create and is kept on update."},
             },
             "required": ["agent_id", "label", "content"],
             "additionalProperties": false,
@@ -317,6 +317,10 @@ async fn run(state: &AppState, caller: &Caller, name: &str, arguments: Value) ->
         }
         COMMIT_FACTS => {
             let req: CommitRequest = parse(arguments)?;
+            // The schema promises this. REST allows it, to store a source with no facts.
+            if req.facts.is_empty() {
+                return Err(ApiError::invalid_input("facts must not be empty"));
+            }
             encode(&services.commit(caller, req).await?)
         }
         BLOCK_READ => {

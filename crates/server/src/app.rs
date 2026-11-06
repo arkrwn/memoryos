@@ -18,7 +18,7 @@ use tower_http::catch_panic::CatchPanicLayer;
 
 use crate::config::Config;
 use crate::error::ApiError;
-use crate::rate_limit::RateLimiter;
+use crate::rate_limit::{FailedAuthLimiter, RateLimiter};
 use crate::readiness::{warm_up, EmbedderReadiness, WarmUpTiming};
 use crate::service::Services;
 use crate::telemetry::Metrics;
@@ -33,9 +33,9 @@ pub struct AppState {
     pub(crate) services: Arc<Services>,
     pub(crate) metrics: Metrics,
     pub(crate) limiter: Arc<RateLimiter>,
+    pub(crate) failed_auth: Arc<FailedAuthLimiter>,
     pub(crate) readiness: Arc<EmbedderReadiness>,
     pub(crate) request_timeout: Duration,
-    pub(crate) mcp_allowed_origins: Arc<Vec<String>>,
 }
 
 fn build_embedder(config: &Config) -> Result<Arc<dyn Embedder>, String> {
@@ -84,9 +84,9 @@ pub async fn serve(
         services: Arc::new(services),
         metrics,
         limiter: Arc::new(RateLimiter::new(config.rate_limit_rps)),
+        failed_auth: Arc::new(FailedAuthLimiter::new()),
         readiness,
         request_timeout: config.request_timeout,
-        mcp_allowed_origins: Arc::new(config.mcp_allowed_origins.clone()),
     };
 
     tracing::info!("server started");
