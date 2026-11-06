@@ -5,8 +5,47 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "memoryos"
+path = "src/main.rs"
+
+[features]
+# Enables tests/integration, which needs Docker with pgvector/pgvector:pg17 and wiremock/wiremock:3.3.1.
+integration = []
+
 [dependencies]
 memoryos-core.workspace = true
+memoryos-store.workspace = true
+memoryos-llm.workspace = true
+memoryos-ingest.workspace = true
+memoryos-retrieve.workspace = true
+memoryos-agent.workspace = true
+async-trait.workspace = true
+axum = "0.8"
+base64 = "0.22"
+chrono.workspace = true
+clap = { version = "4", features = ["derive"] }
+getrandom = "0.3"
+opentelemetry = "0.31"
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "reqwest-rustls"] }
+opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace"] }
+prometheus = { version = "0.14", default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+tokio.workspace = true
+tower-http = { version = "0.6", features = ["catch-panic"] }
+tracing.workspace = true
+tracing-opentelemetry = "0.32"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid.workspace = true
+
+[dev-dependencies]
+memoryos-sdk.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_yaml_ng = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio"] }
+testcontainers = "0.25"
 
 [lints]
 workspace = true
