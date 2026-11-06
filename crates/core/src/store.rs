@@ -23,8 +23,10 @@ pub trait MemoryStore: Send + Sync {
         episode: NewEpisode,
     ) -> Result<Episode>;
     async fn get_episode(&self, ctx: &RequestContext, id: Uuid) -> Result<Episode>;
-    /// Deletes the episode. Facts it alone supports are deleted; facts with other sources
-    /// lose this source and stay. Entities left with no facts are deleted.
+    /// Deletes the episode. Facts it alone supports are deleted; facts with other sources lose
+    /// this source and stay, with trust recomputed as the highest among the remaining sources. A
+    /// surviving active fact whose new trust falls under a source quarantine rule of SPEC section 5
+    /// becomes quarantined. Entities left with no facts are deleted.
     async fn purge_episode(&self, ctx: &RequestContext, id: Uuid) -> Result<PurgeReport>;
     /// Hard-deletes everything stored under `scope`, including sessions when it is an agent scope.
     async fn purge_scope(&self, ctx: &RequestContext, scope: &Scope) -> Result<PurgeReport>;
@@ -53,9 +55,21 @@ pub trait MemoryStore: Send + Sync {
         limit: i64,
     ) -> Result<Vec<(Entity, f64)>>;
     async fn add_entity_alias(&self, ctx: &RequestContext, id: Uuid, alias: &str) -> Result<()>;
+    /// The entity in `scope` with exactly this `kind` whose name or a known alias equals `name`
+    /// under `normalize_name`. A name match wins over an alias match.
+    async fn find_entity(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        kind: &str,
+        name: &str,
+    ) -> Result<Option<Entity>>;
 
     // Facts
     async fn get_fact(&self, ctx: &RequestContext, id: Uuid) -> Result<Fact>;
+    /// Every fact linked to the episode as a source, in any status, oldest first. That covers facts
+    /// it created and facts it corroborated. Facts it created keep their creation order.
+    async fn facts_for_episode(&self, ctx: &RequestContext, episode_id: Uuid) -> Result<Vec<Fact>>;
     /// All versions in the supersession chain containing `id`, oldest first.
     async fn fact_history(&self, ctx: &RequestContext, id: Uuid) -> Result<Vec<Fact>>;
     /// Marks the fact retracted by setting `invalidated_at`. Writes an audit event.
@@ -103,11 +117,17 @@ pub trait MemoryStore: Send + Sync {
         scopes: &[Scope],
         limit: i64,
     ) -> Result<Vec<Fact>>;
+    /// Activates the fact and closes the head of the chain it was pending on. If that chain has
+    /// moved to a head the fact was not reviewed against, and that head has higher trust, nothing
+    /// is activated or closed: the fact stays quarantined, `pending_supersede_of` moves to the new
+    /// head, that change is committed, and this returns `InvalidInput` so it can be reviewed again.
     async fn approve_fact(&self, ctx: &RequestContext, id: Uuid) -> Result<Fact>;
     async fn reject_fact(&self, ctx: &RequestContext, id: Uuid) -> Result<Fact>;
 
     // Graph
     /// Entities and active edges within `depth` hops of `root` through `scopes`. `depth` is 1..=5.
+    /// Returns at most `edge_limit` edges in total, nearer hops first and newest first within a
+    /// hop. `edge_limit` must be positive, and values above the store's hard cap of 5000 use the cap.
     async fn neighbors(
         &self,
         ctx: &RequestContext,
@@ -115,6 +135,7 @@ pub trait MemoryStore: Send + Sync {
         root: Uuid,
         depth: i32,
         filter: &FactFilter,
+        edge_limit: i64,
     ) -> Result<GraphNeighborhood>;
 
     // Blocks
@@ -193,6 +214,15 @@ pub trait MemoryStore: Send + Sync {
         error: &str,
         run_after: DateTime<Utc>,
         max_attempts: i32,
+    ) -> Result<bool>;
+    /// Gives the job back without counting this claim as an attempt, for a graceful shutdown that
+    /// says nothing about the job. Runnable again at `run_after`. Returns `false` if this claim
+    /// was lost.
+    async fn release_job(
+        &self,
+        job: &Job,
+        worker_id: &str,
+        run_after: DateTime<Utc>,
     ) -> Result<bool>;
 
     // API keys: cross-tenant, looked up before the tenant is known

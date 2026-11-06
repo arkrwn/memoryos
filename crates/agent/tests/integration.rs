@@ -18,7 +18,7 @@ use memoryos_core::{
 use memoryos_llm::AnthropicClient;
 use memoryos_store::PgStore;
 use serde_json::{json, Value};
-use testcontainers::core::{IntoContainerPort, WaitFor};
+use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 use uuid::Uuid;
@@ -56,6 +56,9 @@ async fn start_postgres() -> String {
             "database system is ready to accept connections",
         ))
         .with_env_var("POSTGRES_PASSWORD", "postgres")
+        // The image declares a volume here. Without this mount each run leaks an anonymous volume,
+        // because the reaper's `docker rm -f` does not remove volumes.
+        .with_mount(Mount::tmpfs_mount("/var/lib/postgresql/data"))
         .with_cmd(["postgres", "-c", "max_connections=400", "-c", "fsync=off"])
         .start()
         .await

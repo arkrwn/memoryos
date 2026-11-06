@@ -115,6 +115,24 @@ impl FromStr for Trust {
     }
 }
 
+/// SPEC section 5: facts from this source are quarantined whatever they say, because `external`
+/// content is untrusted anywhere and an agent cannot plant claims in user or shared memory.
+pub fn source_requires_quarantine(scope: &Scope, trust: Trust) -> bool {
+    match trust {
+        Trust::External => true,
+        Trust::Agent => !matches!(scope, Scope::Agent(_)),
+        Trust::User | Trust::System => false,
+    }
+}
+
+/// Key for entity identity: case-insensitive, with whitespace runs collapsed.
+pub fn normalize_name(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FactStatus {
@@ -346,6 +364,29 @@ mod tests {
         for bad in ["user", "user:", "team:x", "user:a b", "user:a'b"] {
             assert!(bad.parse::<Scope>().is_err(), "{bad} should be rejected");
         }
+    }
+
+    #[test]
+    fn normalization_collapses_case_and_whitespace() {
+        assert_eq!(normalize_name("  Ada \t LOVELACE "), "ada lovelace");
+    }
+
+    #[test]
+    fn source_quarantine_covers_external_anywhere_and_agent_outside_its_scope() {
+        for scope in [Scope::user("u"), Scope::agent("a"), Scope::shared("s")] {
+            assert!(source_requires_quarantine(&scope, Trust::External));
+            assert!(!source_requires_quarantine(&scope, Trust::User));
+            assert!(!source_requires_quarantine(&scope, Trust::System));
+        }
+        assert!(source_requires_quarantine(&Scope::user("u"), Trust::Agent));
+        assert!(source_requires_quarantine(
+            &Scope::shared("s"),
+            Trust::Agent
+        ));
+        assert!(!source_requires_quarantine(
+            &Scope::agent("a"),
+            Trust::Agent
+        ));
     }
 
     #[test]

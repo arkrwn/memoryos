@@ -47,14 +47,6 @@ pub(crate) fn scope_strings(scopes: &[Scope]) -> Vec<String> {
     scopes.iter().map(ToString::to_string).collect()
 }
 
-/// Key for entity identity: case-insensitive, with whitespace runs collapsed.
-pub(crate) fn normalize_name(name: &str) -> String {
-    name.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
-}
-
 /// `api_keys.key_hash` must be a SHA-256 hex digest, so a raw token can never be stored by mistake.
 pub(crate) fn key_hash(value: &str) -> Result<()> {
     let valid = value.len() == 64
@@ -89,11 +81,6 @@ mod tests {
         assert!(limit(0).is_err());
         assert!(limit(1001).is_err());
         assert_eq!(limit(1000).ok(), Some(1000));
-    }
-
-    #[test]
-    fn normalize_collapses_case_and_whitespace() {
-        assert_eq!(normalize_name("  Ada \t LOVELACE "), "ada lovelace");
     }
 
     #[test]

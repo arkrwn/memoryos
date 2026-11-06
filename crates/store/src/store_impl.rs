@@ -6,9 +6,9 @@ use std::collections::BTreeSet;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use memoryos_core::{
-    ApiKey, Block, BlockVersion, Entity, Episode, Error, Fact, FactFilter, FactOp, FactStatus,
-    GraphNeighborhood, Job, MemoryStore, NewEntity, NewEpisode, PurgeReport, RequestContext,
-    Result, Scope, ScoredEpisode, ScoredFact, Session, SessionMessage, Trust,
+    normalize_name, ApiKey, Block, BlockVersion, Entity, Episode, Error, Fact, FactFilter, FactOp,
+    FactStatus, GraphNeighborhood, Job, MemoryStore, NewEntity, NewEpisode, PurgeReport,
+    RequestContext, Result, Scope, ScoredEpisode, ScoredFact, Session, SessionMessage, Trust,
 };
 use pgvector::Vector;
 use serde_json::{json, Value};
@@ -21,8 +21,9 @@ use crate::rows::{
 };
 use crate::{db, facts, validate, PgStore};
 
-/// Stops a depth-5 walk through a hub from loading an unbounded graph into memory.
-const MAX_GRAPH_EDGES: usize = 5000;
+/// Hard cap on `neighbors`, so a depth-5 walk through a hub cannot load an unbounded graph, whatever
+/// limit the caller asks for.
+const MAX_GRAPH_EDGES: i64 = 5000;
 
 /// Applies pgvector's iterative scan for this transaction, so rows removed by scope and time
 /// filters do not shrink the result below `limit`.
@@ -54,6 +55,7 @@ async fn load_fact(conn: &mut PgConnection, id: Uuid) -> Result<Fact> {
 /// Locks a fact and returns its state for the quarantine transitions.
 struct QuarantineState {
     status: String,
+    trust: Trust,
     invalidated: bool,
     valid_from: DateTime<Utc>,
     pending_supersede_of: Option<Uuid>,
@@ -61,7 +63,7 @@ struct QuarantineState {
 
 async fn lock_quarantined(conn: &mut PgConnection, id: Uuid) -> Result<QuarantineState> {
     let row = sqlx::query(
-        "SELECT status, invalidated_at IS NOT NULL AS invalidated, valid_from, \
+        "SELECT status, trust, invalidated_at IS NOT NULL AS invalidated, valid_from, \
          pending_supersede_of FROM facts WHERE id = $1 FOR UPDATE",
     )
     .bind(id)
@@ -71,6 +73,11 @@ async fn lock_quarantined(conn: &mut PgConnection, id: Uuid) -> Result<Quarantin
     .ok_or_else(|| Error::NotFound(format!("fact {id}")))?;
     let state = QuarantineState {
         status: row.try_get("status").map_err(db)?,
+        trust: row
+            .try_get::<String, _>("trust")
+            .map_err(db)?
+            .parse()
+            .map_err(|_| Error::Storage("fact has an invalid trust".into()))?,
         invalidated: row.try_get("invalidated").map_err(db)?,
         valid_from: row.try_get("valid_from").map_err(db)?,
         pending_supersede_of: row.try_get("pending_supersede_of").map_err(db)?,
@@ -197,17 +204,12 @@ impl MemoryStore for PgStore {
             .await
             .map_err(db)?
             .ok_or_else(|| Error::NotFound(format!("episode {id}")))?;
-        let report = facts::purge_episode(&mut tx, id).await?;
-        facts::audit(
-            &mut tx,
-            ctx,
-            "episode.purge",
-            Some(id),
-            facts::purge_detail(&report),
-        )
-        .await?;
+        let outcome = facts::purge_episode(&mut tx, id).await?;
+        let mut detail = facts::purge_detail(&outcome.report);
+        detail["facts_requarantined"] = json!(outcome.facts_requarantined);
+        facts::audit(&mut tx, ctx, "episode.purge", Some(id), detail).await?;
         tx.commit().await.map_err(db)?;
-        Ok(report)
+        Ok(outcome.report)
     }
 
     async fn purge_scope(&self, ctx: &RequestContext, scope: &Scope) -> Result<PurgeReport> {
@@ -272,12 +274,13 @@ impl MemoryStore for PgStore {
         validate::non_empty("kind", &entity.kind)?;
         validate::non_empty("name", &entity.name)?;
         let embedding = validate::embedding(&entity.embedding)?;
-        let normalized = validate::normalize_name(&entity.name);
+        let normalized = normalize_name(&entity.name);
+        let alias_keys: Vec<String> = entity.aliases.iter().map(|a| normalize_name(a)).collect();
         let scope = entity.scope.to_string();
         let mut tx = self.tenant_tx(ctx).await?;
         let sql = format!(
             "INSERT INTO entities (id, tenant, scope, kind, name, normalized_name, aliases, \
-             embedding) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             embedding, alias_keys) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
              ON CONFLICT (tenant, scope, kind, normalized_name) DO NOTHING \
              RETURNING {ENTITY_COLS}"
         );
@@ -290,6 +293,7 @@ impl MemoryStore for PgStore {
             .bind(&normalized)
             .bind(&entity.aliases)
             .bind(embedding)
+            .bind(&alias_keys)
             .fetch_optional(&mut *tx)
             .await
             .map_err(db)?;
@@ -366,11 +370,16 @@ impl MemoryStore for PgStore {
         validate::non_empty("alias", alias)?;
         let mut tx = self.tenant_tx(ctx).await?;
         let updated = sqlx::query(
-            "UPDATE entities SET aliases = CASE WHEN $2 = ANY(aliases) THEN aliases \
-             ELSE array_append(aliases, $2) END WHERE id = $1",
+            "UPDATE entities SET \
+                 aliases = CASE WHEN $2 = ANY(aliases) THEN aliases \
+                     ELSE array_append(aliases, $2) END, \
+                 alias_keys = CASE WHEN $3 = ANY(alias_keys) THEN alias_keys \
+                     ELSE array_append(alias_keys, $3) END \
+             WHERE id = $1",
         )
         .bind(id)
         .bind(alias)
+        .bind(normalize_name(alias))
         .execute(&mut *tx)
         .await
         .map_err(db)?;
@@ -380,9 +389,73 @@ impl MemoryStore for PgStore {
         tx.commit().await.map_err(db)
     }
 
+    async fn find_entity(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        kind: &str,
+        name: &str,
+    ) -> Result<Option<Entity>> {
+        validate::non_empty("kind", kind)?;
+        validate::non_empty("name", name)?;
+        let normalized = normalize_name(name);
+        let scope = scope.to_string();
+        let mut tx = self.tenant_tx(ctx).await?;
+        // Two statements so that a name hit stays a unique-index lookup. Oldest wins if two entities
+        // ever claim one alias, which keeps the answer stable.
+        let by_name = format!(
+            "SELECT {ENTITY_COLS} FROM entities \
+             WHERE scope = $1 AND kind = $2 AND normalized_name = $3"
+        );
+        let by_alias = format!(
+            "SELECT {ENTITY_COLS} FROM entities \
+             WHERE scope = $1 AND kind = $2 AND $3 = ANY(alias_keys) ORDER BY id LIMIT 1"
+        );
+        let mut found = None;
+        for sql in [&by_name, &by_alias] {
+            found = sqlx::query(sql)
+                .bind(&scope)
+                .bind(kind)
+                .bind(&normalized)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db)?;
+            if found.is_some() {
+                break;
+            }
+        }
+        let result = found.as_ref().map(rows::entity).transpose()?;
+        tx.commit().await.map_err(db)?;
+        Ok(result)
+    }
+
     async fn get_fact(&self, ctx: &RequestContext, id: Uuid) -> Result<Fact> {
         let mut tx = self.tenant_tx(ctx).await?;
         let result = load_fact(&mut tx, id).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(result)
+    }
+
+    async fn facts_for_episode(&self, ctx: &RequestContext, episode_id: Uuid) -> Result<Vec<Fact>> {
+        let mut tx = self.tenant_tx(ctx).await?;
+        sqlx::query("SELECT id FROM episodes WHERE id = $1")
+            .bind(episode_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db)?
+            .ok_or_else(|| Error::NotFound(format!("episode {episode_id}")))?;
+        // Ids are UUIDv7 from one generator per process, so id order is creation order.
+        let sql = format!(
+            "SELECT {FACT_COLS} FROM facts f \
+             WHERE f.id IN (SELECT l.fact_id FROM fact_sources l WHERE l.episode_id = $1) \
+             ORDER BY f.id"
+        );
+        let found = sqlx::query(&sql)
+            .bind(episode_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db)?;
+        let result = found.iter().map(rows::fact).collect::<Result<_>>()?;
         tx.commit().await.map_err(db)?;
         Ok(result)
     }
@@ -617,6 +690,38 @@ impl MemoryStore for PgStore {
                 "fact {id} was retracted and cannot be approved"
             )));
         }
+        if let Some(old_id) = state.pending_supersede_of {
+            let settled = facts::settle_supersede(
+                &mut tx,
+                id,
+                state.trust,
+                state.valid_from,
+                old_id,
+                Some(old_id),
+            )
+            .await?;
+            // The review covered `old_id`, not this head, so it does not authorize closing it.
+            if let facts::Settled::Outranked { head } = settled {
+                sqlx::query("UPDATE facts SET pending_supersede_of = $2 WHERE id = $1")
+                    .bind(id)
+                    .bind(head)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db)?;
+                facts::audit(
+                    &mut tx,
+                    ctx,
+                    "fact.approve_held",
+                    Some(id),
+                    json!({ "reviewed": old_id, "head": head }),
+                )
+                .await?;
+                tx.commit().await.map_err(db)?;
+                return Err(Error::InvalidInput(format!(
+                    "fact {id} now contradicts fact {head}, which has higher trust: review it again"
+                )));
+            }
+        }
         sqlx::query(
             "UPDATE facts SET status = 'active', pending_supersede_of = NULL WHERE id = $1",
         )
@@ -624,9 +729,6 @@ impl MemoryStore for PgStore {
         .execute(&mut *tx)
         .await
         .map_err(db)?;
-        if let Some(old_id) = state.pending_supersede_of {
-            facts::settle_supersede(&mut tx, id, state.valid_from, old_id).await?;
-        }
         facts::audit(
             &mut tx,
             ctx,
@@ -670,12 +772,19 @@ impl MemoryStore for PgStore {
         root: Uuid,
         depth: i32,
         filter: &FactFilter,
+        edge_limit: i64,
     ) -> Result<GraphNeighborhood> {
         if !(1..=5).contains(&depth) {
             return Err(Error::InvalidInput(format!(
                 "depth must be in 1..=5, got {depth}"
             )));
         }
+        if edge_limit < 1 {
+            return Err(Error::InvalidInput(format!(
+                "edge_limit must be positive, got {edge_limit}"
+            )));
+        }
+        let edge_limit = edge_limit.min(MAX_GRAPH_EDGES);
         let scope_texts = validate::scope_strings(scopes);
         let mut tx = self.tenant_tx(ctx).await?;
         let root_row = sqlx::query("SELECT id FROM entities WHERE id = $1 AND scope = ANY($2)")
@@ -691,42 +800,53 @@ impl MemoryStore for PgStore {
         // Breadth-first. `seen` holds every visited entity, so a cycle adds nothing to the next
         // frontier and the walk stops. Facts without an object are included: they describe the
         // entity and retrieval uses them as graph-expanded candidates.
+        //
+        // Each frontier entity walks its own index newest first and stops at the limit, so a hub
+        // costs the limit and not its edge count. Rows are loaded only for the ids that win.
         let filter_sql = visible(3, 4);
         let sql = format!(
-            "SELECT {FACT_COLS} FROM facts f \
-             WHERE f.scope = ANY($1) AND (f.subject_id = ANY($2) OR f.object_id = ANY($2)) \
-                 AND {filter_sql} \
-             ORDER BY f.id LIMIT $5"
+            "WITH hits AS MATERIALIZED ( \
+                 SELECT DISTINCT h.id FROM unnest($2::uuid[]) AS frontier(entity_id) \
+                 CROSS JOIN LATERAL ( \
+                     (SELECT f.id FROM facts f \
+                      WHERE f.subject_id = frontier.entity_id AND f.scope = ANY($1) \
+                          AND NOT f.id = ANY($6) AND {filter_sql} \
+                      ORDER BY f.id DESC LIMIT $5) \
+                     UNION ALL \
+                     (SELECT f.id FROM facts f \
+                      WHERE f.object_id = frontier.entity_id AND f.scope = ANY($1) \
+                          AND NOT f.id = ANY($6) AND {filter_sql} \
+                      ORDER BY f.id DESC LIMIT $5)) h \
+                 ORDER BY h.id DESC LIMIT $5) \
+             SELECT {FACT_COLS} FROM hits JOIN facts f ON f.id = hits.id ORDER BY f.id DESC"
         );
         let mut seen = BTreeSet::from([root]);
-        let mut seen_edges = BTreeSet::new();
+        let mut seen_edges: Vec<Uuid> = Vec::new();
         let mut edges = Vec::new();
         let mut frontier = vec![root];
         for _ in 0..depth {
             if frontier.is_empty() {
                 break;
             }
-            let remaining = MAX_GRAPH_EDGES.saturating_sub(edges.len());
-            if remaining == 0 {
-                tracing::warn!(%root, depth, "graph walk stopped at the edge limit");
+            let remaining = edge_limit - edges.len() as i64;
+            if remaining <= 0 {
+                tracing::debug!(%root, depth, edge_limit, "graph walk stopped at the edge limit");
                 break;
             }
-            // Asking for already-seen edges too: they do not count against what is new.
             let found = sqlx::query(&sql)
                 .bind(&scope_texts)
                 .bind(&frontier)
                 .bind(filter.as_of)
                 .bind(filter.known_at)
-                .bind((remaining + seen_edges.len()) as i64)
+                .bind(remaining)
+                .bind(&seen_edges)
                 .fetch_all(&mut *tx)
                 .await
                 .map_err(db)?;
             let mut next = Vec::new();
             for row in &found {
                 let fact = rows::fact(row)?;
-                if !seen_edges.insert(fact.id) {
-                    continue;
-                }
+                seen_edges.push(fact.id);
                 for entity in std::iter::once(fact.subject_id).chain(fact.object_id) {
                     if seen.insert(entity) {
                         next.push(entity);
@@ -1144,6 +1264,27 @@ impl MemoryStore for PgStore {
         .bind(error)
         .bind(run_after)
         .bind(max_attempts)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    async fn release_job(
+        &self,
+        job: &Job,
+        worker_id: &str,
+        run_after: DateTime<Utc>,
+    ) -> Result<bool> {
+        let updated = sqlx::query(
+            "UPDATE jobs SET status = 'pending', attempts = attempts - 1, run_after = $4, \
+                 locked_by = NULL, locked_until = NULL \
+             WHERE id = $1 AND status = 'running' AND locked_by = $2 AND attempts = $3",
+        )
+        .bind(job.id)
+        .bind(worker_id)
+        .bind(job.attempts)
+        .bind(run_after)
         .execute(&self.pool)
         .await
         .map_err(db)?;

@@ -22,7 +22,7 @@ use pgvector::Vector;
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
-use testcontainers::core::{IntoContainerPort, WaitFor};
+use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 use uuid::Uuid;
@@ -55,6 +55,9 @@ async fn start_server() -> String {
             "database system is ready to accept connections",
         ))
         .with_env_var("POSTGRES_PASSWORD", "postgres")
+        // The image declares a volume here. Without this mount each run leaks an anonymous volume,
+        // because the reaper's `docker rm -f` does not remove volumes.
+        .with_mount(Mount::tmpfs_mount("/var/lib/postgresql/data"))
         .with_cmd(["postgres", "-c", "max_connections=400", "-c", "fsync=off"])
         .start()
         .await
@@ -836,7 +839,7 @@ async fn quarantined_supersede_leaves_old_open_until_approved() -> TestResult {
     );
     assert_eq!(
         db.store
-            .neighbors(&c, &scopes, subject, 1, &no_filter)
+            .neighbors(&c, &scopes, subject, 1, &no_filter, 5000)
             .await?
             .edges
             .len(),
@@ -1242,23 +1245,23 @@ async fn neighbors_respects_depth_and_terminates_on_cycles() -> TestResult {
     };
 
     // Depth 1 from `a` follows edges in both directions: a->b and d->a.
-    let one = db.store.neighbors(&c, &scopes, a, 1, &filter).await?;
+    let one = db.store.neighbors(&c, &scopes, a, 1, &filter, 5000).await?;
     assert_eq!(one.root, a);
     assert_eq!(entity_ids(&one), BTreeSet::from([a, b, d]));
     assert_eq!(edge_ids(&one), BTreeSet::from([ab, da]));
 
-    let two = db.store.neighbors(&c, &scopes, a, 2, &filter).await?;
+    let two = db.store.neighbors(&c, &scopes, a, 2, &filter, 5000).await?;
     assert_eq!(entity_ids(&two), BTreeSet::from([a, b, d, e]));
     assert_eq!(edge_ids(&two), BTreeSet::from([ab, da, bd, de]));
 
-    let five = db.store.neighbors(&c, &scopes, a, 5, &filter).await?;
+    let five = db.store.neighbors(&c, &scopes, a, 5, &filter, 5000).await?;
     assert_eq!(entity_ids(&five), BTreeSet::from([a, b, d, e]));
     assert_eq!(edge_ids(&five), BTreeSet::from([ab, bd, da, de, ee]));
     assert_eq!(five.edges.len(), 5, "no duplicates after a cycle");
 
     for bad in [0, 6, -1] {
         assert!(is_invalid(
-            db.store.neighbors(&c, &scopes, a, bad, &filter).await
+            db.store.neighbors(&c, &scopes, a, bad, &filter, 5000).await
         ));
     }
     Ok(())
@@ -1281,7 +1284,7 @@ async fn neighbors_applies_scope_and_time_filter_to_edges() -> TestResult {
 
     let current = db
         .store
-        .neighbors(&c, &scopes, a, 2, &FactFilter::default())
+        .neighbors(&c, &scopes, a, 2, &FactFilter::default(), 5000)
         .await?;
     assert_eq!(
         current.edges.iter().map(|f| f.id).collect::<Vec<_>>(),
@@ -1291,7 +1294,7 @@ async fn neighbors_applies_scope_and_time_filter_to_edges() -> TestResult {
 
     let past = db
         .store
-        .neighbors(&c, &scopes, a, 2, &at(date(2021, 1)))
+        .neighbors(&c, &scopes, a, 2, &at(date(2021, 1)), 5000)
         .await?;
     assert_eq!(
         past.edges.iter().map(|f| f.id).collect::<Vec<_>>(),
@@ -1302,7 +1305,7 @@ async fn neighbors_applies_scope_and_time_filter_to_edges() -> TestResult {
     db.store.invalidate_fact(&c, new_edge, "wrong").await?;
     assert!(db
         .store
-        .neighbors(&c, &scopes, a, 2, &FactFilter::default())
+        .neighbors(&c, &scopes, a, 2, &FactFilter::default(), 5000)
         .await?
         .edges
         .is_empty());
@@ -1310,12 +1313,12 @@ async fn neighbors_applies_scope_and_time_filter_to_edges() -> TestResult {
     // A root outside the caller's scopes is indistinguishable from a missing one.
     assert!(is_not_found(
         db.store
-            .neighbors(&c, &[user("u2")], a, 1, &FactFilter::default())
+            .neighbors(&c, &[user("u2")], a, 1, &FactFilter::default(), 5000)
             .await
     ));
     assert!(is_not_found(
         db.store
-            .neighbors(&c, &scopes, Uuid::now_v7(), 1, &FactFilter::default())
+            .neighbors(&c, &scopes, Uuid::now_v7(), 1, &FactFilter::default(), 5000)
             .await
     ));
     Ok(())
@@ -1461,6 +1464,564 @@ async fn purge_episode_in_the_middle_of_a_chain_relinks_it() -> TestResult {
     assert_eq!(relinked.valid_to, Some(date(2022, 1)));
     assert_eq!(relinked.superseded_by, Some(last));
     assert_eq!(db.store.get_fact(&c, last).await?.valid_to, None);
+    Ok(())
+}
+
+fn with_trust(mut fact: NewFact, trust: Trust) -> NewFact {
+    fact.trust = trust;
+    fact
+}
+
+async fn corroborate(
+    db: &Db,
+    c: &RequestContext,
+    scope: &Scope,
+    trust: Trust,
+    id: Uuid,
+) -> Res<Uuid> {
+    let episode_id = new_episode(db, c, scope, trust).await?;
+    db.store
+        .apply_extraction(c, episode_id, vec![FactOp::Corroborate { fact_id: id }])
+        .await?;
+    Ok(episode_id)
+}
+
+#[tokio::test]
+async fn purging_the_trusted_source_quarantines_a_fact_left_on_an_external_one() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = user("u1");
+    let subject = entity(&db, &c, &scope, "ada").await?;
+    let (good, fact) = add_fact(&db, &c, new_fact(&scope, subject, "claim", date(2020, 1))).await?;
+    let external = corroborate(&db, &c, &scope, Trust::External, fact).await?;
+
+    let report = db.store.purge_episode(&c, good).await?;
+    assert_eq!(report.facts_deleted, 0);
+
+    let left = db.store.get_fact(&c, fact).await?;
+    assert_eq!(left.status, FactStatus::Quarantined);
+    assert_eq!(left.trust, Trust::External);
+    assert_eq!(left.source_episode_ids, vec![external]);
+    let current = db
+        .store
+        .current_facts_for_subject(&c, &scope, subject)
+        .await?;
+    assert!(current.is_empty());
+    let detail: serde_json::Value =
+        sqlx::query_scalar("SELECT detail FROM audit_events WHERE action = 'episode.purge'")
+            .fetch_one(&db.admin)
+            .await?;
+    assert_eq!(detail["facts_requarantined"], json!(1));
+    Ok(())
+}
+
+#[tokio::test]
+async fn purge_applies_the_agent_rule_by_scope() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+
+    let scope = user("u1");
+    let subject = entity(&db, &c, &scope, "ada").await?;
+    let (good, fact) = add_fact(&db, &c, new_fact(&scope, subject, "claim", date(2020, 1))).await?;
+    corroborate(&db, &c, &scope, Trust::Agent, fact).await?;
+    db.store.purge_episode(&c, good).await?;
+    let left = db.store.get_fact(&c, fact).await?;
+    assert_eq!(
+        (left.status, left.trust),
+        (FactStatus::Quarantined, Trust::Agent)
+    );
+
+    // In its own scope an agent's fact may stay active, at the lower trust.
+    let scope = Scope::agent("a1");
+    let subject = entity(&db, &c, &scope, "ada").await?;
+    let (good, fact) = add_fact(&db, &c, new_fact(&scope, subject, "claim", date(2020, 1))).await?;
+    corroborate(&db, &c, &scope, Trust::Agent, fact).await?;
+    db.store.purge_episode(&c, good).await?;
+    let left = db.store.get_fact(&c, fact).await?;
+    assert_eq!(
+        (left.status, left.trust),
+        (FactStatus::Active, Trust::Agent)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn purge_recomputes_trust_as_the_highest_remaining_source() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = user("u1");
+    let subject = entity(&db, &c, &scope, "ada").await?;
+    let fact = with_trust(
+        new_fact(&scope, subject, "claim", date(2020, 1)),
+        Trust::System,
+    );
+    let (top, fact) = add_fact(&db, &c, fact).await?;
+    corroborate(&db, &c, &scope, Trust::External, fact).await?;
+    corroborate(&db, &c, &scope, Trust::User, fact).await?;
+
+    db.store.purge_episode(&c, top).await?;
+    let left = db.store.get_fact(&c, fact).await?;
+    assert_eq!((left.status, left.trust), (FactStatus::Active, Trust::User));
+    Ok(())
+}
+
+#[tokio::test]
+async fn requarantined_fact_reopens_what_it_closed_and_approval_restores_it() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = user("u1");
+    let subject = entity(&db, &c, &scope, "ada").await?;
+    let (_, truth) = add_fact(&db, &c, new_fact(&scope, subject, "truth", date(2020, 1))).await?;
+    let good = new_episode(&db, &c, &scope, Trust::User).await?;
+    let claim = db
+        .store
+        .apply_extraction(
+            &c,
+            good,
+            vec![FactOp::Supersede {
+                old_fact_id: truth,
+                new: new_fact(&scope, subject, "claim", date(2021, 1)),
+            }],
+        )
+        .await?[0];
+    corroborate(&db, &c, &scope, Trust::External, claim).await?;
+
+    db.store.purge_episode(&c, good).await?;
+    let reopened = db.store.get_fact(&c, truth).await?;
+    assert_eq!((reopened.valid_to, reopened.superseded_by), (None, None));
+    let held = db.store.get_fact(&c, claim).await?;
+    assert_eq!(held.status, FactStatus::Quarantined);
+    assert_eq!(held.pending_supersede_of, Some(truth));
+    let current = db
+        .store
+        .current_facts_for_subject(&c, &scope, subject)
+        .await?;
+    assert_eq!(
+        current.iter().map(|f| f.id).collect::<Vec<_>>(),
+        vec![truth]
+    );
+
+    db.store.approve_fact(&c, claim).await?;
+    let closed = db.store.get_fact(&c, truth).await?;
+    assert_eq!(closed.superseded_by, Some(claim));
+    assert_eq!(closed.valid_to, Some(date(2021, 1)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn requarantined_fact_in_the_middle_of_a_chain_leaves_it_linked() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = user("u1");
+    let subject = entity(&db, &c, &scope, "ada").await?;
+    let (_, first) = add_fact(&db, &c, new_fact(&scope, subject, "a", date(2020, 1))).await?;
+    let good = new_episode(&db, &c, &scope, Trust::User).await?;
+    let middle = db
+        .store
+        .apply_extraction(
+            &c,
+            good,
+            vec![FactOp::Supersede {
+                old_fact_id: first,
+                new: new_fact(&scope, subject, "b", date(2021, 1)),
+            }],
+        )
+        .await?[0];
+    let last = supersede(
+        &db,
+        &c,
+        middle,
+        new_fact(&scope, subject, "c", date(2022, 1)),
+    )
+    .await?;
+    corroborate(&db, &c, &scope, Trust::External, middle).await?;
+
+    db.store.purge_episode(&c, good).await?;
+    let relinked = db.store.get_fact(&c, first).await?;
+    assert_eq!(relinked.superseded_by, Some(last));
+    assert_eq!(relinked.valid_to, Some(date(2022, 1)));
+    let held = db.store.get_fact(&c, middle).await?;
+    assert_eq!(held.status, FactStatus::Quarantined);
+    assert_eq!((held.superseded_by, held.valid_to), (None, None));
+    assert_eq!(held.pending_supersede_of, Some(last));
+
+    // Approval makes it history again and the head stays current.
+    let approved = db.store.approve_fact(&c, middle).await?;
+    assert_eq!(approved.superseded_by, Some(last));
+    assert_eq!(approved.valid_to, Some(date(2022, 1)));
+    assert_eq!(db.store.get_fact(&c, last).await?.valid_to, None);
+    Ok(())
+}
+
+// ---- Trust at the head of a chain ------------------------------------------------------------
+
+/// `old` closed by a system fact, so a writer that only saw `old` reaches a higher-trust head.
+async fn chain_with_system_head(
+    db: &Db,
+    c: &RequestContext,
+    scope: &Scope,
+    subject: Uuid,
+) -> Res<(Uuid, Uuid)> {
+    let (_, old) = add_fact(db, c, new_fact(scope, subject, "old", date(2020, 1))).await?;
+    let head = supersede(
+        db,
+        c,
+        old,
+        with_trust(
+            new_fact(scope, subject, "system says", date(2021, 1)),
+            Trust::System,
+        ),
+    )
+    .await?;
+    Ok((old, head))
+}
+
+#[tokio::test]
+async fn supersede_that_reaches_a_higher_trust_head_is_quarantined() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = user("u1");
+    let subject = entity(&db, &c, &scope, "ada").await?;
+    let (old, head) = chain_with_system_head(&db, &c, &scope, subject).await?;
+
+    let new = supersede(
+        &db,
+        &c,
+        old,
+        new_fact(&scope, subject, "user says", date(2022, 1)),
+    )
+    .await?;
+
+    let open = db.store.get_fact(&c, head).await?;
+    assert_eq!((open.valid_to, open.superseded_by), (None, None));
+    let held = db.store.get_fact(&c, new).await?;
+    assert_eq!(held.status, FactStatus::Quarantined);
+    assert_eq!(held.pending_supersede_of, Some(head));
+    assert_eq!((held.valid_to, held.superseded_by), (None, None));
+
+    // Approval reviewed exactly this head, so it may close it.
+    let approved = db.store.approve_fact(&c, new).await?;
+    assert_eq!(approved.status, FactStatus::Active);
+    let closed = db.store.get_fact(&c, head).await?;
+    assert_eq!(closed.superseded_by, Some(new));
+    assert_eq!(closed.valid_to, Some(date(2022, 1)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn backdated_supersede_of_a_higher_trust_head_is_quarantined_too() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = user("u1");
+    let subject = entity(&db, &c, &scope, "ada").await?;
+    let (old, head) = chain_with_system_head(&db, &c, &scope, subject).await?;
+    let new = supersede(
+        &db,
+        &c,
+        old,
+        new_fact(&scope, subject, "user says", date(2020, 6)),
+    )
+    .await?;
+    let held = db.store.get_fact(&c, new).await?;
+    assert_eq!(held.status, FactStatus::Quarantined);
+    assert_eq!(held.pending_supersede_of, Some(head));
+    Ok(())
+}
+
+#[tokio::test]
+async fn supersede_that_reaches_an_equal_trust_head_closes_it() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = user("u1");
+    let subject = entity(&db, &c, &scope, "ada").await?;
+    let (_, old) = add_fact(&db, &c, new_fact(&scope, subject, "old", date(2020, 1))).await?;
+    let head = supersede(
+        &db,
+        &c,
+        old,
+        new_fact(&scope, subject, "head", date(2021, 1)),
+    )
+    .await?;
+    let new = supersede(
+        &db,
+        &c,
+        old,
+        new_fact(&scope, subject, "new", date(2022, 1)),
+    )
+    .await?;
+    assert_eq!(db.store.get_fact(&c, new).await?.status, FactStatus::Active);
+    assert_eq!(db.store.get_fact(&c, head).await?.superseded_by, Some(new));
+    Ok(())
+}
+
+/// A quarantined fact pending on `old`, as an extraction would leave it.
+async fn pending_on(
+    db: &Db,
+    c: &RequestContext,
+    scope: &Scope,
+    subject: Uuid,
+    old: Uuid,
+) -> Res<Uuid> {
+    let mut fact = new_fact(scope, subject, "pending", date(2023, 1));
+    fact.status = FactStatus::Quarantined;
+    supersede(db, c, old, fact).await
+}
+
+#[tokio::test]
+async fn approval_is_held_when_the_target_moved_to_a_higher_trust_head() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = user("u1");
+    let subject = entity(&db, &c, &scope, "ada").await?;
+    let (_, old) = add_fact(&db, &c, new_fact(&scope, subject, "old", date(2020, 1))).await?;
+    let pending = pending_on(&db, &c, &scope, subject, old).await?;
+    let head = supersede(
+        &db,
+        &c,
+        old,
+        with_trust(
+            new_fact(&scope, subject, "system says", date(2021, 1)),
+            Trust::System,
+        ),
+    )
+    .await?;
+
+    assert!(is_invalid(db.store.approve_fact(&c, pending).await));
+    let held = db.store.get_fact(&c, pending).await?;
+    assert_eq!(held.status, FactStatus::Quarantined);
+    assert_eq!(held.pending_supersede_of, Some(head));
+    let open = db.store.get_fact(&c, head).await?;
+    assert_eq!((open.valid_to, open.superseded_by), (None, None));
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) FROM audit_events WHERE action = 'fact.approve_held'"
+        )
+        .await?,
+        1
+    );
+
+    // The second approval is a decision about this head.
+    let approved = db.store.approve_fact(&c, pending).await?;
+    assert_eq!(approved.status, FactStatus::Active);
+    assert_eq!(
+        db.store.get_fact(&c, head).await?.superseded_by,
+        Some(pending)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn approval_closes_a_moved_head_of_equal_trust_and_skips_a_retracted_one() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = user("u1");
+    let subject = entity(&db, &c, &scope, "ada").await?;
+
+    let (_, old) = add_fact(&db, &c, new_fact(&scope, subject, "old", date(2020, 1))).await?;
+    let pending = pending_on(&db, &c, &scope, subject, old).await?;
+    let head = supersede(
+        &db,
+        &c,
+        old,
+        new_fact(&scope, subject, "head", date(2021, 1)),
+    )
+    .await?;
+    db.store.approve_fact(&c, pending).await?;
+    assert_eq!(
+        db.store.get_fact(&c, head).await?.superseded_by,
+        Some(pending)
+    );
+
+    let (_, old) = add_fact(&db, &c, new_fact(&scope, subject, "old 2", date(2020, 1))).await?;
+    let pending = pending_on(&db, &c, &scope, subject, old).await?;
+    db.store.invalidate_fact(&c, old, "wrong").await?;
+    let approved = db.store.approve_fact(&c, pending).await?;
+    assert_eq!(approved.status, FactStatus::Active);
+    assert_eq!(db.store.get_fact(&c, old).await?.superseded_by, None);
+    Ok(())
+}
+
+// ---- Episode facts, entity lookup, edge limits and job release -------------------------------
+
+#[tokio::test]
+async fn facts_for_episode_lists_created_and_corroborated_facts_in_any_status() -> TestResult {
+    let db = db().await;
+    let (c, other) = (ctx("t1"), ctx("t2"));
+    let scope = user("u1");
+    let subject = entity(&db, &c, &scope, "ada").await?;
+    let (_, linked) = add_fact(&db, &c, new_fact(&scope, subject, "linked", date(2020, 1))).await?;
+
+    let mut held = new_fact(&scope, subject, "held", date(2020, 1));
+    held.status = FactStatus::Quarantined;
+    let episode_id = new_episode(&db, &c, &scope, Trust::User).await?;
+    let inserted = db
+        .store
+        .apply_extraction(
+            &c,
+            episode_id,
+            vec![
+                FactOp::Add(new_fact(&scope, subject, "first", date(2020, 1))),
+                FactOp::Corroborate { fact_id: linked },
+                FactOp::Add(held),
+            ],
+        )
+        .await?;
+
+    let found = db.store.facts_for_episode(&c, episode_id).await?;
+    assert_eq!(
+        found.iter().map(|f| f.id).collect::<Vec<_>>(),
+        vec![linked, inserted[0], inserted[1]]
+    );
+    assert_eq!(found[2].status, FactStatus::Quarantined);
+
+    let empty = new_episode(&db, &c, &scope, Trust::User).await?;
+    assert!(db.store.facts_for_episode(&c, empty).await?.is_empty());
+    assert!(is_not_found(
+        db.store.facts_for_episode(&c, Uuid::now_v7()).await
+    ));
+    assert!(is_not_found(
+        db.store.facts_for_episode(&other, episode_id).await
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn find_entity_matches_normalized_names_and_aliases_exactly() -> TestResult {
+    let db = db().await;
+    let (c, other) = (ctx("t1"), ctx("t2"));
+    let scope = user("u1");
+    let robert = entity(&db, &c, &scope, "Robert  Smith").await?;
+    db.store.add_entity_alias(&c, robert, "Bobby  S").await?;
+    let bob = entity(&db, &c, &scope, "Bob").await?;
+
+    let find = |name: &'static str| {
+        let (store, c, scope) = (db.store.clone(), c.clone(), scope.clone());
+        async move { store.find_entity(&c, &scope, "thing", name).await }
+    };
+    assert_eq!(find(" ROBERT smith ").await?.map(|e| e.id), Some(robert));
+    assert_eq!(find("bobby s").await?.map(|e| e.id), Some(robert));
+    assert_eq!(find("Bob").await?.map(|e| e.id), Some(bob));
+    assert!(find("Rob").await?.is_none());
+
+    // A name beats another entity's alias.
+    db.store.add_entity_alias(&c, robert, "Bob").await?;
+    assert_eq!(find("bob").await?.map(|e| e.id), Some(bob));
+
+    let store = &db.store;
+    assert!(store
+        .find_entity(&c, &scope, "other", "Bob")
+        .await?
+        .is_none());
+    assert!(store
+        .find_entity(&c, &user("u2"), "thing", "Bob")
+        .await?
+        .is_none());
+    assert!(store
+        .find_entity(&other, &scope, "thing", "Bob")
+        .await?
+        .is_none());
+    assert!(is_invalid(
+        store.find_entity(&c, &scope, "thing", " ").await
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn neighbors_returns_the_newest_edges_up_to_the_limit() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = user("u1");
+    let scopes = [scope.clone()];
+    let filter = FactFilter::default();
+    let hub = entity(&db, &c, &scope, "hub").await?;
+    let spoke = entity(&db, &c, &scope, "spoke").await?;
+
+    // Half point out of the hub and half into it: both directions count toward one limit.
+    let mut made = Vec::new();
+    for i in 0..12 {
+        let fact = if i % 2 == 0 {
+            edge(&db, &c, &scope, hub, spoke).await?
+        } else {
+            edge(&db, &c, &scope, spoke, hub).await?
+        };
+        made.push(fact);
+    }
+    made.reverse();
+
+    let some = db.store.neighbors(&c, &scopes, hub, 1, &filter, 5).await?;
+    assert_eq!(
+        some.edges.iter().map(|f| f.id).collect::<Vec<_>>(),
+        made[..5]
+    );
+
+    // Above the hard cap is the cap, not an error.
+    let all = db
+        .store
+        .neighbors(&c, &scopes, hub, 1, &filter, i64::MAX)
+        .await?;
+    assert_eq!(all.edges.iter().map(|f| f.id).collect::<Vec<_>>(), made);
+
+    // The limit covers the whole walk, and earlier hops are not counted twice.
+    let walk = db.store.neighbors(&c, &scopes, hub, 3, &filter, 7).await?;
+    assert_eq!(walk.edges.len(), 7);
+    let distinct: BTreeSet<Uuid> = walk.edges.iter().map(|f| f.id).collect();
+    assert_eq!(distinct.len(), 7);
+
+    for bad in [0, -1] {
+        assert!(is_invalid(
+            db.store.neighbors(&c, &scopes, hub, 1, &filter, bad).await
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn release_job_gives_the_attempt_back_and_is_fenced() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    new_episode(&db, &c, &user("u1"), Trust::User).await?;
+    let job = db.store.claim_job("w", 30).await?.expect("a job");
+    assert_eq!(job.attempts, 1);
+
+    let later = Utc::now() + chrono::Duration::hours(1);
+    assert!(!db.store.release_job(&job, "other", later).await?);
+    let mut stale = job.clone();
+    stale.attempts = 9;
+    assert!(!db.store.release_job(&stale, "w", later).await?);
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) FROM jobs WHERE status = 'running' AND attempts = 1"
+        )
+        .await?,
+        1
+    );
+
+    assert!(db.store.release_job(&job, "w", later).await?);
+    let row = sqlx::query("SELECT status, attempts, locked_by, locked_until, last_error FROM jobs")
+        .fetch_one(&db.admin)
+        .await?;
+    assert_eq!(row.try_get::<String, _>("status")?, "pending");
+    assert_eq!(row.try_get::<i32, _>("attempts")?, 0);
+    assert_eq!(row.try_get::<Option<String>, _>("locked_by")?, None);
+    assert_eq!(
+        row.try_get::<Option<DateTime<Utc>>, _>("locked_until")?,
+        None
+    );
+    assert_eq!(row.try_get::<Option<String>, _>("last_error")?, None);
+
+    // Not due until `run_after`, and a second release of the same claim does nothing.
+    assert!(db.store.claim_job("w", 30).await?.is_none());
+    assert!(!db.store.release_job(&job, "w", later).await?);
+
+    sqlx::query("UPDATE jobs SET run_after = now()")
+        .execute(&db.admin)
+        .await?;
+    let again = db.store.claim_job("w", 30).await?.expect("claimable");
+    assert_eq!(again.attempts, 1);
+    assert!(db.store.complete_job(&again, "w").await?);
+    assert!(!db.store.release_job(&again, "w", Utc::now()).await?);
     Ok(())
 }
 
@@ -2036,7 +2597,9 @@ async fn tenant_b_cannot_read_or_change_any_table_family_of_tenant_a() -> TestRe
         db.store.block_versions(&b, "bot", "persona").await
     ));
     assert!(is_not_found(
-        db.store.neighbors(&b, &scopes, subject, 2, &filter).await
+        db.store
+            .neighbors(&b, &scopes, subject, 2, &filter, 5000)
+            .await
     ));
 
     // Reads by search, with the same scope string.

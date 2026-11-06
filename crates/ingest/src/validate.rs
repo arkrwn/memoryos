@@ -8,15 +8,6 @@ pub(crate) fn is_blank_or_unstorable(value: &str) -> bool {
     value.trim().is_empty() || value.contains('\0')
 }
 
-/// Must match `normalize_name` in `memoryos-store`, which is private to that crate and keys
-/// `upsert_entity`: case-insensitive, with whitespace runs collapsed.
-pub(crate) fn normalize_name(name: &str) -> String {
-    name.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
-}
-
 /// `Person` and `person` are one kind. The store compares kinds exactly.
 pub(crate) fn normalize_kind(kind: &str) -> String {
     kind.trim().to_lowercase()
@@ -35,8 +26,7 @@ mod tests {
     }
 
     #[test]
-    fn normalization_collapses_case_and_whitespace() {
-        assert_eq!(normalize_name("  Ada \t LOVELACE "), "ada lovelace");
+    fn kind_normalization_trims_and_lowers() {
         assert_eq!(normalize_kind(" Person "), "person");
     }
 }

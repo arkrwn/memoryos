@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeZone, Utc};
 use memoryos_core::{
@@ -23,7 +23,7 @@ use memoryos_store::PgStore;
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
-use testcontainers::core::{IntoContainerPort, WaitFor};
+use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 use uuid::Uuid;
@@ -37,6 +37,9 @@ const QUERY: &str = "zebra";
 const FAILING_QUERY: &str = "failing";
 /// WireMock answers with the zero vector, which the store's vector search refuses.
 const ZERO_QUERY: &str = "zeroed";
+/// WireMock answers correctly, after `SLOW_REPLY_MS`.
+const SLOW_QUERY: &str = "slowed";
+const SLOW_REPLY_MS: u64 = 3000;
 /// Far from the query direction, behind every filler.
 const FAR: f32 = 170.0;
 
@@ -74,6 +77,9 @@ async fn start_postgres() -> String {
             "database system is ready to accept connections",
         ))
         .with_env_var("POSTGRES_PASSWORD", "postgres")
+        // The image declares a volume here. Without this mount each run leaks an anonymous volume,
+        // because the reaper's `docker rm -f` does not remove volumes.
+        .with_mount(Mount::tmpfs_mount("/var/lib/postgresql/data"))
         .with_cmd(["postgres", "-c", "max_connections=400", "-c", "fsync=off"])
         .start()
         .await
@@ -147,6 +153,28 @@ async fn start_wiremock() -> String {
         json!({"error": {"message": "down"}}),
     )
     .await;
+    let slow = json!({
+        "request": {
+            "method": "POST",
+            "url": EMBEDDINGS_URL,
+            "bodyPatterns": [{
+                "equalToJson": {"input": [SLOW_QUERY]},
+                "ignoreExtraElements": true,
+            }],
+        },
+        "response": {
+            "status": 200,
+            "fixedDelayMilliseconds": SLOW_REPLY_MS,
+            "jsonBody": embeddings_reply(&at_angle(0.0)),
+        },
+    });
+    let response = http
+        .post(format!("{url}/__admin/mappings"))
+        .json(&slow)
+        .send()
+        .await
+        .expect("register slow stub");
+    assert_eq!(response.status().as_u16(), 201, "stub rejected");
     url
 }
 
@@ -667,7 +695,7 @@ async fn quarantined_and_rejected_facts_are_absent_from_every_list() {
     let scopes = [f.scope.clone()];
     let neighborhood = f
         .store
-        .neighbors(&f.ctx, &scopes, subject, 1, &filter)
+        .neighbors(&f.ctx, &scopes, subject, 1, &filter, 5000)
         .await
         .expect("neighbors");
     let edges: BTreeSet<Uuid> = neighborhood.edges.iter().map(|edge| edge.id).collect();
@@ -740,6 +768,74 @@ async fn other_scope_is_absent_unless_requested() {
 }
 
 // ---- Failure handling ------------------------------------------------------------------------
+
+#[tokio::test]
+async fn slow_embedding_times_out_and_still_returns_text_results() {
+    let f = fixture().await;
+    let (a, b) = (f.entity("a").await, f.entity("b").await);
+    let text_hit = f.add(a, "the slowed report", 170.0).await;
+    // Near the stubbed vector, so it would appear if the embedding were waited for.
+    f.add(b, "no shared words", 0.0).await;
+
+    let embedder: Arc<dyn Embedder> = Arc::new(OpenAiEmbedder::new(
+        "test-key-not-a-real-secret".into(),
+        "test".into(),
+        Some(format!("{}/v1", servers().wiremock_url)),
+    ));
+    let short =
+        Retriever::new(f.store.clone(), embedder).with_embed_timeout(Duration::from_millis(200));
+    let started = Instant::now();
+    let response = short
+        .recall(&f.ctx, f.request(SLOW_QUERY))
+        .await
+        .expect("recall");
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    assert_eq!(ids(&response.facts), BTreeSet::from([text_hit]));
+
+    // The default gives up at 2 seconds, before the 3 second reply.
+    let started = Instant::now();
+    let response = f
+        .retriever
+        .recall(&f.ctx, f.request(SLOW_QUERY))
+        .await
+        .expect("recall");
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(1900), "{elapsed:?}");
+    assert!(
+        elapsed < Duration::from_millis(SLOW_REPLY_MS),
+        "{elapsed:?}"
+    );
+    assert_eq!(ids(&response.facts), BTreeSet::from([text_hit]));
+}
+
+#[tokio::test]
+async fn graph_expansion_reads_a_hubs_newest_edges() {
+    let f = fixture().await;
+    f.add_fillers(50).await;
+    let hub = f.entity("hub").await;
+    let oldest = f.add(hub, "hub edge oldest", FAR).await;
+    let ops = (0..60)
+        .map(|i| {
+            let statement = format!("hub edge {i}");
+            FactOp::Add(new_fact(&f.scope, hub, &statement, FAR))
+        })
+        .collect();
+    f.apply_in(&f.ctx, &f.scope, Trust::User, ops).await;
+    let newest = f.add(hub, "hub edge newest", FAR).await;
+    f.add(hub, "a zebra at the hub", FAR).await;
+
+    let mut request = f.request(QUERY);
+    request.limit = 100;
+    let found = ids(&f
+        .retriever
+        .recall(&f.ctx, request)
+        .await
+        .expect("recall")
+        .facts);
+    assert!(found.contains(&newest));
+    assert!(!found.contains(&oldest));
+}
 
 #[tokio::test]
 async fn embedding_failure_still_returns_text_results() {
@@ -822,7 +918,7 @@ async fn neighbors_failure_on_one_subject_keeps_the_rest() {
     let scopes = [f.scope.clone()];
     let failed = f
         .store
-        .neighbors(&f.ctx, &scopes, broken, 1, &FactFilter::default())
+        .neighbors(&f.ctx, &scopes, broken, 1, &FactFilter::default(), 5000)
         .await;
     assert!(matches!(failed, Err(Error::NotFound(_))));
 

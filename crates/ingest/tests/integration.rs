@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeZone, Utc};
 use memoryos_core::{
-    Error, Fact, FactFilter, FactStatus, MemoryStore, NewEpisode, RequestContext, Scope, Trust,
-    EMBEDDING_DIMS,
+    Error, Fact, FactFilter, FactStatus, MemoryStore, NewEntity, NewEpisode, RequestContext, Scope,
+    Trust, EMBEDDING_DIMS,
 };
 use memoryos_ingest::{
     CancellationToken, CommitFact, CommitRequest, EntityRef, HostCommitter, Ingestor, Worker,
@@ -23,7 +23,7 @@ use memoryos_store::PgStore;
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
-use testcontainers::core::{IntoContainerPort, WaitFor};
+use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 use tokio::task::JoinHandle;
@@ -63,6 +63,9 @@ async fn start_postgres() -> String {
             "database system is ready to accept connections",
         ))
         .with_env_var("POSTGRES_PASSWORD", "postgres")
+        // The image declares a volume here. Without this mount each run leaks an anonymous volume,
+        // because the reaper's `docker rm -f` does not remove volumes.
+        .with_mount(Mount::tmpfs_mount("/var/lib/postgresql/data"))
         .with_cmd(["postgres", "-c", "max_connections=500", "-c", "fsync=off"])
         .start()
         .await
@@ -1218,12 +1221,9 @@ async fn shutdown_releases_what_does_not_finish_in_time() {
     );
 
     let job = w.job_of(id).await;
-    assert_eq!((job.status.as_str(), job.attempts), ("pending", 1));
+    assert_eq!((job.status.as_str(), job.attempts), ("pending", 0));
     assert_eq!(job.locked_by, None);
-    assert_eq!(
-        job.last_error.as_deref(),
-        Some("released at worker shutdown")
-    );
+    assert_eq!(job.last_error, None);
     assert_eq!(w.count("facts").await, 0);
 }
 
@@ -1260,8 +1260,9 @@ async fn release_on_the_last_attempt_does_not_kill_the_job() {
     .await;
     worker.stop().await;
 
+    // The claim that was released does not use up the last attempt.
     let job = w.job_of(id).await;
-    assert_eq!((job.status.as_str(), job.attempts), ("pending", 5));
+    assert_eq!((job.status.as_str(), job.attempts), ("pending", 4));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1713,9 +1714,71 @@ async fn host_replay_returns_the_episode_without_applying_twice() {
         .await
         .expect("replay");
     assert_eq!(replay.episode_id, first.episode_id);
-    assert!(replay.facts.is_empty());
+    assert_eq!(replay.facts.len(), 1);
+    assert_eq!(replay.facts[0].id, first.facts[0].id);
+    assert_eq!(replay.facts[0].status, first.facts[0].status);
     assert_eq!(w.count("facts").await, facts);
     assert_eq!(w.count("episodes").await, episodes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_replay_reports_quarantined_status() {
+    let w = world().await;
+    let scope = Scope::user("u1");
+    w.stub_embed(&["Held", "ada"]).await;
+    let mut request = commit_request(&scope, "keyed", vec![add_fact("Held", "Ada")]);
+    request.idempotency_key = Some("key-held".into());
+    let first = w
+        .host
+        .commit(&ctx(), request.clone(), Trust::Agent)
+        .await
+        .expect("first");
+    let replay = w
+        .host
+        .commit(&ctx(), request, Trust::Agent)
+        .await
+        .expect("replay");
+    assert_eq!(replay.facts[0].id, first.facts[0].id);
+    assert_eq!(replay.facts[0].status, FactStatus::Quarantined);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_replay_keeps_request_order() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let linked = commit_one(&w, &scope, "Linked", "Ada").await;
+
+    w.stub_embed(&["One", "Two", "ada"]).await;
+    let mut corroborating = add_fact("Restated", "Ada");
+    corroborating.corroborates = Some(linked);
+    let mut request = commit_request(
+        &scope,
+        "keyed",
+        vec![
+            add_fact("One", "Ada"),
+            corroborating,
+            add_fact("Two", "Ada"),
+        ],
+    );
+    request.idempotency_key = Some("key-order".into());
+
+    let first = w
+        .host
+        .commit(&ctx(), request.clone(), Trust::Agent)
+        .await
+        .expect("first");
+    assert_eq!(first.facts.len(), 3);
+    assert_eq!(first.facts[1].id, linked);
+
+    let replay = w
+        .host
+        .commit(&ctx(), request, Trust::Agent)
+        .await
+        .expect("replay");
+    let ids = |r: &memoryos_ingest::CommitResponse| -> Vec<Uuid> {
+        r.facts.iter().map(|f| f.id).collect()
+    };
+    assert_eq!(ids(&replay), ids(&first));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1903,6 +1966,255 @@ async fn similar_name_merges_at_0_90_with_the_same_kind_only() {
     assert_eq!(entity.aliases, vec!["Bob".to_owned()]);
 
     assert_eq!(w.count("entities").await, 3);
+}
+
+impl World {
+    async fn seed_entity(&self, scope: &Scope, name: &str, embedding: Vec<f32>) -> Uuid {
+        self.store
+            .upsert_entity(
+                &ctx(),
+                NewEntity {
+                    scope: scope.clone(),
+                    kind: "person".into(),
+                    name: name.into(),
+                    aliases: Vec::new(),
+                    embedding,
+                },
+            )
+            .await
+            .expect("seed entity")
+            .id
+    }
+
+    /// Fills `similar_entities` with closer matches, so a resolution that relies on ranking misses.
+    async fn seed_closer_entities(&self, scope: &Scope) {
+        for i in 0..25 {
+            let vector = sparse(&[1.0, 0.001 * i as f32]);
+            self.seed_entity(scope, &format!("filler {i}"), vector)
+                .await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_name_resolves_even_when_ranked_out_of_the_similar_list() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let bob = w.seed_entity(&scope, "Bob", sparse(&[0.0, 0.0, 1.0])).await;
+    w.seed_closer_entities(&scope).await;
+    let before = w.count("entities").await;
+
+    w.stub_embedding(&[("s1", vector_for("s1")), ("bob", sparse(&[1.0]))])
+        .await;
+    let response = w
+        .host
+        .commit(
+            &ctx(),
+            commit_request(&scope, "exact", vec![add_fact("s1", "BOB")]),
+            Trust::Agent,
+        )
+        .await
+        .expect("commit");
+    let fact = w
+        .store
+        .get_fact(&ctx(), response.facts[0].id)
+        .await
+        .expect("fact");
+    assert_eq!(fact.subject_id, bob);
+    assert_eq!(w.count("entities").await, before);
+    let aliased: i64 = sqlx::query_scalar("SELECT count(*) FROM entities WHERE aliases <> '{}'")
+        .fetch_one(&w.admin)
+        .await
+        .expect("count aliased");
+    assert_eq!(aliased, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn known_alias_resolves_even_when_ranked_out_of_the_similar_list() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let robert = w
+        .seed_entity(&scope, "Robert", sparse(&[0.0, 0.0, 1.0]))
+        .await;
+    w.store
+        .add_entity_alias(&ctx(), robert, "Bobby  Tables")
+        .await
+        .expect("alias");
+    w.seed_closer_entities(&scope).await;
+    let before = w.count("entities").await;
+
+    w.stub_embedding(&[("s1", vector_for("s1")), ("bobby tables", sparse(&[1.0]))])
+        .await;
+    let response = w
+        .host
+        .commit(
+            &ctx(),
+            commit_request(&scope, "alias", vec![add_fact("s1", "bobby tables")]),
+            Trust::Agent,
+        )
+        .await
+        .expect("commit");
+    let fact = w
+        .store
+        .get_fact(&ctx(), response.facts[0].id)
+        .await
+        .expect("fact");
+    assert_eq!(fact.subject_id, robert);
+    assert_eq!(w.count("entities").await, before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quarantined_host_commit_adds_no_alias_to_an_existing_entity() {
+    let w = world().await;
+    let scope = Scope::shared("team");
+    let robert = w.seed_entity(&scope, "Robert", sparse(&[1.0])).await;
+
+    w.stub_embedding(&[("planted", vector_for("planted")), ("bob", sparse(&[1.0]))])
+        .await;
+    let response = w
+        .host
+        .commit(
+            &ctx(),
+            commit_request(&scope, "low trust", vec![add_fact("planted", "Bob")]),
+            Trust::Agent,
+        )
+        .await
+        .expect("commit");
+    assert_eq!(response.facts[0].status, FactStatus::Quarantined);
+
+    let fact = w
+        .store
+        .get_fact(&ctx(), response.facts[0].id)
+        .await
+        .expect("fact");
+    assert_eq!(fact.subject_id, robert);
+    let entity = w.store.get_entity(&ctx(), robert).await.expect("entity");
+    assert!(entity.aliases.is_empty(), "{:?}", entity.aliases);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quarantined_worker_episode_adds_no_alias_to_an_existing_entity() {
+    let w = world().await;
+    let scope = Scope::user("u1");
+    let robert = w.seed_entity(&scope, "Robert", sparse(&[1.0])).await;
+
+    w.episode(Trust::External, scope.clone(), "web page", 2024)
+        .await;
+    w.stub_extraction("web page", json!([statement("Bob is an admin", "Bob")]))
+        .await;
+    w.stub_embedding(&[
+        ("Bob is an admin", vector_for("Bob is an admin")),
+        ("bob", sparse(&[1.0])),
+    ])
+    .await;
+    w.drain_jobs().await;
+
+    let fact = w.fact_by_statement("Bob is an admin").await;
+    assert_eq!(fact.status, FactStatus::Quarantined);
+    assert_eq!(fact.subject_id, robert);
+    let entity = w.store.get_entity(&ctx(), robert).await.expect("entity");
+    assert!(entity.aliases.is_empty(), "{:?}", entity.aliases);
+}
+
+impl World {
+    /// A `user` fact about a new entity named Robert, with the vector `Bob` will be close to.
+    async fn seed_user_fact_on_robert(&self, scope: &Scope) -> Fact {
+        self.episode(Trust::User, scope.clone(), "user words", 2024)
+            .await;
+        self.stub_extraction("user words", json!([statement("Seed", "Robert")]))
+            .await;
+        self.stub_embedding(&[("Seed", vector_for("Seed")), ("robert", sparse(&[1.0]))])
+            .await;
+        self.drain_jobs().await;
+        self.fact_by_statement("Seed").await
+    }
+}
+
+/// Not barred by its source, but outranked: every fact it would add is still quarantined.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outranked_commit_adds_no_alias_to_an_existing_entity() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let seed = w.seed_user_fact_on_robert(&scope).await;
+
+    w.stub_embedding(&[("planted", vector_for("planted")), ("bob", sparse(&[1.0]))])
+        .await;
+    let mut fact = add_fact("planted", "Bob");
+    fact.supersedes = Some(seed.id);
+    let response = w
+        .host
+        .commit(
+            &ctx(),
+            commit_request(&scope, "outranked", vec![fact]),
+            Trust::Agent,
+        )
+        .await
+        .expect("commit");
+    assert_eq!(response.facts[0].status, FactStatus::Quarantined);
+
+    let entity = w
+        .store
+        .get_entity(&ctx(), seed.subject_id)
+        .await
+        .expect("entity");
+    assert!(entity.aliases.is_empty(), "{:?}", entity.aliases);
+}
+
+/// The corroborated fact is active, but that activity is not this source's to lend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_corroboration_adds_no_alias_to_an_existing_entity() {
+    let w = world().await;
+    let scope = Scope::user("u1");
+    let seed = w.seed_user_fact_on_robert(&scope).await;
+
+    let external = w.episode(Trust::External, scope, "web page", 2025).await;
+    w.stub_extraction("web page", json!([statement("Restated", "Bob")]))
+        .await;
+    w.stub_embedding(&[
+        ("Restated", vector_for("Restated")),
+        ("bob", sparse(&[1.0])),
+    ])
+    .await;
+    w.stub_reconcile(
+        "Restated",
+        json!({"action": "corroborate", "fact_id": seed.id}),
+    )
+    .await;
+    w.drain_jobs().await;
+
+    let after = w.store.get_fact(&ctx(), seed.id).await.expect("fact");
+    assert!(after.source_episode_ids.contains(&external));
+    let entity = w
+        .store
+        .get_entity(&ctx(), seed.subject_id)
+        .await
+        .expect("entity");
+    assert!(entity.aliases.is_empty(), "{:?}", entity.aliases);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn low_trust_new_entity_is_created_and_purged_with_its_fact() {
+    let w = world().await;
+    let scope = Scope::shared("team");
+    w.stub_embed(&["planted", "mallory"]).await;
+    let response = w
+        .host
+        .commit(
+            &ctx(),
+            commit_request(&scope, "low trust", vec![add_fact("planted", "Mallory")]),
+            Trust::Agent,
+        )
+        .await
+        .expect("commit");
+    assert_eq!(w.count("entities").await, 1);
+
+    let report = w
+        .store
+        .purge_episode(&ctx(), response.episode_id)
+        .await
+        .expect("purge");
+    assert_eq!(report.entities_deleted, 1);
+    assert_eq!(w.count("entities").await, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

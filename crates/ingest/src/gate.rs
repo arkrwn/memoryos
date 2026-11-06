@@ -2,7 +2,7 @@
 //! mode both come through `build_op`.
 
 use chrono::{DateTime, Utc};
-use memoryos_core::{FactOp, FactStatus, NewFact, Scope, Trust};
+use memoryos_core::{source_requires_quarantine, FactOp, FactStatus, NewFact, Scope, Trust};
 use uuid::Uuid;
 
 /// The episode a fact derives from. A fact's trust always equals its episode's trust.
@@ -36,13 +36,8 @@ pub(crate) enum Resolution {
 
 /// SPEC section 5. `contradicted` is the trust of the fact the statement would supersede.
 pub(crate) fn status_for(scope: &Scope, trust: Trust, contradicted: Option<Trust>) -> FactStatus {
-    let barred_by_source = match trust {
-        Trust::External => true,
-        Trust::Agent => !matches!(scope, Scope::Agent(_)),
-        Trust::User | Trust::System => false,
-    };
     let outranked = contradicted.is_some_and(|old| old > trust);
-    if barred_by_source || outranked {
+    if source_requires_quarantine(scope, trust) || outranked {
         FactStatus::Quarantined
     } else {
         FactStatus::Active

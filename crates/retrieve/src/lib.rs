@@ -2,6 +2,7 @@
 //! See docs/SPEC.md sections 2, 7 and 14.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures::future::join_all;
@@ -21,8 +22,12 @@ const MAX_SCOPES: usize = 50;
 const CANDIDATES_PER_LIST: i64 = 50;
 const GRAPH_SEED_FACTS: usize = 5;
 const GRAPH_DEPTH: i32 = 1;
+/// Bounds how many edges the database reads for one subject, however many it has.
+const GRAPH_EDGES_PER_SUBJECT: i64 = 50;
 /// Bounds how many edges reach fusion, however many a subject has.
 const MAX_GRAPH_CANDIDATES: usize = 50;
+/// A slow provider must not hold up recall, since text search can answer without it.
+const DEFAULT_EMBED_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RecallRequest {
@@ -49,11 +54,22 @@ pub struct RecallResponse {
 pub struct Retriever {
     store: Arc<dyn MemoryStore>,
     embedder: Arc<dyn Embedder>,
+    embed_timeout: Duration,
 }
 
 impl Retriever {
     pub fn new(store: Arc<dyn MemoryStore>, embedder: Arc<dyn Embedder>) -> Self {
-        Self { store, embedder }
+        Self {
+            store,
+            embedder,
+            embed_timeout: DEFAULT_EMBED_TIMEOUT,
+        }
+    }
+
+    /// How long to wait for the query embedding before using text search only. Defaults to 2 seconds.
+    pub fn with_embed_timeout(mut self, timeout: Duration) -> Self {
+        self.embed_timeout = timeout;
+        self
     }
 
     /// Ranked facts, plus episodes still being processed when the read is about the present.
@@ -127,17 +143,27 @@ impl Retriever {
     }
 
     async fn embed_query(&self, query: &str) -> Option<Vec<f32>> {
-        match self.embedder.embed(&[query.to_owned()]).await {
-            Ok(vectors) => {
+        let input = [query.to_owned()];
+        let embedded = tokio::time::timeout(self.embed_timeout, self.embedder.embed(&input)).await;
+        match embedded {
+            Ok(Ok(vectors)) => {
                 let first = vectors.into_iter().next();
                 if first.is_none() {
                     tracing::warn!("embedder returned no vector, using text search only");
                 }
                 first
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 let kind = fusion::error_kind(&error);
                 tracing::warn!(kind, "query embedding failed, using text search only");
+                None
+            }
+            Err(_) => {
+                let timeout_ms = self.embed_timeout.as_millis() as u64;
+                tracing::warn!(
+                    timeout_ms,
+                    "query embedding timed out, using text search only"
+                );
                 None
             }
         }
@@ -177,7 +203,14 @@ impl Retriever {
         let expansions = subjects.iter().map(|&subject| async move {
             let neighborhood = self
                 .store
-                .neighbors(ctx, scopes, subject, GRAPH_DEPTH, filter)
+                .neighbors(
+                    ctx,
+                    scopes,
+                    subject,
+                    GRAPH_DEPTH,
+                    filter,
+                    GRAPH_EDGES_PER_SUBJECT,
+                )
                 .await;
             (subject, neighborhood)
         });
