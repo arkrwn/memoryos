@@ -1,0 +1,30 @@
+[package]
+name = "memoryos-hooks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# Enables tests/integration.rs, which builds the real binary and needs Docker with
+# pgvector/pgvector:pg17 and wiremock/wiremock:3.3.1.
+integration = []
+
+[dependencies]
+memoryos-sdk.workspace = true
+chrono.workspace = true
+clap = { version = "4", features = ["derive"] }
+serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+sha2 = "0.10"
+tokio.workspace = true
+url = "2"
+uuid.workspace = true
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tempfile = "3"
+testcontainers = "0.25"
+
+[lints]
+workspace = true

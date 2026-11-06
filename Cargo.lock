@@ -1923,6 +1923,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "memoryos-hooks"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "memoryos-sdk",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "testcontainers",
+ "tokio",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "memoryos-ingest"
 version = "0.1.0"
 dependencies = [
@@ -2005,6 +2023,7 @@ dependencies = [
  "getrandom 0.3.4",
  "memoryos-agent",
  "memoryos-core",
+ "memoryos-hooks",
  "memoryos-ingest",
  "memoryos-llm",
  "memoryos-retrieve",

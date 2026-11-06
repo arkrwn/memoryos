@@ -46,6 +46,8 @@ pub enum Command {
     /// Manage API keys.
     #[command(subcommand)]
     Key(KeyCommand),
+    #[command(flatten)]
+    Client(memoryos_hooks::Command),
 }
 
 #[derive(Debug, Subcommand)]
@@ -88,6 +90,7 @@ pub fn dispatch(cli: Cli) -> Result<(), String> {
             admin,
         }) => block_on(create_key(tenant, name, scopes, max_trust, admin)),
         Command::Key(KeyCommand::Revoke { id }) => block_on(revoke_key(id)),
+        Command::Client(command) => memoryos_hooks::run(command),
     }
 }
 
