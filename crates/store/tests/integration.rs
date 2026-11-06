@@ -3421,3 +3421,78 @@ async fn quarantine_prefixes_match_literally_and_stay_in_the_tenant() -> TestRes
     assert!(listed(vec![], vec![""], "b").await?.is_empty());
     Ok(())
 }
+
+// ---- Text search candidate cap -----------------------------------------------------------------
+
+/// The cap on ranked candidates applies after every filter, so 1100 newer matches that the reader
+/// may not see cannot push out the one match it may see.
+#[tokio::test]
+async fn the_text_candidate_cap_applies_after_isolation_and_time_filters() -> TestResult {
+    let db = db().await;
+    let c = ctx("a");
+    let scope = user("capped");
+    let subject = entity(&db, &c, &scope, "Ada").await?;
+    let (_, visible) = add_fact(
+        &db,
+        &c,
+        new_fact(&scope, subject, "common word", date(2020, 1)),
+    )
+    .await?;
+
+    // All match the word: other tenant, other scope, not yet valid at the read time, closed by then.
+    let other = ctx("b");
+    let other_subject = entity(&db, &other, &scope, "Ada").await?;
+    for (tenant, scope_text, entity_id, from, to) in [
+        ("b", "user:capped", other_subject, "2020-01-01", None),
+        ("a", "user:elsewhere", subject, "2020-01-01", None),
+        ("a", "user:capped", subject, "2023-01-01", None),
+        (
+            "a",
+            "user:capped",
+            subject,
+            "2020-01-01",
+            Some("2020-01-02"),
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO facts (id, tenant, scope, subject_id, predicate, statement, embedding, \
+                 trust, status, valid_from, valid_to) \
+             SELECT gen_random_uuid(), $1, $2, $3, 'says', 'common word', \
+                 (SELECT embedding FROM facts LIMIT 1), 'user', 'active', $4::timestamptz, \
+                 $5::timestamptz \
+             FROM generate_series(1, 1100)",
+        )
+        .bind(tenant)
+        .bind(scope_text)
+        .bind(entity_id)
+        .bind(from)
+        .bind(to)
+        .execute(&db.admin)
+        .await?;
+    }
+    // Sorted above every other id, so a cap applied before the filters would see only these.
+    sqlx::query("UPDATE facts SET id = ('ffffffff' || substr(id::text, 9))::uuid WHERE id <> $1")
+        .bind(visible)
+        .execute(&db.admin)
+        .await?;
+
+    let read_at = at(date(2022, 1));
+    let found = db
+        .store
+        .search_facts_text(&c, std::slice::from_ref(&scope), "common", &read_at, 50)
+        .await?;
+    assert_eq!(
+        found.iter().map(|hit| hit.fact.id).collect::<Vec<_>>(),
+        [visible]
+    );
+
+    // A word in more facts than the cap returns from the newest ones, up to the limit asked for.
+    let now = FactFilter::default();
+    let many = db
+        .store
+        .search_facts_text(&c, std::slice::from_ref(&scope), "common", &now, 50)
+        .await?;
+    assert_eq!(many.len(), 50);
+    assert!(many.iter().all(|hit| hit.fact.id != visible));
+    Ok(())
+}

@@ -193,22 +193,36 @@ $$;
 ALTER TABLE facts NO FORCE ROW LEVEL SECURITY;
 ALTER TABLE episodes NO FORCE ROW LEVEL SECURITY;
 
+-- Ranks at most the newest 1000 matches, or p_limit if larger, after every filter. Without the cap a
+-- word in most facts ranks all of them: measured 1.2 s at 1M facts in one scope. The cost is that
+-- older matches of such a word cannot be returned. EXECUTE plans with the real query, so a rare word
+-- uses GIN and a common one walks ids backward and stops early.
 CREATE FUNCTION search_fact_ids_text(p_scopes text[], p_query text, p_as_of timestamptz, p_known_at timestamptz, p_limit bigint)
 RETURNS TABLE (id uuid, rank real)
-LANGUAGE sql STABLE SECURITY DEFINER
+LANGUAGE plpgsql STABLE SECURITY DEFINER
 SET search_path = public
 AS $$
-    SELECT f.id, ts_rank(f.statement_tsv, q) AS rank
-    FROM facts f, websearch_to_tsquery('simple', p_query) q
-    WHERE f.tenant = current_setting('app.tenant', true)
-      AND f.scope = ANY (p_scopes)
-      AND f.status = 'active'
-      AND f.statement_tsv @@ q
-      AND f.valid_from <= p_as_of AND (f.valid_to IS NULL OR f.valid_to > p_as_of)
-      AND f.recorded_at <= p_known_at
-      AND (f.invalidated_at IS NULL OR f.invalidated_at > p_known_at)
-    ORDER BY rank DESC, f.id
-    LIMIT p_limit;
+DECLARE
+    q tsquery := websearch_to_tsquery('simple', p_query);
+BEGIN
+    RETURN QUERY EXECUTE $sql$
+        SELECT c.id, ts_rank(c.statement_tsv, $1) AS rank
+        FROM (
+            SELECT f.id, f.statement_tsv FROM facts f
+            WHERE f.tenant = current_setting('app.tenant', true)
+              AND f.scope = ANY ($2)
+              AND f.status = 'active'
+              AND f.statement_tsv @@ $1
+              AND f.valid_from <= $3 AND (f.valid_to IS NULL OR f.valid_to > $3)
+              AND f.recorded_at <= $4
+              AND (f.invalidated_at IS NULL OR f.invalidated_at > $4)
+            ORDER BY f.id DESC
+            LIMIT GREATEST(1000, $5)
+        ) c
+        ORDER BY rank DESC, c.id
+        LIMIT $5
+    $sql$ USING q, p_scopes, p_as_of, p_known_at, p_limit;
+END;
 $$;
 
 -- Only `user` and `system` episodes are readable before processing. See SPEC section 3.
