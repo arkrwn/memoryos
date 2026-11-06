@@ -1,1 +1,286 @@
-//! See docs/SPEC.md section 2 for this crate's public API.
+//! Hybrid retrieval over facts: vector, text and graph lists merged by reciprocal rank fusion.
+//! See docs/SPEC.md sections 2, 7 and 14.
+
+use std::sync::Arc;
+
+use chrono::{DateTime, Utc};
+use futures::future::join_all;
+use memoryos_core::{
+    Embedder, Error, Fact, FactFilter, MemoryStore, RequestContext, Result, Scope, ScoredEpisode,
+    ScoredFact,
+};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+mod fusion;
+
+pub const DEFAULT_LIMIT: i64 = 10;
+pub const MAX_LIMIT: i64 = 100;
+
+const MAX_SCOPES: usize = 50;
+const CANDIDATES_PER_LIST: i64 = 50;
+const GRAPH_SEED_FACTS: usize = 5;
+const GRAPH_DEPTH: i32 = 1;
+/// Bounds how many edges reach fusion, however many a subject has.
+const MAX_GRAPH_CANDIDATES: usize = 50;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecallRequest {
+    pub scopes: Vec<Scope>,
+    pub query: String,
+    #[serde(default = "default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub as_of: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub known_at: Option<DateTime<Utc>>,
+}
+
+fn default_limit() -> i64 {
+    DEFAULT_LIMIT
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecallResponse {
+    pub facts: Vec<ScoredFact>,
+    pub pending_episodes: Vec<ScoredEpisode>,
+}
+
+pub struct Retriever {
+    store: Arc<dyn MemoryStore>,
+    embedder: Arc<dyn Embedder>,
+}
+
+impl Retriever {
+    pub fn new(store: Arc<dyn MemoryStore>, embedder: Arc<dyn Embedder>) -> Self {
+        Self { store, embedder }
+    }
+
+    /// Ranked facts, plus episodes still being processed when the read is about the present.
+    pub async fn recall(&self, ctx: &RequestContext, req: RecallRequest) -> Result<RecallResponse> {
+        let limit = validate(&req.scopes, &req.query, req.limit)?;
+        let filter = FactFilter {
+            as_of: req.as_of,
+            known_at: req.known_at,
+        };
+        let read_is_current = req.as_of.is_none() && req.known_at.is_none();
+        let (facts, pending_episodes) = tokio::try_join!(
+            self.ranked_facts(ctx, &req.scopes, &req.query, &filter, limit),
+            async {
+                if read_is_current {
+                    self.store
+                        .search_pending_episodes(ctx, &req.scopes, &req.query, req.limit)
+                        .await
+                } else {
+                    Ok(Vec::new())
+                }
+            },
+        )?;
+        Ok(RecallResponse {
+            facts,
+            pending_episodes,
+        })
+    }
+
+    /// Related current facts for a statement the host may commit: recall without pending episodes.
+    pub async fn candidates(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        statement: &str,
+        limit: i64,
+    ) -> Result<Vec<ScoredFact>> {
+        let limit = validate(scopes, statement, limit)?;
+        self.ranked_facts(ctx, scopes, statement, &FactFilter::default(), limit)
+            .await
+    }
+
+    async fn ranked_facts(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        query: &str,
+        filter: &FactFilter,
+        limit: usize,
+    ) -> Result<Vec<ScoredFact>> {
+        let embedding = self.embed_query(query).await;
+        let (vector, text) = tokio::join!(
+            self.vector_list(ctx, scopes, embedding.as_deref(), filter),
+            self.store
+                .search_facts_text(ctx, scopes, query, filter, CANDIDATES_PER_LIST),
+        );
+        // Text search is the fallback for vector search, so nothing is left if it fails too.
+        let text = facts_only(text?);
+
+        // Fused twice on purpose: the first pass only picks which subjects to expand.
+        let subjects = fusion::top_subjects(&fusion::fuse(&[&vector, &text]), GRAPH_SEED_FACTS);
+        let graph = self.graph_list(ctx, scopes, &subjects, filter).await;
+
+        Ok(fusion::fuse(&[&vector, &text, &graph])
+            .into_iter()
+            .take(limit)
+            .map(|(fact, score)| ScoredFact {
+                fact: fact.clone(),
+                score,
+            })
+            .collect())
+    }
+
+    async fn embed_query(&self, query: &str) -> Option<Vec<f32>> {
+        match self.embedder.embed(&[query.to_owned()]).await {
+            Ok(vectors) => {
+                let first = vectors.into_iter().next();
+                if first.is_none() {
+                    tracing::warn!("embedder returned no vector, using text search only");
+                }
+                first
+            }
+            Err(error) => {
+                let kind = fusion::error_kind(&error);
+                tracing::warn!(kind, "query embedding failed, using text search only");
+                None
+            }
+        }
+    }
+
+    async fn vector_list(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        embedding: Option<&[f32]>,
+        filter: &FactFilter,
+    ) -> Vec<Fact> {
+        let Some(embedding) = embedding else {
+            return Vec::new();
+        };
+        let found = self
+            .store
+            .search_facts_vector(ctx, scopes, embedding, filter, CANDIDATES_PER_LIST)
+            .await;
+        match found {
+            Ok(scored) => facts_only(scored),
+            Err(error) => {
+                let kind = fusion::error_kind(&error);
+                tracing::warn!(kind, "vector search failed, using text search only");
+                Vec::new()
+            }
+        }
+    }
+
+    async fn graph_list(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        subjects: &[Uuid],
+        filter: &FactFilter,
+    ) -> Vec<Fact> {
+        let expansions = subjects.iter().map(|&subject| async move {
+            let neighborhood = self
+                .store
+                .neighbors(ctx, scopes, subject, GRAPH_DEPTH, filter)
+                .await;
+            (subject, neighborhood)
+        });
+        let results = join_all(expansions).await;
+        fusion::interleave(fusion::usable_edges(results), MAX_GRAPH_CANDIDATES)
+    }
+}
+
+fn facts_only(scored: Vec<ScoredFact>) -> Vec<Fact> {
+    scored.into_iter().map(|scored| scored.fact).collect()
+}
+
+/// Checks the request and returns `limit` as a count. Messages never quote the query.
+fn validate(scopes: &[Scope], query: &str, limit: i64) -> Result<usize> {
+    if scopes.is_empty() || scopes.len() > MAX_SCOPES {
+        return Err(Error::InvalidInput(format!(
+            "scopes must have 1 to {MAX_SCOPES} entries, got {}",
+            scopes.len()
+        )));
+    }
+    if query.trim().is_empty() {
+        return Err(Error::InvalidInput("query must not be empty".into()));
+    }
+    if !(1..=MAX_LIMIT).contains(&limit) {
+        return Err(Error::InvalidInput(format!(
+            "limit must be in 1..={MAX_LIMIT}, got {limit}"
+        )));
+    }
+    Ok(limit as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scopes(count: usize) -> Vec<Scope> {
+        (0..count).map(|i| Scope::user(format!("u{i}"))).collect()
+    }
+
+    fn is_invalid(result: Result<usize>) -> bool {
+        matches!(result, Err(Error::InvalidInput(_)))
+    }
+
+    fn parse(text: &str) -> RecallRequest {
+        serde_json::from_str(text).expect("valid request")
+    }
+
+    #[test]
+    fn scope_count_must_be_1_to_50() {
+        assert!(is_invalid(validate(&scopes(0), "q", 10)));
+        assert!(is_invalid(validate(&scopes(51), "q", 10)));
+        assert_eq!(validate(&scopes(1), "q", 10).ok(), Some(10));
+        assert_eq!(validate(&scopes(50), "q", 10).ok(), Some(10));
+    }
+
+    #[test]
+    fn query_must_have_content() {
+        for blank in ["", "   ", " \n\t "] {
+            assert!(is_invalid(validate(&scopes(1), blank, 10)));
+        }
+    }
+
+    #[test]
+    fn limit_must_be_1_to_100() {
+        for bad in [i64::MIN, -1, 0, 101, i64::MAX] {
+            assert!(is_invalid(validate(&scopes(1), "q", bad)), "{bad}");
+        }
+        assert_eq!(validate(&scopes(1), "q", 1).ok(), Some(1));
+        assert_eq!(validate(&scopes(1), "q", 100).ok(), Some(100));
+    }
+
+    #[test]
+    fn request_defaults_limit_and_times() {
+        let request = parse(r#"{"scopes":["user:a"],"query":"q"}"#);
+        assert_eq!(request.limit, DEFAULT_LIMIT);
+        assert!(request.as_of.is_none());
+        assert!(request.known_at.is_none());
+        assert_eq!(request.scopes, [Scope::user("a")]);
+
+        let request = parse(
+            r#"{"scopes":[],"query":"q","limit":3,"as_of":"2024-01-02T03:04:05Z","known_at":null}"#,
+        );
+        assert_eq!(request.limit, 3);
+        assert!(request.as_of.is_some());
+        assert!(request.known_at.is_none());
+    }
+
+    #[test]
+    fn request_rejects_a_bad_scope() {
+        let parsed = serde_json::from_str::<RecallRequest>(r#"{"scopes":["team:a"],"query":"q"}"#);
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn response_serializes_the_openapi_fields() {
+        let response = RecallResponse {
+            facts: vec![],
+            pending_episodes: vec![],
+        };
+        let json = serde_json::to_value(&response).expect("serializes");
+        assert_eq!(
+            json,
+            serde_json::json!({"facts": [], "pending_episodes": []})
+        );
+    }
+}
