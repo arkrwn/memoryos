@@ -948,7 +948,7 @@ fn claude_code_install_merges_and_is_idempotent_and_reversible() {
     assert_eq!(
         merged["hooks"]["SessionStart"],
         json!([{
-            "matcher": "startup|resume|compact",
+            "matcher": "startup|resume|clear|compact",
             "hooks": [{"type": "command", "command": "memoryos hook session-start"}],
         }])
     );
