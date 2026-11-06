@@ -1,0 +1,14 @@
+**/target
+.git
+.github
+.claude
+.env
+**/.env
+*.log
+**/.DS_Store
+docs
+README.md
+Dockerfile
+.dockerignore
+deploy
+!deploy/healthcheck.sh
