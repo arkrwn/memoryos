@@ -113,14 +113,14 @@ impl From<Error> for ApiError {
                 too_large.to_string(),
             ),
             Error::Provider(detail) => {
-                // Only the part before the first colon: what follows can be the provider's own
+                // Only the part before the first colon: what follows can be the embedder's own
                 // error text, which may quote the request.
                 let summary = detail.split(':').next().unwrap_or_default();
-                tracing::warn!(summary, "provider call failed");
+                tracing::warn!(summary, "embedding failed");
                 Self::new(
                     StatusCode::BAD_GATEWAY,
                     "provider_error",
-                    "an upstream provider request failed",
+                    "the embedding model failed",
                 )
             }
             Error::Storage(detail) => {
@@ -192,7 +192,7 @@ mod tests {
         for error in [
             Error::Storage("password=hunter2".into()),
             Error::Internal("password=hunter2".into()),
-            Error::Provider("openai: password=hunter2".into()),
+            Error::Provider("local embedder: password=hunter2".into()),
             Error::NotFound("row in tenant secret".into()),
         ] {
             let mapped = ApiError::from(error);

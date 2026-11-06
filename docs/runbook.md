@@ -7,8 +7,8 @@ dc() { docker compose -f deploy/docker-compose.yml "$@"; }
 ```
 
 Every command here was run on Docker 29.8.2, Compose 5.6.0 and arm64 Linux, using throwaway project
-names set through `COMPOSE_PROJECT_NAME`, unless it is marked **not run**. No real LLM provider or
-production traffic was involved. Quoted outputs are from those runs.
+names set through `COMPOSE_PROJECT_NAME`, unless it is marked **not run**. No production traffic was
+involved. Quoted outputs are from those runs, which predate the removal of worker mode (T15).
 
 ## Install
 
@@ -29,27 +29,11 @@ dc up -d --build
 until curl -sf http://localhost:8080/readyz; do sleep 5; done
 ```
 
-The stack is `postgres` (not published on the host), `migrate` (one-shot) and `memoryos` (host mode,
-published on `127.0.0.1:8080`). `/healthz`, `/readyz` and `/metrics` answer without a token, so
+The stack is `postgres` (not published on the host), `migrate` (one-shot) and `memoryos` (published on
+`127.0.0.1:8080`). MemoryOS needs no LLM key. `/healthz`, `/readyz` and `/metrics` answer without a token, so
 keep a TLS reverse proxy in front before setting `MEMORYOS_PUBLISH` to a public address.
 
 Leave `HF_HOME` unset, because it overrides `MEMORYOS_MODEL_CACHE`.
-
-### Worker mode
-
-`deploy/.env` needs the provider keys, then:
-
-```bash
-dc up -d memoryos-worker
-```
-
-This starts `postgres`, `migrate` and the worker-mode server, without `memoryos`. Without a key the
-server exits at startup and names the variable, for example `the openai embedder requires
-OPENAI_API_KEY (or set MEMORYOS_EMBEDDER=local)`. `dc up -d memoryos-worker memoryos-job-worker` adds a
-standalone job worker. It serves no HTTP, so its job counts never reach `/metrics`.
-
-Pick one mode per database. Vectors from the local model and from OpenAI cannot be compared, and
-changing embedder needs re-embedding, for which there is no tool yet.
 
 ### Database roles
 
@@ -74,7 +58,7 @@ Then point `DATABASE_URL` at that login and run `memoryos migrate`. What the dri
 | `pg_dump` as that login | Fails: `query would be affected by row-level security policy for table "audit_events"`. Back up as a superuser |
 
 > **Warning: isolation applies to the server's transactions, not to everyone with the login.** `facts`
-> and `episodes` are `NO FORCE`, so the owner login, outside `memoryos_app`, reads every tenant. The
+> is `NO FORCE`, so the owner login, outside `memoryos_app`, reads every tenant's facts. The
 > drill returned both tenants' facts from plain `psql`. A superuser does too. Do not give this login
 > to people or to reporting tools, and to query as one tenant use
 > `SET ROLE memoryos_app; SET app.tenant = '...';`.
@@ -129,8 +113,9 @@ dc exec -T postgres psql -U memoryos -d memoryos -Atc "SELECT (SELECT count(*) F
 dc exec -T postgres psql -U memoryos -d memoryos -Atc "SELECT count(*) FROM pg_policies;"
 ```
 
-The drill gave 9 policies, the same counts on both sides, `recall` returned both facts with the
-pre-backup token, and a key in another tenant got `{"facts":[],"pending_episodes":[]}`.
+Expect 7 policies, one per tenant table. The drill ran when there were 9, because `sessions` and
+`session_messages` still existed. It gave the same counts on both sides, `recall` returned both facts
+with the pre-backup token, and a key in another tenant got no facts.
 
 To restore in place instead of beside (**not run**, and it deletes the current database):
 
@@ -168,20 +153,13 @@ Revoking takes effect on the next request: the drill went from 200 to 401 withou
 
 | Signal | Watch for |
 |---|---|
-| `GET /readyz` | 503. The body names `database` (`ok`, `unavailable`) and `embedder` (`not_required`, `loading`, `ready`, `failed`) |
+| `GET /readyz` | 503. The body names `database` (`ok`, `unavailable`) and `embedder` (`loading`, `ready`, `failed`) |
 | `GET /healthz` | Failure means the process is gone. It stays 200 through database and model failures |
-| `memoryos_http_requests_total{status=~"5.."}` | 500 is usually the database, and 502 is the model or a provider |
+| `memoryos_http_requests_total{status=~"5.."}` | 500 is usually the database, and 502 is the embedding model |
 | `memoryos_http_request_duration_seconds` | Latency by route |
 | `memoryos_recall_duration_seconds` | Target is p95 under 200 ms, not yet measured at scale |
-| `memoryos_jobs_processed_total{result="failed"}` | Worker mode, embedded worker only. A rising count means extraction fails |
-| Logs, JSON on stdout | `not ready`, `retrying provider request`, `query embedding timed out` |
+| Logs, JSON on stdout | `not ready`, `query embedding timed out` |
 | Container memory | Near `MEMORYOS_MEM_LIMIT`. OOM shows as a restart with exit code 137 |
-
-Job backlog, worker mode:
-
-```bash
-dc exec -T postgres psql -U memoryos -d memoryos -Atc "SELECT status, attempts, run_after > now() AS waiting, left(last_error,120) FROM jobs;"
-```
 
 Quarantine backlog is `GET /v1/quarantine`, per scope, below. Traces export only when
 `OTEL_EXPORTER_OTLP_ENDPOINT` is set (**not run**).
@@ -189,7 +167,7 @@ Quarantine backlog is `GET /v1/quarantine`, per scope, below. Traces export only
 ## Quarantine
 
 An admin key reviews facts that the trust gate held back. Each scope is named exactly in the query.
-Host commits to `user:*` or `shared:*` always land here.
+Commits to `user:*` or `shared:*` always land here.
 
 ```bash
 curl -sS -H "Authorization: Bearer $TOKEN" "http://localhost:8080/v1/quarantine?scopes=user:alice"
@@ -216,32 +194,6 @@ dc exec -T postgres psql -U memoryos -d memoryos -c "SELECT created_at, tenant, 
 ```
 
 ## Incidents
-
-### Provider down (worker mode)
-
-Symptoms: `memoryos_jobs_processed_total{result="failed"}` rises, and logs show `retrying provider
-request`. Host mode has no LLM provider, so this does not apply there.
-
-What keeps working, confirmed with base URLs pointed at a closed port:
-
-- `POST /v1/episodes` still answers 202.
-- `recall` still works, falling back to text search with the warning `query embedding timed out, using
-  text search only`. The new episode shows under `pending_episodes` when its trust is `user` or
-  `system`.
-- Jobs retry with backoff from 30s to a 1h cap, and go `dead` after 5 attempts.
-
-Steps:
-
-1. Check the provider's status and the keys. Provider errors in logs are cut at the first colon, so
-   they may not say why.
-2. Look at the job states, using the query under Monitoring.
-3. When the provider is back, requeue what went dead:
-
-```bash
-dc exec -T postgres psql -U memoryos -d memoryos -c "UPDATE jobs SET status = 'pending', attempts = 0, run_after = now(), locked_by = NULL, locked_until = NULL WHERE status = 'dead';"
-```
-
-The worker picks these up on its own, with no restart.
 
 ### Database down
 
@@ -314,16 +266,11 @@ delete `pgdata`.
 ## Known limits
 
 - The full list is in `docs/SPEC.md` section 13. The ones that matter most in operation are below.
-- The rate limiter and the agent session lock are per process, so with several instances the limit
-  multiplies, and clients must not run concurrent turns on one session.
-- A standalone `memoryos worker` serves no HTTP, so it has no metrics.
+- The rate limiter is per process, so with several instances the limit multiplies.
 - `LocalEmbedder` silently truncates input over 512 tokens.
-- Changing embedder needs re-embedding, and there is no tool for it.
+- Changing the embedding model needs re-embedding, and there is no tool for it.
 - The compose stack is one Postgres and one server. There is no replication or scheduled backup; add
   those yourself.
 - MCP has been checked by protocol requests and tests, not by a real agent host.
-- No live LLM provider has been used in any test.
-- Worker mode is proven to start, take episodes and survive provider failure. Extraction against a
-  real provider has not run.
 - The image takes prebuilt ONNX Runtime from `cdn.pyke.io` at build time. `cargo deny` does not cover it.
 - The release targets in `README.md` are not yet measured.

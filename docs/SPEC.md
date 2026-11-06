@@ -1,22 +1,23 @@
 # MemoryOS specification
 
 MemoryOS is a memory service for AI agents: one Rust service on Postgres + pgvector, with one
-data model behind four capabilities. The contracts are `crates/core/src/{types,store,llm}.rs`,
-`migrations/0001_init.sql` and `docs/openapi.yaml`. If this file disagrees with them, stop and
-record it in `docs/PROGRESS.md`.
+data model behind four capabilities. It never calls an LLM and needs no provider key: the agent's own
+model, the host, decides what to remember and calls MemoryOS. MemoryOS never calls the host. The
+contracts are `crates/core/src/{types,store,embedder}.rs`, `migrations/0001_init.sql` and
+`docs/openapi.yaml`. If this file disagrees with them, stop and record it in `docs/PROGRESS.md`.
 
 ## 1. Capabilities
 
 | Capability | Behavior |
 |---|---|
-| Personalization | Facts scoped to a user. Reconciliation chooses add, supersede, corroborate or ignore |
+| Personalization | Facts scoped to a user. The host chooses add, supersede, corroborate or nothing |
 | Changing facts | Superseding closes a fact without deleting it. Reads support `as_of` and `known_at` |
-| Self-editing agents | Size-limited, versioned blocks edited through tools, plus an agent loop with sessions |
+| Self-editing agents | Size-limited, versioned blocks edited through REST and MCP tools |
 | Shared graph | Facts are edges between entities. Shared scopes are guarded by per-key scope patterns |
 
 ## 2. Crates and public APIs
 
-Each crate exposes exactly these entry points, so crates can be built in parallel.
+Each crate exposes exactly these entry points.
 
 ```rust
 // memoryos-store
@@ -24,58 +25,65 @@ PgStore::connect(database_url: &str, max_connections: u32) -> Result<PgStore>
 PgStore::migrate(&self) -> Result<()>          // sqlx::migrate!("../../migrations")
 impl MemoryStore for PgStore
 
-// memoryos-llm
-AnthropicClient::new(api_key: String, model: String, base_url: Option<String>) -> Self   // impl Llm
-OpenAiClient::new(api_key: String, model: String, base_url: Option<String>) -> Self      // impl Llm
-OpenAiEmbedder::new(api_key: String, model: String, base_url: Option<String>) -> Self    // impl Embedder
+// memoryos-embed, feature `local`, on by default
+LocalEmbedder::new(cache_dir: Option<PathBuf>) -> Result<Self>   // impl Embedder
 
 // memoryos-ingest
-Ingestor::new(store: Arc<dyn MemoryStore>, llm: Arc<dyn Llm>, embedder: Arc<dyn Embedder>) -> Self
-Ingestor::process_episode(&self, ctx: &RequestContext, episode_id: Uuid) -> Result<()>
-Worker::new(store: Arc<dyn MemoryStore>, ingestor: Arc<Ingestor>, config: WorkerConfig) -> Self
-Worker::run(self, shutdown: CancellationToken) -> impl Future<Output = ()>
+HostCommitter::new(store: Arc<dyn MemoryStore>, embedder: Arc<dyn Embedder>) -> Self
+HostCommitter::commit(&self, ctx: &RequestContext, req: CommitRequest, max_trust: Trust) -> Result<CommitResponse>
+// CommitRequest, CommitFact, EntityRef, CommitResponse, CommittedFact are serde types in ingest
 
 // memoryos-retrieve
 Retriever::new(store: Arc<dyn MemoryStore>, embedder: Arc<dyn Embedder>) -> Self
 Retriever::recall(&self, ctx: &RequestContext, req: RecallRequest) -> Result<RecallResponse>
+Retriever::candidates(&self, ctx: &RequestContext, scopes: &[Scope], statement: &str, limit: i64) -> Result<Vec<ScoredFact>>
 pub struct RecallRequest { scopes: Vec<Scope>, query: String, limit: i64, as_of: Option<DateTime<Utc>>, known_at: Option<DateTime<Utc>> }
-pub struct RecallResponse { facts: Vec<ScoredFact>, pending_episodes: Vec<ScoredEpisode> }
-
-// memoryos-agent
-AgentRuntime::new(store: Arc<dyn MemoryStore>, retriever: Arc<Retriever>, llm: Arc<dyn Llm>, config: AgentConfig) -> Self
-AgentRuntime::run_turn(&self, ctx: &RequestContext, session_id: Uuid, user_text: String) -> Result<TurnResult>
-pub struct TurnResult { text: String, tool_calls: u32, input_tokens: u64, output_tokens: u64 }
+pub struct RecallResponse { facts: Vec<ScoredFact> }
 
 // memoryos-sdk: thin HTTP client over docs/openapi.yaml
 MemoryOs::connect(base_url, api_key)
 ```
 
-The `memoryos` binary (crate `server`) has these commands: `serve` (API plus embedded worker,
-`--no-worker` to disable), `worker`, `migrate`, `key create`, `key revoke`.
+`LocalEmbedder` uses `multilingual-e5-small` through `fastembed`, downloads the model on first use,
+and prefixes every input with `query: `, the form that model documents for symmetric similarity.
+
+The `memoryos` binary (crate `server`) has these commands: `serve`, `migrate`, `key create`,
+`key revoke`, and the client commands in section 3.
 
 ## 3. Write path
 
-1. `POST /v1/episodes` checks the scope and `trust <= key.max_trust`, then calls
-   `insert_episode`, which stores the episode and an `extract` job in one transaction. Returns 202.
-   Replaying an `idempotency_key` returns 202 with the existing episode; if that episode is in a
-   different scope the server returns 400 `invalid_input` and does not reveal it.
-2. The episode is immediately searchable through `search_pending_episodes`, only when its trust
-   is `user` or `system`.
-3. The worker claims the job and calls `Ingestor::process_episode`:
-   a. LLM extraction, forced through one tool, returns entities and statements as JSON.
-   b. Entity resolution: same normalized name uses `upsert_entity`; otherwise cosine similarity
-      of at least 0.90 with the same kind merges, adding the new name as an alias.
-   c. Reconciliation: for each statement, an LLM compares it with `current_facts_for_subject`
-      and returns `add`, `supersede(fact_id)`, `corroborate(fact_id)` or `ignore`. A `fact_id`
-      that was not in the candidate list is rejected and treated as `add`.
-   d. Trust gate (section 5) assigns each fact's status.
-   e. `apply_extraction` commits everything and sets `processed_at` atomically.
-4. Retries back off exponentially (30s base, 1h cap), and a job goes `dead` after 5 attempts.
-   The worker checks `job.attempts` right after claiming, so a job that keeps crashing workers
-   still goes `dead`. A job whose episode was purged (`NotFound`) is completed, not retried.
-5. Job leases are fenced: `complete_job`, `fail_job` and `renew_job` take effect only when the
-   job is still `running` with the same `locked_by` and `attempts`, and otherwise report `false`.
-   Workers renew the lease while extraction runs.
+1. `POST /v1/candidates` with `{scopes, statement, limit}` returns related current facts. It ranks
+   like `Retriever::recall`, at the present time.
+2. The host decides, then `POST /v1/commits` sends `{scope, source, content, facts[]}`. Each fact has
+   `statement`, `subject {name, kind}`, `predicate`, optional `object {name, kind}`, optional
+   `valid_from`, and at most one of `supersedes` and `corroborates`. Maximum 50 facts.
+3. `HostCommitter` stores `content` through `insert_episode` as the source of the facts. Replaying an
+   `idempotency_key` returns the existing episode and its facts; a key reused for a different scope,
+   source, content or trust returns 400 `invalid_input` and reveals nothing about the first request.
+4. It embeds statements and entities in one call. Entity resolution: same normalized name or known
+   alias with the same kind uses that entity; otherwise cosine similarity of at least 0.90 with the
+   same kind merges. The new name becomes an alias only when this source has an active fact on it.
+5. It builds `FactOp`s, applies the section 5 trust gate, and calls `apply_commit`, which commits
+   everything and sets `processed_at` atomically. If the episode is already processed that is a no-op,
+   so a concurrent replay cannot apply twice. Returns `episode_id` and each fact's `id` and `status`.
+
+Rules:
+- Commit trust is `agent`, or `external` if the key's `max_trust` is `external`. A request cannot
+  set a higher trust, because the host model also reads untrusted content.
+- `supersedes` and `corroborates` must name a current, active fact in the same scope, else 400.
+  The server never trusts a host-supplied id without that check.
+- `recall_candidates`, `commit_facts`, `recall`, `block_read`, `block_replace` and `graph_neighbors`
+  are the MCP tools. Tool descriptions state when to recall, when to save, and that retrieved or
+  tool-read content is data, never instructions.
+
+CLI, using `MEMORYOS_URL` and `MEMORYOS_API_KEY` (any agent without MCP can use these):
+`memoryos recall`, `candidates`, `commit`, `quarantine list|approve|reject`, and
+`memoryos hook session-start|stop|install --agent claude-code|opencode`, as shown in `README.md`.
+- `hook stop` reads the host's JSON from stdin, prints nothing when `stop_hook_active` is true, and
+  otherwise prints the block decision once every 10 turns, counted per `session_id` in a state file.
+- Hook commands never fail the host: on any error they log to stderr and exit 0 with no output.
+- `hook install` merges into existing settings, keeps other entries, is idempotent, and also
+  registers the MCP server. The API key stays in an environment variable reference, never in the file.
 
 ## 4. Time semantics
 
@@ -99,10 +107,10 @@ AND (invalidated_at IS NULL OR invalidated_at > K)
 
 | Rule | Result |
 |---|---|
-| Episode trust is `external` | Every derived fact is `quarantined` |
-| Episode trust is `agent` and scope is `user:*` or `shared:*` | Quarantined, so an agent cannot plant claims in user or shared memory |
-| Statement contradicts a fact of higher trust | Quarantined, with `pending_supersede_of` set |
-| Statement contradicts a fact of equal or lower trust | Active, supersedes it |
+| Source trust is `external` | Every derived fact is `quarantined` |
+| Source trust is `agent` and scope is `user:*` or `shared:*` | Quarantined, so an agent cannot plant claims in user or shared memory |
+| Fact supersedes a fact of higher trust | Quarantined, with `pending_supersede_of` set |
+| Fact supersedes a fact of equal or lower trust | Active, supersedes it |
 | Otherwise | Active |
 
 - A fact's trust equals its episode's trust. Corroboration never raises it.
@@ -118,8 +126,6 @@ AND (invalidated_at IS NULL OR invalidated_at > K)
   the fact closed a live fact of now-higher trust. Pending links move to the surviving successor or
   the reopened predecessor.
 - `reject_fact` sets `rejected`. Rejected and quarantined facts never appear in recall or graph.
-- Extraction and reconciliation prompts wrap content as untrusted data, and they expose only the
-  forced output tool. Episode text can never reach a memory-writing tool.
 - `POST /v1/episodes/{id}/purge` removes one bad source and everything derived only from it. A
   fact closed by a purged fact is reopened or relinked, so purging a poison restores the truth.
 - Approve, reject, invalidate and purge each write an `audit_events` row.
@@ -129,14 +135,14 @@ AND (invalidated_at IS NULL OR invalidated_at > K)
 - Every tenant transaction runs `SET LOCAL ROLE memoryos_app` and
   `SELECT set_config('app.tenant', $1, true)`. Row-level security then applies, even when the
   login role is a superuser. With no tenant set, tables return no rows.
-- Only job methods, `*_api_key` and `ping` run outside that role. A non-superuser login needs
-  `GRANT memoryos_app TO <login>`. Fact and pending-episode text search go through the
-  `SECURITY DEFINER` functions in the migration, because GIN indexes are unusable under RLS.
+- Only `*_api_key` and `ping` run outside that role. A non-superuser login needs
+  `GRANT memoryos_app TO <login>`. Fact text search goes through the `SECURITY DEFINER` function in
+  the migration, because GIN indexes are unusable under RLS.
 - API keys: bearer tokens `mos_<43 url-safe chars>` from 32 random bytes. Only the SHA-256 hex is
   stored. Each key has a tenant, scope patterns, `max_trust` and `is_admin`.
 - `server` must check `scope` against the key's patterns on every request, including reads by id,
   where it checks the loaded row's scope and returns 404 on a mismatch.
-- Blocks and sessions for agent `X` require scope `agent:X`.
+- Blocks for agent `X` require scope `agent:X`.
 - Quarantine listing and approval, purge and `DELETE /v1/users/{id}/memory` require `is_admin`.
 
 ## 7. Retrieval
@@ -148,24 +154,13 @@ AND (invalidated_at IS NULL OR invalidated_at > K)
    depth 1 as a third ranked list.
 4. Reciprocal rank fusion with `k = 60`: `score = sum(1 / (60 + rank))`. Return the top `limit`
    (default 10, max 100).
-5. Add `search_pending_episodes` only when neither `as_of` nor `known_at` is set.
 
-## 8. Blocks and agent runtime
+## 8. Blocks
 
-- Tools given to the model: `block_replace(label, content, expected_version)`,
-  `block_append(label, text, expected_version)`, `memory_recall(query)`, `memory_remember(text)`.
-- `memory_remember` writes an episode with trust `agent` into scope `agent:<agent_id>`, where its
-  facts can go active. `memory_recall` searches the session's scope and `agent:<agent_id>`.
-- A reply with `StopReason::MaxTokens` is reported in logs, and the turn asks the model to continue
-  once, so truncated text is not silently returned as complete.
-- Context order: system prompt, blocks rendered with label, version and usage, session summary,
-  then messages. Block content is delimited and labelled as data in the prompt.
-- Tool-call loop limit is 10 per turn. Tool errors go back to the model as `is_error` results.
-- A version conflict returns the current content, so the model can retry.
-- Compaction runs when stored messages exceed `AgentConfig::max_context_chars` (default 100000):
-  older messages are summarized and replaced through `compact_session`, keeping tool-use and
-  tool-result pairs together.
-- Unknown agents get default blocks `persona` and `human`, 2000 chars each.
+- Blocks are size-limited, versioned working notes per agent, reachable through REST and the MCP tools
+  `block_read` and `block_replace`.
+- `expected_version` omitted creates a block and fails if it exists. Set, it updates only that version
+  and appends a version row. A mismatch returns `version_conflict`.
 
 ## 9. API
 
@@ -178,7 +173,7 @@ AND (invalidated_at IS NULL OR invalidated_at > K)
 | `Forbidden` | 403 | `forbidden` |
 | `VersionConflict` | 409 | `version_conflict` |
 | `BlockTooLarge` | 422 | `block_too_large` |
-| `Provider` | 502 | `provider_error` |
+| `Provider` (the embedder failed) | 502 | `provider_error` |
 | `Storage`, `Internal` | 500 | `internal` (details logged, never returned) |
 | No or bad token | 401 | `unauthorized` |
 | Rate limited | 429 | `rate_limited` |
@@ -186,14 +181,13 @@ AND (invalidated_at IS NULL OR invalidated_at > K)
 | Wrong method | 405 | `method_not_allowed` |
 | Request timed out | 504 | `timeout` |
 
-Limits: request body 1 MiB, episode content 100000 chars, 50 scopes per request, 100 requests per
-second per key by default. `POST /mcp` exposes the MCP tools in section 14 under the same
-authorization, plus `remember` in worker mode, which always writes at most `agent` trust. It supports
-clients on MCP revision 2026-07-28 and earlier, and rejects any `Origin` that is not localhost or in
-`MEMORYOS_MCP_ALLOWED_ORIGINS`.
+Limits: request body 1 MiB, commit content 100000 chars, 50 scopes per request, 100 requests per
+second per key by default. `POST /mcp` exposes the MCP tools in section 3 under the same
+authorization. It supports clients on MCP revision 2026-07-28 and earlier, and rejects any `Origin`
+that is not localhost or in `MEMORYOS_MCP_ALLOWED_ORIGINS`.
 
-Other rules: `POST /v1/facts/{id}/invalidate` requires `fact.trust <= key.max_trust`. A key with
-`external` max trust gets 403 on session turns. A block update that omits `max_chars` keeps its limit.
+Other rules: `POST /v1/facts/{id}/invalidate` requires `fact.trust <= key.max_trust`. A block update
+that omits `max_chars` keeps its limit.
 
 ## 10. Configuration
 
@@ -201,29 +195,24 @@ Other rules: `POST /v1/facts/{id}/invalidate` requires `fact.trust <= key.max_tr
 |---|---|---|
 | `DATABASE_URL` | required | |
 | `MEMORYOS_BIND` | `0.0.0.0:8080` | |
-| `MEMORYOS_LLM_PROVIDER` | `anthropic` | `anthropic` or `openai` |
-| `MEMORYOS_LLM_MODEL` | `claude-haiku-5-5` / `gpt-5.1` by provider | Haiku accepts forced tool calls, which extraction uses. Models that do not fall back to `auto` with one tool |
-| `MEMORYOS_EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI embedder only. Must return 384 dims |
-| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | | Embeddings need the OpenAI key |
-| `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL` | provider default | Tests point these at WireMock |
 | `MEMORYOS_DB_MAX_CONNECTIONS` | `20` | |
 | `MEMORYOS_RATE_LIMIT_RPS` | `100` | Per key |
-| `MEMORYOS_WORKER_CONCURRENCY` | `4` | |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Traces are exported only when set |
 | `MEMORYOS_REQUEST_TIMEOUT_SECS` | `30` | |
-| `MEMORYOS_TURN_TIMEOUT_SECS` | `300` | Agent turns |
 | `MEMORYOS_MCP_ALLOWED_ORIGINS` | unset | Comma-separated, in addition to localhost |
-| `MEMORYOS_MODE` | `host` | `host` or `worker`, section 14 |
-| `MEMORYOS_EMBEDDER` | by mode | `local` or `openai`, section 14 |
 | `MEMORYOS_MODEL_CACHE` | user cache dir | Local model. Leave `HF_HOME` unset, since it overrides this |
 
 ## 11. Testing rules
 
 - Integration tests live in each crate's `tests/`, gated behind a cargo feature `integration`.
   Run them with `cargo test -p <crate> --features integration`.
-- Integration tests use real containers through `testcontainers`: `pgvector/pgvector:pg17` for
-  Postgres and `wiremock/wiremock:3.3.1` for LLM and embedding HTTP. Mock objects are not allowed there.
-- Unit tests may use small in-memory fakes of `Llm` and `Embedder` only.
+- Integration tests use a real `pgvector/pgvector:pg17` container through `testcontainers`. The eval
+  harness also starts `wiremock/wiremock:3.3.1`, as a fake MemoryOS server.
+- Embeddings in tests come from `TestEmbedder` in `memoryos-embed`, feature `test-embedder`, so no test
+  needs the 481 MB model. The server selects it when built with that feature and
+  `MEMORYOS_TEST_EMBEDDER` holds a delay per call in milliseconds. The release image never has it, since
+  the Dockerfile's cargo commands enable no features.
+- `integration-local` on `memoryos-embed` runs the real model. It is off by default.
 - Tenant isolation must be tested with two tenants against real Postgres.
 - Run gates: `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
   `cargo test`, `cargo deny check`.
@@ -233,75 +222,16 @@ Other rules: `POST /v1/facts/{id}/invalidate` requires `fact.trust <= key.max_tr
 | Gate | Target | Proof |
 |---|---|---|
 | Static checks | No warnings | Commands in section 11 |
-| Recall latency | p95 under 200 ms at 1M facts, excluding embedding and LLM calls | Load test output |
+| Recall latency | p95 under 200 ms at 1M facts, excluding embedding | Load test output |
 | Staleness | At least 95% of superseded facts absent from current recall | `memoryos-eval --mode host` report |
 | Poisoning | 0 poisoned facts in recall without approval | `memoryos-eval --mode host` report |
 | Isolation | 0 cross-tenant reads | Integration tests |
-| Recovery | A job held by a killed worker completes after lease expiry | Integration test |
 | Restore | Backup restored into an empty database and recall still works | Drill log |
 | Ready to use | README quickstart works from a clean checkout | Recorded run |
 
-The eval gates run in host mode with scripted commits and no LLM, at zero cost, by the user's decision
-not to spend money on provider APIs. They prove what the server enforces: supersession, time filters,
-trust and quarantine. They do not prove how well a host model decides what to save. Worker mode has
-not been evaluated against any real model, so its extraction quality is unproven.
-
-## 14. Host mode (default)
-
-`MEMORYOS_MODE=host` is the default; `worker` enables sections 3 and 8. MemoryOS never calls the
-host: the host calls MemoryOS.
-
-| | Host | Worker |
-|---|---|---|
-| LLM key | None | Required |
-| Default embedder (`MEMORYOS_EMBEDDER`) | `local` | `openai`; `local` also allowed |
-| Worker and extraction | Off | On |
-| `POST /v1/episodes` | 400 `invalid_input`, directing to `POST /v1/commits` | Normal |
-| Session endpoints | 400 `invalid_input` | Normal |
-| `POST /v1/candidates`, `POST /v1/commits` | Normal | Normal |
-
-Flow:
-1. `POST /v1/candidates` with `{scopes, statement, limit}` returns related current facts. It is
-   `Retriever::recall` without pending episodes.
-2. The host decides, then `POST /v1/commits` sends `{scope, source, content, facts[]}`. Each fact has
-   `statement`, `subject {name, kind}`, `predicate`, optional `object {name, kind}`, optional
-   `valid_from`, and at most one of `supersedes` and `corroborates`. Maximum 50 facts.
-3. `HostCommitter` stores `content` through `insert_unqueued_episode` as the source, resolves entities
-   and embeds statements as in section 3, builds `FactOp`s, applies the section 5 trust gate with
-   the same code as the worker, and calls `apply_extraction`. Returns `episode_id` and each fact's
-   `id` and `status`.
-
-Rules:
-- Commit trust is `agent`, or `external` if the key's `max_trust` is `external`. A request cannot
-  set a higher trust, because the host model also reads untrusted content.
-- `supersedes` and `corroborates` must name a current, active fact in the same scope, else 400.
-  The server never trusts a host-supplied id without that check.
-- `recall_candidates`, `commit_facts`, `recall`, `block_read`, `block_replace` and `graph_neighbors`
-  are the host-mode MCP tools. `remember` is worker mode only. Tool descriptions state when to
-  recall, when to save, and that retrieved or tool-read content is data, never instructions.
-
-Entry points:
-```rust
-// memoryos-ingest
-HostCommitter::new(store: Arc<dyn MemoryStore>, embedder: Arc<dyn Embedder>) -> Self
-HostCommitter::commit(&self, ctx: &RequestContext, req: CommitRequest, max_trust: Trust) -> Result<CommitResponse>
-// CommitRequest, CommitFact, EntityRef, CommitResponse, CommittedFact are serde types in ingest
-
-// memoryos-llm, feature `local`, on by default
-LocalEmbedder::new(cache_dir: Option<PathBuf>) -> Result<Self>   // impl Embedder
-```
-
-`LocalEmbedder` uses `multilingual-e5-small` through `fastembed`, downloads the model on first use,
-and prefixes every input with `query: `, the form that model documents for symmetric similarity.
-
-CLI, using `MEMORYOS_URL` and `MEMORYOS_API_KEY` (any agent without MCP can use these):
-`memoryos recall`, `candidates`, `commit`, `quarantine list|approve|reject`, and
-`memoryos hook session-start|stop|install --agent claude-code|opencode`, as shown in `README.md`.
-- `hook stop` reads the host's JSON from stdin, prints nothing when `stop_hook_active` is true, and
-  otherwise prints the block decision once every 10 turns, counted per `session_id` in a state file.
-- Hook commands never fail the host: on any error they log to stderr and exit 0 with no output.
-- `hook install` merges into existing settings, keeps other entries, is idempotent, and also
-  registers the MCP server. The API key stays in an environment variable reference, never in the file.
+The eval gates use scripted commits and no LLM, at zero cost. They prove what the server enforces:
+supersession, time filters, trust and quarantine. They do not prove how well a host model decides what
+to save.
 
 ## 13. Known limits
 
@@ -309,15 +239,10 @@ CLI, using `MEMORYOS_URL` and `MEMORYOS_API_KEY` (any agent without MCP can use 
   search covers those cases when embeddings are available.
 - Embedding width is fixed at 384. Changing model needs re-embedding.
 - The rate limiter is in-process, so the limit applies per server instance.
-- A standalone `memoryos worker` serves no HTTP, so its job counts do not reach `/metrics`. Only the
-  worker embedded in `serve` reports them.
-- Provider errors log only the text before the first colon, because the rest can quote content. This
-  makes provider failures harder to diagnose from logs.
+- Embedder errors log only the text before the first colon, because the rest can quote content. This
+  makes model failures harder to diagnose from logs.
 - `known_at` is not fully bitemporal: `valid_to` and `status` are not versioned, so a later close or
   approval shows up in reads at an earlier `known_at`.
-- Thinking blocks are not kept between agent tool calls, so the model loses that reasoning.
-- The agent runtime's per-session lock is in-process. With several server instances, clients must
-  not run concurrent turns on one session.
 - `LocalEmbedder` silently truncates inputs over 512 tokens and needs at least 1 GiB of memory.
 - Purge edge cases with backdated facts (T14), three confirmed by temporary tests and one from reading:
   - Purging a head can reopen both its real predecessor and a backdated fact, leaving two current facts.

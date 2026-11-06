@@ -1,5 +1,5 @@
 //! The MemoryOS HTTP service: REST API, MCP endpoint, authorization, limits and telemetry.
-//! See docs/SPEC.md sections 3, 6, 8 and 9 and docs/openapi.yaml.
+//! See docs/SPEC.md sections 3, 6, 9 and 10 and docs/openapi.yaml.
 
 pub mod app;
 pub mod auth;

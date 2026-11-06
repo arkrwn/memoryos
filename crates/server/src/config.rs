@@ -1,4 +1,4 @@
-//! Environment configuration (SPEC section 8). Missing requirements fail here, at startup, with a
+//! Environment configuration (SPEC section 10). Missing requirements fail here, at startup, with a
 //! message naming the variable.
 
 use std::fmt;

@@ -2029,7 +2029,7 @@ async fn supersede_that_reaches_an_equal_trust_head_closes_it() -> TestResult {
     Ok(())
 }
 
-/// A quarantined fact pending on `old`, as an extraction would leave it.
+/// A quarantined fact pending on `old`, as a commit would leave it.
 async fn pending_on(
     db: &Db,
     c: &RequestContext,

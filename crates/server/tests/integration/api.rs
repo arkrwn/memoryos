@@ -1,4 +1,4 @@
-//! Host mode end to end, through the SDK where the SDK has the call. No model is ever contacted.
+//! The API end to end, through the SDK where the SDK has the call.
 
 use chrono::{Duration as ChronoDuration, Utc};
 use memoryos_core::{Scope, Trust};

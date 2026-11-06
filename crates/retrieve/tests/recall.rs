@@ -264,7 +264,7 @@ impl Fixture {
         self.store
             .apply_commit(ctx, source.id, ops)
             .await
-            .expect("apply extraction")
+            .expect("apply commit")
     }
 
     async fn add(&self, subject: Uuid, statement: &str, degrees: f32) -> Uuid {
