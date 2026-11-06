@@ -348,7 +348,7 @@ async fn embeddings_are_restored_to_input_order() {
     assert_eq!(firsts, [0.0, 1.0, 2.0]);
     let expected = json!({
         "model": EMBEDDING_MODEL,
-        "dimensions": 1536,
+        "dimensions": memoryos_core::EMBEDDING_DIMS,
         "input": ["input-0", "input-1", "input-2"],
     });
     assert_eq!(
