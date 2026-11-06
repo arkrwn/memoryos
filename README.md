@@ -4,18 +4,19 @@
 
 **Long-term memory for AI agents that stays current, traceable and hard to poison.**
 
-![Status: in development](https://img.shields.io/badge/status-in%20development-orange)
-![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-b7410e?logo=rust)
+![Status: pre-release](https://img.shields.io/badge/status-pre--release-orange)
+![Rust 1.92+](https://img.shields.io/badge/rust-1.92%2B-b7410e?logo=rust)
 ![Postgres + pgvector](https://img.shields.io/badge/postgres-pgvector-336791?logo=postgresql&logoColor=white)
 ![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)
 
-[Why MemoryOS](#-why-memoryos) · [How it works](#-how-it-works) · [Security](#-security) · [Agent hooks](#-agent-hooks-proposed) · [Roadmap](#-roadmap) · [Docs](#-documentation)
+[Why MemoryOS](#-why-memoryos) · [Quickstart](#-quickstart) · [How it works](#-how-it-works) · [Security](#-security) · [Agent hooks](#-agent-hooks) · [Roadmap](#-roadmap) · [Docs](#-documentation)
 
 </div>
 
-> [!WARNING]
-> **Not usable yet.** The storage layer, LLM clients and eval harness are built, but the server is
-> not. Code samples show the planned interface and may change. Track the work in
+> [!NOTE]
+> **Pre-release.** The server, REST API, MCP endpoint and Rust SDK run, and the Docker stack below is
+> tested end to end in host mode. Not done yet: integration gates, a load test and independent review.
+> It has not run against a live LLM provider or a real agent host. Track the work in
 > [`docs/PROGRESS.md`](docs/PROGRESS.md).
 
 ## ✨ Why MemoryOS
@@ -31,9 +32,58 @@ change and sources that lie.
 | 🕸️ **Shared knowledge graph** | Every fact is also an edge between entities, shared across agents through scoped access |
 | 🛡️ **Poisoning defense** | Low-trust content is quarantined, and every fact traces back to its source |
 
+## 🚀 Quickstart
+
+Needs Docker, and at least 1 GiB of memory for the server container. The first image build takes a
+few minutes, and the first start downloads a 481 MB embedding model into a named volume.
+
+```bash
+cp deploy/.env.example deploy/.env
+sed -i.bak "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 32)/" deploy/.env && rm deploy/.env.bak
+docker compose -f deploy/docker-compose.yml up -d --build
+
+# Ready once the model has loaded, about 2 minutes on a first start.
+until curl -sf http://localhost:8080/readyz; do sleep 5; done
+
+TOKEN=$(docker compose -f deploy/docker-compose.yml exec -T memoryos memoryos key create \
+  --tenant demo --name quickstart --scopes 'user:*,agent:*' --max-trust agent --admin)
+```
+
+Save a fact, in the agent's own scope, then recall it:
+
+```bash
+curl -sS http://localhost:8080/v1/commits -H "Authorization: Bearer $TOKEN" -d '{
+  "scope": "agent:demo",
+  "source": "quickstart",
+  "content": "The team deploys to Hetzner.",
+  "facts": [{
+    "statement": "The team deploys to Hetzner",
+    "subject": {"name": "the team", "kind": "group"},
+    "predicate": "deploys_to",
+    "object": {"name": "Hetzner", "kind": "organization"}
+  }]
+}'
+# {"episode_id":"...","facts":[{"id":"...","status":"active"}]}
+
+curl -sS http://localhost:8080/v1/recall -H "Authorization: Bearer $TOKEN" \
+  -d '{"scopes": ["agent:demo"], "query": "where does the team deploy?"}'
+```
+
+The same write to `user:alice` comes back `"status":"quarantined"`, and recall leaves it out until an
+admin approves it. MCP clients connect to `POST /mcp` with the same token:
+
+```bash
+curl -sS http://localhost:8080/mcp -H "Authorization: Bearer $TOKEN" \
+  -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}'
+```
+
+Backups, upgrades, key rotation, worker mode and incidents are in the
+[runbook](docs/runbook.md).
+
 ## 🔍 Example
 
-The user says *"I moved to Bandung"* after previously living in Jakarta:
+This uses the Rust SDK against a server in worker mode, where MemoryOS extracts facts itself. The user
+says *"I moved to Bandung"* after previously living in Jakarta:
 
 ```rust
 let mem = MemoryOs::connect(url, api_key).await?;
@@ -55,11 +105,12 @@ let then = mem.recall(user, "where does the user live?")
 ```mermaid
 flowchart TD
     A[Agents and apps] -->|REST or MCP| S[memoryos-server<br/>auth, scopes, limits, telemetry]
-    S -->|write| G[Trust gate]
+    S -->|host mode: commit| G[Trust gate]
+    S -->|worker mode: episode| E[Episode + job<br/>one transaction]
     S -->|read| R[Hybrid retrieval<br/>vector + text + graph]
-    G --> E[Episode + job<br/>one transaction]
     E --> W[Worker<br/>extract, resolve entities, reconcile]
-    W --> DB[(Postgres + pgvector)]
+    W --> G
+    G --> DB[(Postgres + pgvector)]
     R --> DB
 ```
 
@@ -73,11 +124,11 @@ disagree:
 
 ### Two ways to run
 
-| | 🖥️ Host mode (proposed) | ☁️ Worker mode |
+| | 🖥️ Host mode (default) | ☁️ Worker mode |
 |---|---|---|
 | **Who extracts facts** | The coding agent's own model | A background worker calling an LLM API |
 | **API key needed** | None | OpenAI, or Anthropic plus OpenAI |
-| **Embeddings** | Local model in the binary | OpenAI |
+| **Embeddings** | Local model, downloaded on first use | OpenAI, or the local model |
 | **Runs when the agent is closed** | No | Yes |
 | **Best for** | Claude Code, OpenCode and similar agents | Servers and multi-user apps |
 
@@ -99,7 +150,7 @@ Research shows a poisoned memory survives across sessions, unlike ordinary promp
   it had replaced.
 - **Audit trail:** approvals, rejections, retractions and purges are all recorded.
 
-## 🪝 Agent hooks (proposed)
+## 🪝 Agent hooks
 
 In host mode, the agent reads and saves memories through MCP tools. Hooks are optional. They only
 load memories and remind the agent to save, and they cannot bypass validation or quarantine.
@@ -147,8 +198,8 @@ When a save is due, `memoryos hook stop` prints:
 }
 ```
 
-`Stop` fires at the end of every turn, so the command limits itself, for example to once every 10
-turns. `SessionEnd` cannot be used for this, because it has no decision control and cannot make the
+`Stop` fires at the end of every turn, so the command limits itself to once every 10 turns per
+session. `SessionEnd` cannot be used for this, because it has no decision control and cannot make the
 agent act.
 
 </details>
@@ -173,9 +224,10 @@ This keeps memories through compaction but does not remind the agent to save, wh
 </details>
 
 <details>
-<summary><b>One-command install (planned)</b></summary>
+<summary><b>One-command install</b></summary>
 
-Adds its entries and keeps your existing hooks:
+Adds its entries, keeps your existing hooks, and registers the MCP server. The API key stays an
+environment variable reference, never a value in the file:
 
 ```bash
 memoryos hook install --agent claude-code
@@ -184,7 +236,9 @@ memoryos hook install --agent opencode
 
 </details>
 
-These setups are untested, and the `memoryos hook` commands are not built yet. References:
+The `memoryos hook` commands read `MEMORYOS_URL` and `MEMORYOS_API_KEY`, and never fail the host: on
+an error they log to stderr and exit 0. These setups have not been tested in a real Claude Code or
+OpenCode session. References:
 [Claude Code hooks](https://code.claude.com/docs/en/hooks),
 [OpenCode plugins](https://opencode.ai/docs/plugins/),
 [OpenCode v1 migration](https://opencode.ai/v2/docs/build/plugins/migrate-v1/).
@@ -193,7 +247,7 @@ These setups are untested, and the `memoryos hook` commands are not built yet. R
 
 - [x] **Wave 0:** specification, core contracts, database schema, API contract
 - [x] **Wave 1:** Postgres store, LLM and embedding clients, eval harness
-- [ ] **Wave 2:** ingest and worker, hybrid retrieval, agent runtime
+- [x] **Wave 2:** ingest and worker, hybrid retrieval, agent runtime
 - [ ] **Wave 3:** server, MCP, SDK, deployment
 - [ ] **Wave 4:** integration, load test, restore drill, independent review
 
@@ -213,6 +267,7 @@ These are goals, not measured results:
 
 | Document | Contents |
 |---|---|
+| [`docs/runbook.md`](docs/runbook.md) | Install, upgrades, backup and restore, keys, monitoring, incidents |
 | [`docs/SPEC.md`](docs/SPEC.md) | Behavior and contracts |
 | [`docs/PLAN.md`](docs/PLAN.md) | Development waves and ownership |
 | [`docs/PROGRESS.md`](docs/PROGRESS.md) | Status, with proof for each task |
@@ -221,12 +276,15 @@ These are goals, not measured results:
 
 ## 🧪 Development
 
-Requires Rust 1.85+ and Docker. Integration tests start real Postgres and WireMock containers.
+Requires Rust 1.92+ and Docker. Integration tests start real Postgres and WireMock containers. Do not
+use `cargo test --all-features`, which downloads the embedding model. The test feature list is in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
+cargo test --workspace --features memoryos-store/integration,memoryos-llm/integration,memoryos-ingest/integration,memoryos-retrieve/integration,memoryos-agent/integration,memoryos-eval/integration,memoryos-server/integration
+cargo deny check
 ```
 
 ## 📄 License
