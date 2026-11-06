@@ -3381,3 +3381,43 @@ async fn empty_tenant_is_rejected_before_any_query() -> TestResult {
     assert!(is_invalid(db.store.list_blocks(&ctx(""), "a").await));
     Ok(())
 }
+
+// ---- Quarantine prefixes -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn quarantine_prefixes_match_literally_and_stay_in_the_tenant() -> TestResult {
+    let db = db().await;
+    let c = ctx("a");
+    let mut ids = Vec::new();
+    for name in ["a_1", "axb", "b"] {
+        let scope = user(name);
+        let subject = entity(&db, &c, &scope, "Ada").await?;
+        let mut fact = new_fact(&scope, subject, "held", date(2022, 1));
+        fact.trust = Trust::External;
+        fact.status = FactStatus::Quarantined;
+        ids.push(add_fact(&db, &c, fact).await?.1);
+    }
+    let listed = |exact: Vec<Scope>, prefixes: Vec<&'static str>, tenant: &'static str| {
+        let store = db.store.clone();
+        async move {
+            let prefixes: Vec<String> = prefixes.into_iter().map(str::to_owned).collect();
+            let found = store
+                .list_quarantined_matching(&ctx(tenant), &exact, &prefixes, 10)
+                .await?;
+            Ok::<_, Error>(found.iter().map(|fact| fact.id).collect::<Vec<_>>())
+        }
+    };
+
+    assert_eq!(listed(vec![], vec!["user:"], "a").await?, ids);
+    assert_eq!(listed(vec![], vec![""], "a").await?, ids);
+    // `_` is an ordinary character here. As a LIKE pattern it would also match `user:axb`.
+    assert_eq!(listed(vec![], vec!["user:a_"], "a").await?, ids[..1]);
+    assert_eq!(listed(vec![user("b")], vec![], "a").await?, ids[2..]);
+    assert_eq!(
+        listed(vec![user("b")], vec!["user:a_"], "a").await?,
+        [ids[0], ids[2]]
+    );
+    assert!(listed(vec![], vec![], "a").await?.is_empty());
+    assert!(listed(vec![], vec![""], "b").await?.is_empty());
+    Ok(())
+}

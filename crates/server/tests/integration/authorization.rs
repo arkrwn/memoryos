@@ -264,6 +264,74 @@ async fn admin_keys_still_respect_scope_patterns() {
     assert_eq!(server.fact_json(&root, fact).await["status"], "quarantined");
 }
 
+/// The ids `GET /v1/quarantine` returns, sorted.
+async fn quarantine_ids(server: &Server, key: &Key, scopes: &str) -> Vec<Uuid> {
+    let path = format!("/v1/quarantine?scopes={scopes}");
+    let (status, reply) = server.call("GET", &path, Some(key), None).await;
+    assert_eq!(status, StatusCode::OK, "{scopes}: {reply}");
+    let mut ids: Vec<Uuid> = reply["facts"]
+        .as_array()
+        .expect("facts")
+        .iter()
+        .map(|fact| fact["id"].as_str().expect("id").parse().expect("uuid"))
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quarantine_wildcard_returns_only_scopes_the_key_may_read() {
+    let server = Server::host().await;
+    let root = server.root("wild").await;
+    let (in_a, status_text, _) = server.commit_one(&root, "user:a", "Ada sails").await;
+    assert_eq!(status_text, "quarantined");
+    let (in_ab, _, _) = server.commit_one(&root, "user:ab", "Abe sails").await;
+    let (in_b, _, _) = server.commit_one(&root, "user:b", "Bob sails").await;
+    let (in_shared, _, _) = server.commit_one(&root, "shared:a", "All sail").await;
+    let sorted = |mut ids: Vec<Uuid>| {
+        ids.sort();
+        ids
+    };
+
+    let only_a = server.key("wild", &["user:a"], Trust::System, true).await;
+    for scopes in ["user:*", "*", "user:a*", "user:a,user:*"] {
+        assert_eq!(
+            quarantine_ids(&server, &only_a, scopes).await,
+            [in_a],
+            "{scopes}"
+        );
+    }
+    for scopes in ["user:b*", "shared:*", "user:b"] {
+        let path = format!("/v1/quarantine?scopes={scopes}");
+        let (status, reply) = server.call("GET", &path, Some(&only_a), None).await;
+        assert_error(status, &reply, 403, "forbidden");
+    }
+
+    let a_prefix = server.key("wild", &["user:a*"], Trust::System, true).await;
+    assert_eq!(
+        quarantine_ids(&server, &a_prefix, "user:*").await,
+        sorted(vec![in_a, in_ab])
+    );
+
+    assert_eq!(
+        quarantine_ids(&server, &root, "user:*").await,
+        sorted(vec![in_a, in_ab, in_b])
+    );
+    assert_eq!(
+        quarantine_ids(&server, &root, "*").await,
+        sorted(vec![in_a, in_ab, in_b, in_shared])
+    );
+
+    // Row-level security still applies to a key that allows everything.
+    let other_tenant = server.root("wild_other").await;
+    assert!(quarantine_ids(&server, &other_tenant, "*").await.is_empty());
+
+    let (status, reply) = server
+        .call("GET", "/v1/quarantine?scopes=team:*", Some(&root), None)
+        .await;
+    assert_error(status, &reply, 400, "invalid_input");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn one_tenant_sees_nothing_of_another() {
     let server = Server::host().await;

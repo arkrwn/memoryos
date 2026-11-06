@@ -14,6 +14,7 @@ use memoryos_core::{
 };
 use memoryos_ingest::{CommitRequest, CommitResponse, HostCommitter};
 use memoryos_retrieve::{RecallRequest, RecallResponse, Retriever};
+use memoryos_store::PgStore;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -53,6 +54,8 @@ pub struct PutBlockRequest {
 
 pub struct Services {
     pub store: Arc<dyn MemoryStore>,
+    /// The same database as `store`. Prefix listing is not part of `MemoryStore`.
+    pub pg: PgStore,
     pub retriever: Arc<Retriever>,
     pub committer: HostCommitter,
     /// `Some` exactly in worker mode, the only mode that has an LLM.
@@ -216,21 +219,24 @@ impl Services {
     pub async fn list_quarantine(
         &self,
         caller: &Caller,
-        scopes: &[Scope],
+        scopes: &[String],
         limit: Option<i64>,
     ) -> ApiResult<Vec<Fact>> {
         caller.require_admin()?;
-        caller.require_scopes(scopes)?;
+        let selection = caller.select_scopes(scopes)?;
         let limit = limit.unwrap_or(DEFAULT_QUARANTINE_PAGE);
         if !(1..=MAX_QUARANTINE_PAGE).contains(&limit) {
             return Err(ApiError::invalid_input(format!(
                 "limit must be in 1..={MAX_QUARANTINE_PAGE}, got {limit}"
             )));
         }
-        Ok(self
-            .store
-            .list_quarantined(&caller.ctx, scopes, limit)
-            .await?)
+        let mut facts = self
+            .pg
+            .list_quarantined_matching(&caller.ctx, &selection.exact, &selection.prefixes, limit)
+            .await?;
+        // `select_scopes` already narrowed the query. This holds even if that logic is ever wrong.
+        facts.retain(|fact| caller.may_read(&fact.scope));
+        Ok(facts)
     }
 
     /// When the chain moved to a higher-trust head, the store holds the fact and its `InvalidInput`

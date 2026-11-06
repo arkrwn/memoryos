@@ -19,7 +19,7 @@ paths:
       security: []
       responses:
         "200": { description: Ready }
-        "503": { description: Database unavailable }
+        "503": { description: "Not ready: the database is unavailable, or the local embedding model is still loading or failed to load" }
   /metrics:
     get:
       summary: Prometheus metrics
@@ -224,7 +224,10 @@ paths:
         - name: scopes
           in: query
           required: true
-          description: Comma-separated scopes
+          description: >-
+            Comma-separated scopes or patterns, in the form of the key's patterns: `*`, `user:*` or
+            `user:prefix*`. An exact scope the key does not allow is 403. A pattern returns only
+            facts in scopes the key allows, and is 403 when it can match none of them
           schema: { type: string }
         - name: limit
           in: query

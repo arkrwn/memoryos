@@ -211,6 +211,11 @@ fn parse_scopes(text: &str) -> ApiResult<Vec<Scope>> {
         .collect()
 }
 
+/// `scopes=user:a,user:*` from a query string. `Caller::select_scopes` validates each item.
+fn parse_scope_patterns(text: &str) -> Vec<String> {
+    text.split(',').map(|item| item.trim().to_owned()).collect()
+}
+
 // ---- Operations -------------------------------------------------------------------------------
 
 async fn healthz() -> Json<serde_json::Value> {
@@ -389,7 +394,7 @@ async fn list_quarantine(
     Extension(caller): Extension<Caller>,
     ApiQuery(query): ApiQuery<QuarantineQuery>,
 ) -> ApiResult<impl IntoResponse> {
-    let scopes = parse_scopes(&query.scopes)?;
+    let scopes = parse_scope_patterns(&query.scopes);
     let facts = state
         .services
         .list_quarantine(&caller, &scopes, query.limit)

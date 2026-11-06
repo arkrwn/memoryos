@@ -56,6 +56,34 @@ pub fn validate_pattern(pattern: &str) -> Result<(), String> {
         .map_err(|_| format!("invalid scope pattern: {pattern}"))
 }
 
+/// What a request may list, after `Caller::select_scopes`: every scope it covers is one the key
+/// allows.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ScopeSelection {
+    pub exact: Vec<Scope>,
+    pub prefixes: Vec<String>,
+}
+
+/// Adds the overlap of the prefix `wanted` and one key pattern. Returns whether there is one.
+fn narrow(wanted: &str, pattern: &str, selection: &mut ScopeSelection) -> ApiResult<bool> {
+    match pattern.strip_suffix('*') {
+        Some(allowed) if allowed.starts_with(wanted) => {
+            selection.prefixes.push(allowed.to_owned());
+            Ok(true)
+        }
+        Some(allowed) if wanted.starts_with(allowed) => {
+            selection.prefixes.push(wanted.to_owned());
+            Ok(true)
+        }
+        None if pattern.starts_with(wanted) => {
+            let scope = pattern.parse::<Scope>().map_err(ApiError::from)?;
+            selection.exact.push(scope);
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 /// The authenticated key. Every check of SPEC section 6 goes through here.
 #[derive(Debug, Clone)]
 pub struct Caller {
@@ -101,6 +129,43 @@ impl Caller {
         scopes
             .iter()
             .try_for_each(|scope| self.require_scope(scope))
+    }
+
+    /// For a request that may name patterns. An exact scope is checked as `require_scope` does. A
+    /// pattern is narrowed to its overlap with the key's patterns, so `user:*` from a key limited
+    /// to `user:a` covers `user:a` alone. A pattern with no overlap is refused.
+    pub fn select_scopes(&self, requested: &[String]) -> ApiResult<ScopeSelection> {
+        if requested.is_empty() || requested.len() > MAX_SCOPES_PER_REQUEST {
+            return Err(ApiError::invalid_input(format!(
+                "scopes must have 1 to {MAX_SCOPES_PER_REQUEST} entries, got {}",
+                requested.len()
+            )));
+        }
+        let mut selection = ScopeSelection::default();
+        for item in requested {
+            validate_pattern(item).map_err(ApiError::invalid_input)?;
+            let Some(wanted) = item.strip_suffix('*') else {
+                let scope = item.parse::<Scope>().map_err(ApiError::from)?;
+                self.require_scope(&scope)?;
+                selection.exact.push(scope);
+                continue;
+            };
+            let mut overlaps = false;
+            for pattern in &self.key.scopes {
+                overlaps |= narrow(wanted, pattern, &mut selection)?;
+            }
+            if !overlaps {
+                return Err(ApiError::forbidden(format!(
+                    "this key does not allow any scope matching {item}"
+                )));
+            }
+        }
+        Ok(selection)
+    }
+
+    /// Whether the key may read a row in this scope.
+    pub fn may_read(&self, scope: &Scope) -> bool {
+        self.allows(scope)
     }
 
     /// For a row loaded by id: a mismatch looks the same as an id that does not exist.
@@ -163,6 +228,64 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    fn select(key: &[&str], requested: &[&str]) -> ApiResult<ScopeSelection> {
+        let requested: Vec<String> = requested.iter().map(|s| (*s).to_owned()).collect();
+        caller(key).select_scopes(&requested)
+    }
+
+    fn selection(exact: &[&str], prefixes: &[&str]) -> ScopeSelection {
+        ScopeSelection {
+            exact: exact.iter().map(|s| s.parse().expect("scope")).collect(),
+            prefixes: prefixes.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_wildcard_narrows_to_what_the_key_allows() {
+        let cases: [(&[&str], &str, ScopeSelection); 7] = [
+            (&["user:a"], "user:*", selection(&["user:a"], &[])),
+            (&["user:a"], "*", selection(&["user:a"], &[])),
+            (&["user:a*"], "user:*", selection(&[], &["user:a"])),
+            (&["user:*"], "user:a*", selection(&[], &["user:a"])),
+            (&["user:*"], "user:*", selection(&[], &["user:"])),
+            (&["*"], "user:*", selection(&[], &["user:"])),
+            (&["*"], "*", selection(&[], &[""])),
+        ];
+        for (key, requested, expected) in cases {
+            assert_eq!(select(key, &[requested]).expect(requested), expected);
+        }
+    }
+
+    #[test]
+    fn a_wildcard_with_no_overlap_is_refused() {
+        for (key, requested) in [
+            (&["user:a"][..], "user:b*"),
+            (&["user:a"][..], "agent:*"),
+            (&["user:a*"][..], "user:b*"),
+            (&["user:a"][..], "user:ab*"),
+        ] {
+            assert!(select(key, &[requested]).is_err(), "{requested}");
+        }
+    }
+
+    #[test]
+    fn exact_scopes_are_still_checked() {
+        assert_eq!(
+            select(&["user:*"], &["user:a"]).expect("allowed"),
+            selection(&["user:a"], &[])
+        );
+        assert!(select(&["user:a"], &["user:b"]).is_err());
+    }
+
+    #[test]
+    fn a_malformed_pattern_is_invalid_and_the_count_is_limited() {
+        for bad in ["team:*", "us*er:a", "user:a*b", "user:a**", "use*", ""] {
+            assert!(select(&["*"], &[bad]).is_err(), "{bad:?}");
+        }
+        assert!(select(&["*"], &[]).is_err());
+        assert!(select(&["*"], &vec!["user:a"; 51]).is_err());
+    }
 
     fn caller(scopes: &[&str]) -> Caller {
         Caller::new(ApiKey {
