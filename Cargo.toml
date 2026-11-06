@@ -16,6 +16,7 @@ memoryos-ingest = { path = "crates/ingest" }
 memoryos-retrieve = { path = "crates/retrieve" }
 memoryos-agent = { path = "crates/agent" }
 memoryos-sdk = { path = "crates/sdk" }
+memoryos-hooks = { path = "crates/hooks" }
 
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }

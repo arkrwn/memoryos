@@ -20,6 +20,7 @@ memoryos-llm.workspace = true
 memoryos-ingest.workspace = true
 memoryos-retrieve.workspace = true
 memoryos-agent.workspace = true
+memoryos-hooks.workspace = true
 async-trait.workspace = true
 axum = "0.8"
 base64 = "0.22"
