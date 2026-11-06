@@ -5,8 +5,34 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Enables tests/integration.rs, which needs Docker and the pgvector/pgvector:pg17 image.
+integration = []
+
 [dependencies]
 memoryos-core.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+# Pinned: later 0.4.x releases implement the sqlx traits for sqlx 0.9, not 0.8.
+pgvector = { version = "=0.4.1", features = ["sqlx"] }
+serde_json.workspace = true
+sqlx = { version = "0.8", default-features = false, features = [
+    "postgres",
+    "runtime-tokio",
+    "tls-rustls",
+    "uuid",
+    "chrono",
+    "json",
+    "migrate",
+    "macros",
+] }
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+futures = "0.3"
+testcontainers = "0.25"
+tokio.workspace = true
 
 [lints]
 workspace = true
