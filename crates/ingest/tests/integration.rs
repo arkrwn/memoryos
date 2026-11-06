@@ -1860,6 +1860,112 @@ async fn host_key_of_a_higher_trust_episode_cannot_borrow_its_trust() {
     assert_eq!(w.count("facts").await, 0);
 }
 
+// ---- Replays that fail ------------------------------------------------------------------------
+
+impl World {
+    /// Answers an embedding request for exactly `inputs`, after `millis`.
+    async fn stub_embed_after(&self, inputs: &[&str], millis: u64, status: u16) {
+        let data: Vec<Value> = inputs
+            .iter()
+            .enumerate()
+            .map(|(index, text)| json!({"index": index, "embedding": vector_for(text)}))
+            .collect();
+        self.stub(json!({
+            "request": {
+                "method": "POST",
+                "url": self.embeddings_url,
+                "bodyPatterns": [{"equalToJson": {"input": inputs}, "ignoreExtraElements": true}],
+            },
+            "response": delayed(json!({"status": status, "jsonBody": {"data": data}}), millis),
+        }))
+        .await;
+    }
+
+    async fn wait_for_episode(&self) {
+        self.wait_until("the first request inserted its episode", || async {
+            self.count("episodes").await == 1
+        })
+        .await;
+    }
+}
+
+fn keyed_request(scope: &Scope, key: &str, fact: CommitFact) -> CommitRequest {
+    let mut request = commit_request(scope, "same source", vec![fact]);
+    request.idempotency_key = Some(key.into());
+    request
+}
+
+/// The loser reads the unprocessed episode, the winner is acknowledged, and only then does the
+/// loser's own work fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replay_failing_late_keeps_the_acknowledged_facts_of_the_winner() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    w.stub_embed_after(&["Winner", "ada"], 1000, 200).await;
+    w.stub_embed_after(&["Loser", "ada"], 3000, 400).await;
+
+    let winner = w.host.commit(
+        &ctx(),
+        keyed_request(&scope, "race", add_fact("Winner", "Ada")),
+        Trust::Agent,
+    );
+    let loser = async {
+        w.wait_for_episode().await;
+        w.host
+            .commit(
+                &ctx(),
+                keyed_request(&scope, "race", add_fact("Loser", "Ada")),
+                Trust::Agent,
+            )
+            .await
+    };
+    let (winner, loser) = tokio::join!(winner, loser);
+
+    let winner = winner.expect("winner");
+    assert!(loser.is_err(), "the loser's embedding call was refused");
+    let kept = w
+        .store
+        .get_fact(&ctx(), winner.facts[0].id)
+        .await
+        .expect("the acknowledged fact is still there");
+    assert_eq!(kept.statement, "Winner");
+    assert_eq!(w.count("episodes").await, 1);
+}
+
+/// The loser fails while the winner is still working, and the winner must still be able to finish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replay_failing_early_does_not_remove_the_episode_of_a_running_commit() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    w.stub_embed_after(&["Winner", "ada"], 1500, 200).await;
+
+    let winner = w.host.commit(
+        &ctx(),
+        keyed_request(&scope, "race", add_fact("Winner", "Ada")),
+        Trust::Agent,
+    );
+    let loser = async {
+        w.wait_for_episode().await;
+        let mut bad_target = add_fact("Loser", "Ada");
+        bad_target.supersedes = Some(Uuid::now_v7());
+        // Not asserted: on a busy machine the winner can finish first, and this is then a plain
+        // replay. What matters is the winner's result.
+        let _ = w
+            .host
+            .commit(
+                &ctx(),
+                keyed_request(&scope, "race", bad_target),
+                Trust::Agent,
+            )
+            .await;
+    };
+    let (winner, ()) = tokio::join!(winner, loser);
+
+    let winner = winner.expect("the winner still commits");
+    assert_eq!(winner.facts.len(), 1);
+    assert_eq!(w.count("facts").await, 1);
+}
+
 // ---- Entity resolution -----------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

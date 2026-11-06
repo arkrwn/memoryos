@@ -367,6 +367,63 @@ async fn null_metadata_and_missing_occurred_at_get_defaults() -> TestResult {
 }
 
 #[tokio::test]
+async fn claim_says_whether_this_call_created_the_episode() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let mut new = episode(&user("u1"), Trust::Agent, "source");
+    new.idempotency_key = Some("k".into());
+    let (first, created) = db.store.claim_unqueued_episode(&c, new.clone()).await?;
+    assert!(created);
+    let (second, created) = db.store.claim_unqueued_episode(&c, new).await?;
+    assert!(!created);
+    assert_eq!(first.id, second.id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn discard_leaves_a_processed_episode_and_its_facts() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = user("u1");
+    let subject = entity(&db, &c, &scope, "Ada").await?;
+    let (episode_id, fact_id) =
+        add_fact(&db, &c, new_fact(&scope, subject, "kept", date(2025, 1))).await?;
+    assert!(!db.store.discard_unprocessed_episode(&c, episode_id).await?);
+    db.store.get_episode(&c, episode_id).await?;
+    db.store.get_fact(&c, fact_id).await?;
+    Ok(())
+}
+
+/// Whichever gets the row first, the other sees that: no acknowledged fact can lose its episode.
+#[tokio::test(flavor = "multi_thread")]
+async fn discard_and_apply_racing_leave_exactly_one_outcome() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = user("u1");
+    let subject = entity(&db, &c, &scope, "Ada").await?;
+    for round in 0..20 {
+        let (claimed, _) = db
+            .store
+            .claim_unqueued_episode(&c, episode(&scope, Trust::User, "source"))
+            .await?;
+        let op = FactOp::Add(new_fact(&scope, subject, "raced", date(2025, 1)));
+        let (discarded, applied) = tokio::join!(
+            db.store.discard_unprocessed_episode(&c, claimed.id),
+            db.store.apply_extraction(&c, claimed.id, vec![op]),
+        );
+        if discarded? {
+            assert!(is_not_found(applied), "round {round}");
+            assert!(is_not_found(db.store.get_episode(&c, claimed.id).await));
+        } else {
+            let ids = applied?;
+            db.store.get_fact(&c, ids[0]).await?;
+            db.store.get_episode(&c, claimed.id).await?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn nul_byte_in_content_is_invalid_input_not_storage_error() -> TestResult {
     let db = db().await;
     let bad = episode(&user("u1"), Trust::User, "a\0b");

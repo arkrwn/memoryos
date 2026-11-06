@@ -107,7 +107,7 @@ impl PgStore {
         ctx: &RequestContext,
         episode: NewEpisode,
         enqueue: bool,
-    ) -> Result<Episode> {
+    ) -> Result<(Episode, bool)> {
         validate::non_empty("source", &episode.source)?;
         validate::non_empty("content", &episode.content)?;
         let metadata = match episode.metadata {
@@ -136,6 +136,7 @@ impl PgStore {
             .await
             .map_err(db)?;
 
+        let created = inserted.is_some();
         let row = match inserted {
             Some(row) => {
                 if enqueue {
@@ -164,14 +165,15 @@ impl PgStore {
         };
         let result = rows::episode(&row)?;
         tx.commit().await.map_err(db)?;
-        Ok(result)
+        Ok((result, created))
     }
 }
 
 #[async_trait]
 impl MemoryStore for PgStore {
     async fn insert_episode(&self, ctx: &RequestContext, episode: NewEpisode) -> Result<Episode> {
-        self.insert_episode_inner(ctx, episode, true).await
+        let (episode, _) = self.insert_episode_inner(ctx, episode, true).await?;
+        Ok(episode)
     }
 
     async fn insert_unqueued_episode(
@@ -179,7 +181,34 @@ impl MemoryStore for PgStore {
         ctx: &RequestContext,
         episode: NewEpisode,
     ) -> Result<Episode> {
+        let (episode, _) = self.insert_episode_inner(ctx, episode, false).await?;
+        Ok(episode)
+    }
+
+    async fn claim_unqueued_episode(
+        &self,
+        ctx: &RequestContext,
+        episode: NewEpisode,
+    ) -> Result<(Episode, bool)> {
         self.insert_episode_inner(ctx, episode, false).await
+    }
+
+    async fn discard_unprocessed_episode(&self, ctx: &RequestContext, id: Uuid) -> Result<bool> {
+        let mut tx = self.tenant_tx(ctx).await?;
+        // One statement: if `apply_extraction` holds the row lock, this waits and then re-reads
+        // `processed_at`, so it cannot delete what that transaction just acknowledged.
+        let deleted = sqlx::query("DELETE FROM episodes WHERE id = $1 AND processed_at IS NULL")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?
+            .rows_affected()
+            > 0;
+        if deleted {
+            facts::audit(&mut tx, ctx, "episode.discard", Some(id), json!({})).await?;
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(deleted)
     }
 
     async fn get_episode(&self, ctx: &RequestContext, id: Uuid) -> Result<Episode> {

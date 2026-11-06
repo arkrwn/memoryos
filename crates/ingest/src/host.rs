@@ -91,9 +91,9 @@ impl HostCommitter {
 
         // The key can only be looked up by inserting, and a replay must be recognized before the
         // references are checked: the original commit may have closed the fact it superseded.
-        let episode = self
+        let (episode, created) = self
             .store
-            .insert_unqueued_episode(
+            .claim_unqueued_episode(
                 ctx,
                 NewEpisode {
                     scope: req.scope.clone(),
@@ -114,7 +114,11 @@ impl HostCommitter {
         let (ops, merges) = match self.build_ops(ctx, &req, &episode).await {
             Ok(built) => built,
             Err(err) => {
-                self.discard(ctx, episode.id).await;
+                // A replay does not own the episode: the request that created it may still be
+                // running, or may already have been acknowledged.
+                if created {
+                    self.discard(ctx, episode.id).await;
+                }
                 return Err(err);
             }
         };
@@ -233,10 +237,15 @@ impl HostCommitter {
     }
 
     /// A commit refused before `apply_extraction` must leave no source behind. The episode holds no
-    /// facts, since `apply_extraction` is what links them. If this fails, what remains is an
-    /// unprocessed `agent` or `external` episode, which pending search never returns.
+    /// facts, since `apply_extraction` is what links them, and if a replay has processed it since,
+    /// the store leaves it alone. If this fails, what remains is an unprocessed `agent` or
+    /// `external` episode, which pending search never returns.
     async fn discard(&self, ctx: &RequestContext, episode_id: Uuid) {
-        if let Err(err) = self.store.purge_episode(ctx, episode_id).await {
+        if let Err(err) = self
+            .store
+            .discard_unprocessed_episode(ctx, episode_id)
+            .await
+        {
             tracing::warn!(%episode_id, error = %err, "could not discard a refused commit");
         }
     }

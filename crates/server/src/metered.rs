@@ -63,6 +63,16 @@ impl MemoryStore for MeteredStore {
     ) -> Result<Episode> {
         self.inner.insert_unqueued_episode(ctx, episode).await
     }
+    async fn claim_unqueued_episode(
+        &self,
+        ctx: &RequestContext,
+        episode: NewEpisode,
+    ) -> Result<(Episode, bool)> {
+        self.inner.claim_unqueued_episode(ctx, episode).await
+    }
+    async fn discard_unprocessed_episode(&self, ctx: &RequestContext, id: Uuid) -> Result<bool> {
+        self.inner.discard_unprocessed_episode(ctx, id).await
+    }
     async fn get_episode(&self, ctx: &RequestContext, id: Uuid) -> Result<Episode> {
         self.inner.get_episode(ctx, id).await
     }

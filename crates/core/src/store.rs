@@ -22,6 +22,16 @@ pub trait MemoryStore: Send + Sync {
         ctx: &RequestContext,
         episode: NewEpisode,
     ) -> Result<Episode>;
+    /// `insert_unqueued_episode` that also says whether this call created the row. `false` means a
+    /// repeated `idempotency_key` returned an episode some other request owns.
+    async fn claim_unqueued_episode(
+        &self,
+        ctx: &RequestContext,
+        episode: NewEpisode,
+    ) -> Result<(Episode, bool)>;
+    /// Deletes the episode only if it is still unprocessed, atomically against `apply_extraction`,
+    /// and returns whether it did. An unprocessed episode has no facts, so nothing else changes.
+    async fn discard_unprocessed_episode(&self, ctx: &RequestContext, id: Uuid) -> Result<bool>;
     async fn get_episode(&self, ctx: &RequestContext, id: Uuid) -> Result<Episode>;
     /// Deletes the episode. Facts it alone supports are deleted; facts with other sources lose
     /// this source and stay, with trust recomputed as the highest among the remaining sources. A
