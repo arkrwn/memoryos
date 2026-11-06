@@ -18,7 +18,7 @@ pub(crate) const API_KEY_COLS: &str = "id, tenant, name, scopes, max_trust, is_a
 /// Requires the table alias `f`. The embedding is left out on purpose: it is never returned.
 pub(crate) const FACT_COLS: &str = "f.id, f.scope, f.subject_id, f.predicate, f.object_id, \
     f.statement, f.trust, f.status, f.valid_from, f.valid_to, f.recorded_at, f.invalidated_at, \
-    f.superseded_by, ARRAY(SELECT s.episode_id FROM fact_sources s WHERE s.fact_id = f.id \
+    f.superseded_by, f.pending_supersede_of, ARRAY(SELECT s.episode_id FROM fact_sources s WHERE s.fact_id = f.id \
     ORDER BY s.episode_id) AS source_episode_ids";
 
 /// SPEC section 4 visibility for `facts f`, with `$t` the valid time and `$k` the knowledge time.
@@ -86,6 +86,7 @@ pub(crate) fn fact(row: &PgRow) -> Result<Fact> {
         recorded_at: get(row, "recorded_at")?,
         invalidated_at: get(row, "invalidated_at")?,
         superseded_by: get(row, "superseded_by")?,
+        pending_supersede_of: get(row, "pending_supersede_of")?,
         source_episode_ids: get(row, "source_episode_ids")?,
     })
 }

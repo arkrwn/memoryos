@@ -524,10 +524,44 @@ async fn store_refuses_facts_that_break_trust_or_scope_rules() -> TestResult {
 }
 
 #[tokio::test]
+async fn agent_facts_can_go_active_only_in_agent_scopes() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    for scope in [user("u1"), Scope::shared("team")] {
+        let subject = entity(&db, &c, &scope, "ada").await?;
+        let episode_id = new_episode(&db, &c, &scope, Trust::Agent).await?;
+        let mut planted = new_fact(&scope, subject, "planted", date(2020, 1));
+        planted.trust = Trust::Agent;
+        assert!(is_invalid(
+            db.store
+                .apply_extraction(&c, episode_id, vec![FactOp::Add(planted.clone())])
+                .await
+        ));
+        // The same statement through quarantine is accepted and stays out of recall.
+        planted.status = FactStatus::Quarantined;
+        let held = add_fact(&db, &c, planted).await?.1;
+        assert_eq!(
+            db.store.get_fact(&c, held).await?.status,
+            FactStatus::Quarantined
+        );
+    }
+    let scope = Scope::agent("bot");
+    let subject = entity(&db, &c, &scope, "ada").await?;
+    let mut own = new_fact(&scope, subject, "own note", date(2020, 1));
+    own.trust = Trust::Agent;
+    let active = add_fact(&db, &c, own).await?.1;
+    assert_eq!(
+        db.store.get_fact(&c, active).await?.status,
+        FactStatus::Active
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn corroborate_links_a_second_source_without_raising_trust() -> TestResult {
     let db = db().await;
     let c = ctx("t1");
-    let scope = user("u1");
+    let scope = Scope::agent("bot");
     let subject = entity(&db, &c, &scope, "ada").await?;
     let mut low = new_fact(&scope, subject, "fact", date(2020, 1));
     low.trust = Trust::Agent;
@@ -781,12 +815,10 @@ async fn quarantined_supersede_leaves_old_open_until_approved() -> TestResult {
     let open = db.store.get_fact(&c, old).await?;
     assert_eq!(open.valid_to, None);
     assert_eq!(open.superseded_by, None);
-    let pending: Option<Uuid> =
-        sqlx::query_scalar("SELECT pending_supersede_of FROM facts WHERE id = $1")
-            .bind(new)
-            .fetch_one(&db.admin)
-            .await?;
+    let pending = db.store.get_fact(&c, new).await?.pending_supersede_of;
     assert_eq!(pending, Some(old));
+    let listed = db.store.list_quarantined(&c, &scopes, 10).await?;
+    assert_eq!(listed[0].pending_supersede_of, Some(old));
 
     // Quarantined facts are absent from every read path.
     let no_filter = FactFilter::default();
@@ -815,6 +847,7 @@ async fn quarantined_supersede_leaves_old_open_until_approved() -> TestResult {
 
     let approved = db.store.approve_fact(&c, new).await?;
     assert_eq!(approved.status, FactStatus::Active);
+    assert_eq!(approved.pending_supersede_of, None);
     let closed = db.store.get_fact(&c, old).await?;
     assert_eq!(closed.valid_to, Some(date(2022, 1)));
     assert_eq!(closed.superseded_by, Some(new));
@@ -1086,7 +1119,7 @@ async fn text_search_ranks_filters_scope_and_treats_query_as_data() -> TestResul
 }
 
 #[tokio::test]
-async fn pending_episode_search_excludes_external_and_processed() -> TestResult {
+async fn pending_episode_search_returns_only_unprocessed_user_and_system() -> TestResult {
     let db = db().await;
     let c = ctx("t1");
     let scope = user("u1");
@@ -1099,6 +1132,13 @@ async fn pending_episode_search_excludes_external_and_processed() -> TestResult 
         .insert_episode(&c, episode(&scope, Trust::External, "the quick poison"))
         .await?;
     db.store
+        .insert_episode(&c, episode(&scope, Trust::Agent, "the quick planted"))
+        .await?;
+    let system = db
+        .store
+        .insert_episode(&c, episode(&scope, Trust::System, "the quick system"))
+        .await?;
+    db.store
         .insert_episode(&c, episode(&user("u2"), Trust::User, "the quick other"))
         .await?;
 
@@ -1106,11 +1146,12 @@ async fn pending_episode_search_excludes_external_and_processed() -> TestResult 
         .store
         .search_pending_episodes(&c, &scopes, "quick", 10)
         .await?;
-    assert_eq!(found.len(), 1);
-    assert_eq!(found[0].episode.id, trusted.id);
+    let ids: BTreeSet<Uuid> = found.iter().map(|s| s.episode.id).collect();
+    assert_eq!(ids, BTreeSet::from([trusted.id, system.id]));
     assert!(found[0].score > 0.0);
 
     db.store.apply_extraction(&c, trusted.id, vec![]).await?;
+    db.store.apply_extraction(&c, system.id, vec![]).await?;
     assert!(db
         .store
         .search_pending_episodes(&c, &scopes, "quick", 10)
@@ -1765,7 +1806,7 @@ async fn fail_job_reschedules_then_goes_dead_at_the_limit() -> TestResult {
 
     // Future run_after: not claimable yet.
     let later = Utc::now() + chrono::Duration::hours(1);
-    db.store.fail_job(job.id, "boom\0", later, 2).await?;
+    assert!(db.store.fail_job(&job, "w", "boom\0", later, 2).await?);
     assert!(db.store.claim_job("w", 60).await?.is_none());
     let row = sqlx::query("SELECT status, last_error, locked_by FROM jobs WHERE id = $1")
         .bind(job.id)
@@ -1783,7 +1824,7 @@ async fn fail_job_reschedules_then_goes_dead_at_the_limit() -> TestResult {
         .await?;
     let retry = db.store.claim_job("w", 60).await?.expect("retry");
     assert_eq!(retry.attempts, 2);
-    db.store.fail_job(retry.id, "boom", past, 2).await?;
+    assert!(db.store.fail_job(&retry, "w", "boom", past, 2).await?);
     let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1")
         .bind(job.id)
         .fetch_one(&db.admin)
@@ -1791,11 +1832,19 @@ async fn fail_job_reschedules_then_goes_dead_at_the_limit() -> TestResult {
     assert_eq!(status, "dead");
     assert!(db.store.claim_job("w", 60).await?.is_none());
 
-    assert!(is_not_found(
-        db.store.fail_job(Uuid::now_v7(), "x", past, 2).await
-    ));
-    assert!(is_not_found(db.store.complete_job(Uuid::now_v7()).await));
     Ok(())
+}
+
+async fn job_row(db: &Db, id: Uuid) -> Res<(String, Option<String>, Option<String>)> {
+    let row = sqlx::query("SELECT status, locked_by, last_error FROM jobs WHERE id = $1")
+        .bind(id)
+        .fetch_one(&db.admin)
+        .await?;
+    Ok((
+        row.try_get("status")?,
+        row.try_get("locked_by")?,
+        row.try_get("last_error")?,
+    ))
 }
 
 #[tokio::test]
@@ -1803,18 +1852,86 @@ async fn completed_job_is_not_claimed_or_revived_by_a_late_failure() -> TestResu
     let db = db().await;
     new_episode(&db, &ctx("t1"), &user("u1"), Trust::User).await?;
     let job = db.store.claim_job("w", 60).await?.expect("job");
-    db.store.complete_job(job.id).await?;
+    assert!(db.store.complete_job(&job, "w").await?);
     assert!(db.store.claim_job("w", 60).await?.is_none());
 
-    db.store
-        .fail_job(job.id, "stale worker", Utc::now(), 5)
-        .await?;
-    let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1")
-        .bind(job.id)
-        .fetch_one(&db.admin)
-        .await?;
-    assert_eq!(status, "done");
+    // The same worker, after its claim is finished: every further call reports a lost claim.
+    assert!(!db.store.complete_job(&job, "w").await?);
+    assert!(!db.store.renew_job(&job, "w", 60).await?);
+    assert!(!db.store.fail_job(&job, "w", "late", Utc::now(), 5).await?);
+    assert_eq!(job_row(&db, job.id).await?.0, "done");
     assert!(db.store.claim_job("w", 60).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_worker_cannot_touch_a_job_another_worker_reclaimed() -> TestResult {
+    let db = db().await;
+    new_episode(&db, &ctx("t1"), &user("u1"), Trust::User).await?;
+    let stale = db.store.claim_job("old", 1).await?.expect("job");
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let current = db.store.claim_job("new", 60).await?.expect("reclaimed");
+    assert_eq!(current.id, stale.id);
+
+    let later = Utc::now() + chrono::Duration::hours(1);
+    assert!(!db.store.complete_job(&stale, "old").await?);
+    assert!(!db.store.fail_job(&stale, "old", "x", later, 1).await?);
+    assert!(!db.store.renew_job(&stale, "old", 3600).await?);
+    assert_eq!(
+        job_row(&db, stale.id).await?,
+        ("running".to_owned(), Some("new".to_owned()), None)
+    );
+
+    // Each part of the fence holds alone: the current worker with the old attempts, and the old
+    // worker with the current attempts.
+    assert!(!db.store.complete_job(&stale, "new").await?);
+    assert!(!db.store.complete_job(&current, "old").await?);
+    assert!(!db.store.fail_job(&current, "old", "x", later, 1).await?);
+    assert_eq!(job_row(&db, stale.id).await?.0, "running");
+
+    assert!(db.store.complete_job(&current, "new").await?);
+    assert_eq!(job_row(&db, stale.id).await?.0, "done");
+    Ok(())
+}
+
+#[tokio::test]
+async fn same_worker_id_reclaiming_is_still_fenced_by_attempts() -> TestResult {
+    let db = db().await;
+    new_episode(&db, &ctx("t1"), &user("u1"), Trust::User).await?;
+    let stale = db.store.claim_job("w", 1).await?.expect("job");
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let current = db.store.claim_job("w", 60).await?.expect("reclaimed");
+    assert!(!db.store.complete_job(&stale, "w").await?);
+    assert!(db.store.complete_job(&current, "w").await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn renew_job_extends_the_lease_so_it_cannot_be_reclaimed() -> TestResult {
+    let db = db().await;
+    new_episode(&db, &ctx("t1"), &user("u1"), Trust::User).await?;
+    let job = db.store.claim_job("w", 1).await?.expect("job");
+    assert!(db.store.renew_job(&job, "w", 60).await?);
+    assert!(is_invalid(db.store.renew_job(&job, "w", 0).await));
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(db.store.claim_job("other", 60).await?.is_none());
+    assert!(db.store.complete_job(&job, "w").await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn lost_claim_on_a_missing_job_is_false() -> TestResult {
+    let db = db().await;
+    let ghost = memoryos_core::Job {
+        id: Uuid::now_v7(),
+        tenant: "t1".into(),
+        kind: "extract".into(),
+        payload: json!({}),
+        attempts: 1,
+    };
+    assert!(!db.store.renew_job(&ghost, "w", 60).await?);
+    assert!(!db.store.complete_job(&ghost, "w").await?);
+    assert!(!db.store.fail_job(&ghost, "w", "x", Utc::now(), 5).await?);
     Ok(())
 }
 
@@ -2108,6 +2225,264 @@ async fn row_level_security_holds_under_the_superuser_login() -> TestResult {
         assert!(denied.is_err(), "{table} must be denied");
         tx.rollback().await?;
     }
+    Ok(())
+}
+
+/// Calls both search functions as memoryos_app. `tenant = None` leaves app.tenant unset.
+async fn search_ids_as_app(
+    pool: &PgPool,
+    tenant: Option<&str>,
+    scope: &str,
+    word: &str,
+) -> Res<(Vec<Uuid>, Vec<Uuid>)> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL ROLE memoryos_app")
+        .execute(&mut *tx)
+        .await?;
+    if let Some(tenant) = tenant {
+        sqlx::query("SELECT set_config('app.tenant', $1, true)")
+            .bind(tenant)
+            .execute(&mut *tx)
+            .await?;
+    }
+    let scopes = vec![scope.to_owned()];
+    let facts: Vec<Uuid> =
+        sqlx::query_scalar("SELECT id FROM search_fact_ids_text($1, $2, now(), now(), 10)")
+            .bind(&scopes)
+            .bind(word)
+            .fetch_all(&mut *tx)
+            .await?;
+    let episodes: Vec<Uuid> =
+        sqlx::query_scalar("SELECT id FROM search_pending_episode_ids($1, $2, 10)")
+            .bind(&scopes)
+            .bind(word)
+            .fetch_all(&mut *tx)
+            .await?;
+    tx.rollback().await?;
+    Ok((facts, episodes))
+}
+
+/// A fact and a pending episode for `a`, both containing "secret". Returns (fact, episode).
+async fn seed_secret(store: &PgStore, a: &RequestContext, scope: &Scope) -> Res<(Uuid, Uuid)> {
+    let subject = store
+        .upsert_entity(
+            a,
+            NewEntity {
+                scope: scope.clone(),
+                kind: "thing".into(),
+                name: "ada".into(),
+                aliases: vec![],
+                embedding: axis(1),
+            },
+        )
+        .await?
+        .id;
+    let source = store
+        .insert_episode(a, episode(scope, Trust::User, "processed"))
+        .await?
+        .id;
+    let fact = store
+        .apply_extraction(
+            a,
+            source,
+            vec![FactOp::Add(new_fact(
+                scope,
+                subject,
+                "secret fact",
+                date(2020, 1),
+            ))],
+        )
+        .await?[0];
+    let pending = store
+        .insert_episode(a, episode(scope, Trust::User, "secret pending"))
+        .await?
+        .id;
+    Ok((fact, pending))
+}
+
+#[tokio::test]
+async fn search_functions_return_nothing_for_another_or_unset_tenant() -> TestResult {
+    let db = db().await;
+    let a = ctx("tenant-a");
+    let scope = user("u1");
+    let (fact, pending) = seed_secret(&db.store, &a, &scope).await?;
+    let scope_text = scope.to_string();
+
+    let own = search_ids_as_app(&db.admin, Some("tenant-a"), &scope_text, "secret").await?;
+    assert_eq!(own, (vec![fact], vec![pending]));
+
+    for tenant in [Some("tenant-b"), Some(""), Some("%"), None] {
+        let seen = search_ids_as_app(&db.admin, tenant, &scope_text, "secret").await?;
+        assert_eq!(seen, (vec![], vec![]), "tenant {tenant:?}");
+    }
+
+    // Through the store as well, with tenant B holding its own row under the same scope name.
+    let b = ctx("tenant-b");
+    let (b_fact, b_pending) = seed_secret(&db.store, &b, &scope).await?;
+    let filter = FactFilter::default();
+    let scopes = [scope];
+    let facts = db
+        .store
+        .search_facts_text(&b, &scopes, "secret", &filter, 10)
+        .await?;
+    assert_eq!(
+        facts.iter().map(|s| s.fact.id).collect::<Vec<_>>(),
+        vec![b_fact]
+    );
+    let episodes = db
+        .store
+        .search_pending_episodes(&b, &scopes, "secret", 10)
+        .await?;
+    assert_eq!(
+        episodes.iter().map(|s| s.episode.id).collect::<Vec<_>>(),
+        vec![b_pending]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn text_search_keeps_time_and_status_filters_through_the_function() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = user("u1");
+    let scopes = [scope.clone()];
+    let subject = entity(&db, &c, &scope, "ada").await?;
+    let (_, old) = add_fact(
+        &db,
+        &c,
+        new_fact(&scope, subject, "marker old", date(2020, 1)),
+    )
+    .await?;
+    let new = supersede(
+        &db,
+        &c,
+        old,
+        new_fact(&scope, subject, "marker new", date(2022, 1)),
+    )
+    .await?;
+    let mut held = new_fact(&scope, subject, "marker held", date(2020, 1));
+    held.trust = Trust::External;
+    held.status = FactStatus::Quarantined;
+    add_fact(&db, &c, held).await?;
+
+    let search = |filter: FactFilter| {
+        let store = db.store.clone();
+        let c = c.clone();
+        let scopes = scopes.clone();
+        async move {
+            store
+                .search_facts_text(&c, &scopes, "marker", &filter, 10)
+                .await
+                .map(|found| found.into_iter().map(|s| s.fact.id).collect::<Vec<_>>())
+        }
+    };
+    assert_eq!(search(FactFilter::default()).await?, vec![new]);
+    assert_eq!(search(at(date(2021, 1))).await?, vec![old]);
+    assert_eq!(search(at(date(2019, 1))).await?, Vec::<Uuid>::new());
+    let recorded = db.store.get_fact(&c, new).await?.recorded_at;
+    let before = FactFilter {
+        as_of: Some(date(2023, 1)),
+        known_at: Some(recorded - chrono::Duration::seconds(1)),
+    };
+    assert_eq!(search(before).await?, Vec::<Uuid>::new());
+    db.store.invalidate_fact(&c, new, "wrong").await?;
+    assert_eq!(search(FactFilter::default()).await?, Vec::<Uuid>::new());
+    Ok(())
+}
+
+/// The production shape: a non-superuser login owns the tables and is granted memoryos_app. A
+/// superuser only prepares the role and the extension, as a managed database would.
+#[tokio::test]
+async fn non_superuser_owner_login_runs_migration_tenancy_search_and_jobs() -> TestResult {
+    let server = server_url();
+    // The template migration created memoryos_app, which is cluster-wide.
+    let bootstrap = connect_with_retry(&format!("{server}/postgres")).await;
+    for sql in [
+        "CREATE ROLE svc LOGIN PASSWORD 'pw' NOSUPERUSER NOBYPASSRLS",
+        "GRANT memoryos_app TO svc",
+        "CREATE DATABASE owned OWNER svc",
+    ] {
+        sqlx::query(sql).execute(&bootstrap).await?;
+    }
+    bootstrap.close().await;
+    let superuser = connect_with_retry(&format!("{server}/owned")).await;
+    sqlx::query("CREATE EXTENSION vector")
+        .execute(&superuser)
+        .await?;
+
+    let host = server
+        .strip_prefix("postgres://postgres:postgres@")
+        .expect("server url");
+    let url = format!("postgres://svc:pw@{host}/owned");
+    let store = PgStore::connect(&url, 8).await?;
+    store.migrate().await?;
+
+    let owner = connect_with_retry(&url).await;
+    let is_super: bool =
+        sqlx::query_scalar("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
+            .fetch_one(&owner)
+            .await?;
+    assert!(!is_super);
+    let table_owner: String =
+        sqlx::query_scalar("SELECT tableowner::text FROM pg_tables WHERE tablename = 'facts'")
+            .fetch_one(&owner)
+            .await?;
+    assert_eq!(table_owner, "svc");
+
+    let a = ctx("tenant-a");
+    let b = ctx("tenant-b");
+    let scope = user("u1");
+    let scopes = [scope.clone()];
+    let filter = FactFilter::default();
+    let (fact, pending) = seed_secret(&store, &a, &scope).await?;
+
+    let found = store
+        .search_facts_text(&a, &scopes, "secret", &filter, 10)
+        .await?;
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].fact.id, fact);
+    assert!(found[0].score > 0.0);
+    let found = store
+        .search_pending_episodes(&a, &scopes, "secret", 10)
+        .await?;
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].episode.id, pending);
+
+    assert!(store
+        .search_facts_text(&b, &scopes, "secret", &filter, 10)
+        .await?
+        .is_empty());
+    assert!(store
+        .search_pending_episodes(&b, &scopes, "secret", 10)
+        .await?
+        .is_empty());
+    assert!(is_not_found(store.get_fact(&b, fact).await));
+    let nothing = (vec![], vec![]);
+    let scope_text = scope.to_string();
+    assert_eq!(
+        search_ids_as_app(&owner, Some("tenant-b"), &scope_text, "secret").await?,
+        nothing
+    );
+    assert_eq!(
+        search_ids_as_app(&owner, None, &scope_text, "secret").await?,
+        nothing
+    );
+
+    // The owner calling the function directly, outside the role, is held to app.tenant too.
+    let direct: Vec<Uuid> =
+        sqlx::query_scalar("SELECT id FROM search_fact_ids_text($1, 'secret', now(), now(), 10)")
+            .bind(vec![scope_text])
+            .fetch_all(&owner)
+            .await?;
+    assert!(direct.is_empty());
+
+    // Writes, audit, enqueue_job and the job methods all work under this login.
+    store.invalidate_fact(&a, fact, "audit").await?;
+    store.put_block(&a, "bot", "persona", "p", 10, None).await?;
+    let job = store.claim_job("w", 60).await?.expect("job");
+    assert!(store.complete_job(&job, "w").await?);
+    let report = store.purge_scope(&a, &scope).await?;
+    assert_eq!(report.facts_deleted, 1);
     Ok(())
 }
 

@@ -500,14 +500,15 @@ impl MemoryStore for PgStore {
             return Ok(Vec::new());
         }
         let mut tx = self.tenant_tx(ctx).await?;
-        let filter_sql = visible(3, 4);
+        // GIN is unusable under RLS, so the DEFINER function finds ids and rank for app.tenant.
+        // The join loads the rows under RLS, in one statement and so on one snapshot. The
+        // function treats NULL times as no match, which is why the defaults are applied here.
         let sql = format!(
-            "SELECT {FACT_COLS}, \
-                 ts_rank(f.statement_tsv, websearch_to_tsquery('simple', $1))::float8 AS rank \
-             FROM facts f \
-             WHERE f.scope = ANY($2) AND {filter_sql} \
-                 AND f.statement_tsv @@ websearch_to_tsquery('simple', $1) \
-             ORDER BY rank DESC, f.id LIMIT $5"
+            "SELECT {FACT_COLS}, s.hit_rank::float8 AS rank \
+             FROM search_fact_ids_text($2, $1, COALESCE($3::timestamptz, now()), \
+                 COALESCE($4::timestamptz, now()), $5) AS s(hit_id, hit_rank) \
+             JOIN facts f ON f.id = s.hit_id \
+             ORDER BY s.hit_rank DESC, f.id"
         );
         let found = sqlx::query(&sql)
             .bind(query)
@@ -535,13 +536,12 @@ impl MemoryStore for PgStore {
             return Ok(Vec::new());
         }
         let mut tx = self.tenant_tx(ctx).await?;
+        // Same approach as search_facts_text. The function limits trust to user and system.
         let sql = format!(
-            "SELECT {EPISODE_COLS}, \
-                 ts_rank(content_tsv, websearch_to_tsquery('simple', $1))::float8 AS rank \
-             FROM episodes \
-             WHERE scope = ANY($2) AND processed_at IS NULL AND trust <> 'external' \
-                 AND content_tsv @@ websearch_to_tsquery('simple', $1) \
-             ORDER BY rank DESC, id LIMIT $3"
+            "SELECT {EPISODE_COLS}, s.hit_rank::float8 AS rank \
+             FROM search_pending_episode_ids($2, $1, $3) AS s(hit_id, hit_rank) \
+             JOIN episodes ON episodes.id = s.hit_id \
+             ORDER BY s.hit_rank DESC, episodes.id"
         );
         let found = sqlx::query(&sql)
             .bind(query)
@@ -1069,56 +1069,64 @@ impl MemoryStore for PgStore {
         row.as_ref().map(rows::job).transpose()
     }
 
-    async fn complete_job(&self, job_id: Uuid) -> Result<()> {
-        // Also accepts a job another worker re-claimed after this worker's lease expired: the
-        // work is done either way, and apply_extraction made the second run a no-op.
+    async fn renew_job(&self, job: &Job, worker_id: &str, lease_secs: i64) -> Result<bool> {
+        if lease_secs <= 0 {
+            return Err(Error::InvalidInput("lease_secs must be positive".into()));
+        }
         let updated = sqlx::query(
-            "UPDATE jobs SET status = 'done', locked_by = NULL, locked_until = NULL \
-             WHERE id = $1",
+            "UPDATE jobs SET locked_until = now() + make_interval(secs => $4) \
+             WHERE id = $1 AND status = 'running' AND locked_by = $2 AND attempts = $3",
         )
-        .bind(job_id)
+        .bind(job.id)
+        .bind(worker_id)
+        .bind(job.attempts)
+        .bind(lease_secs as f64)
         .execute(&self.pool)
         .await
         .map_err(db)?;
-        if updated.rows_affected() == 0 {
-            return Err(Error::NotFound(format!("job {job_id}")));
-        }
-        Ok(())
+        Ok(updated.rows_affected() == 1)
+    }
+
+    async fn complete_job(&self, job: &Job, worker_id: &str) -> Result<bool> {
+        let updated = sqlx::query(
+            "UPDATE jobs SET status = 'done', locked_by = NULL, locked_until = NULL \
+             WHERE id = $1 AND status = 'running' AND locked_by = $2 AND attempts = $3",
+        )
+        .bind(job.id)
+        .bind(worker_id)
+        .bind(job.attempts)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(updated.rows_affected() == 1)
     }
 
     async fn fail_job(
         &self,
-        job_id: Uuid,
+        job: &Job,
+        worker_id: &str,
         error: &str,
         run_after: DateTime<Utc>,
         max_attempts: i32,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // PostgreSQL rejects NUL in text, and failing here would lose the retry.
         let error = error.replace('\0', "");
-        // Only a running job changes: a late failure from a worker that lost its lease must not
-        // bring back a job that has since finished.
         let updated = sqlx::query(
             "UPDATE jobs SET \
-                 status = CASE WHEN attempts >= $4 THEN 'dead' ELSE 'pending' END, \
-                 last_error = $2, run_after = $3, locked_by = NULL, locked_until = NULL \
-             WHERE id = $1 AND status = 'running'",
+                 status = CASE WHEN attempts >= $6 THEN 'dead' ELSE 'pending' END, \
+                 last_error = $4, run_after = $5, locked_by = NULL, locked_until = NULL \
+             WHERE id = $1 AND status = 'running' AND locked_by = $2 AND attempts = $3",
         )
-        .bind(job_id)
+        .bind(job.id)
+        .bind(worker_id)
+        .bind(job.attempts)
         .bind(error)
         .bind(run_after)
         .bind(max_attempts)
         .execute(&self.pool)
         .await
         .map_err(db)?;
-        if updated.rows_affected() == 0 {
-            sqlx::query("SELECT id FROM jobs WHERE id = $1")
-                .bind(job_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(db)?
-                .ok_or_else(|| Error::NotFound(format!("job {job_id}")))?;
-        }
-        Ok(())
+        Ok(updated.rows_affected() == 1)
     }
 
     async fn find_api_key(&self, key_hash: &str) -> Result<Option<ApiKey>> {

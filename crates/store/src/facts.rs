@@ -143,6 +143,13 @@ async fn insert_fact(
                 "facts from external episodes must be quarantined".into(),
             ))
         }
+        FactStatus::Active
+            if episode.trust == Trust::Agent && !matches!(episode.scope, Scope::Agent(_)) =>
+        {
+            return Err(Error::InvalidInput(
+                "agent facts in user or shared scopes must be quarantined".into(),
+            ))
+        }
         _ => {}
     }
     if new.valid_to.is_some_and(|to| to < new.valid_from) {
