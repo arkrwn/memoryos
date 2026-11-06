@@ -47,8 +47,6 @@ pub struct Config {
     pub request_timeout: Duration,
     /// An agent turn makes several model calls, so it gets its own limit.
     pub turn_timeout: Duration,
-    /// Origins allowed on `POST /mcp` besides localhost.
-    pub mcp_allowed_origins: Vec<String>,
 }
 
 impl fmt::Debug for Config {
@@ -122,14 +120,6 @@ impl Config {
                 30,
             )?),
             turn_timeout: Duration::from_secs(number(&get, "MEMORYOS_TURN_TIMEOUT_SECS", 300)?),
-            mcp_allowed_origins: get("MEMORYOS_MCP_ALLOWED_ORIGINS")
-                .map(|list| {
-                    list.split(',')
-                        .map(|origin| origin.trim().to_owned())
-                        .filter(|origin| !origin.is_empty())
-                        .collect()
-                })
-                .unwrap_or_default(),
         })
     }
 }

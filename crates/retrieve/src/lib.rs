@@ -30,6 +30,7 @@ const MAX_GRAPH_CANDIDATES: usize = 50;
 const DEFAULT_EMBED_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecallRequest {
     pub scopes: Vec<Scope>,
     pub query: String,
@@ -256,6 +257,12 @@ mod tests {
 
     fn parse(text: &str) -> RecallRequest {
         serde_json::from_str(text).expect("valid request")
+    }
+
+    #[test]
+    fn unknown_fields_are_refused() {
+        let attempt = r#"{"scopes": ["user:u"], "query": "q", "limitt": 5}"#;
+        assert!(serde_json::from_str::<RecallRequest>(attempt).is_err());
     }
 
     #[test]

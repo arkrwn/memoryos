@@ -63,6 +63,16 @@ impl MemoryStore for MeteredStore {
     ) -> Result<Episode> {
         self.inner.insert_unqueued_episode(ctx, episode).await
     }
+    async fn claim_unqueued_episode(
+        &self,
+        ctx: &RequestContext,
+        episode: NewEpisode,
+    ) -> Result<(Episode, bool)> {
+        self.inner.claim_unqueued_episode(ctx, episode).await
+    }
+    async fn discard_unprocessed_episode(&self, ctx: &RequestContext, id: Uuid) -> Result<bool> {
+        self.inner.discard_unprocessed_episode(ctx, id).await
+    }
     async fn get_episode(&self, ctx: &RequestContext, id: Uuid) -> Result<Episode> {
         self.inner.get_episode(ctx, id).await
     }
@@ -97,8 +107,16 @@ impl MemoryStore for MeteredStore {
             .similar_entities(ctx, scope, embedding, limit)
             .await
     }
-    async fn add_entity_alias(&self, ctx: &RequestContext, id: Uuid, alias: &str) -> Result<()> {
-        self.inner.add_entity_alias(ctx, id, alias).await
+    async fn add_entity_alias(
+        &self,
+        ctx: &RequestContext,
+        id: Uuid,
+        alias: &str,
+        source_episode: Option<Uuid>,
+    ) -> Result<()> {
+        self.inner
+            .add_entity_alias(ctx, id, alias, source_episode)
+            .await
     }
     async fn find_entity(
         &self,
@@ -120,6 +138,14 @@ impl MemoryStore for MeteredStore {
     }
     async fn invalidate_fact(&self, ctx: &RequestContext, id: Uuid, reason: &str) -> Result<Fact> {
         self.inner.invalidate_fact(ctx, id, reason).await
+    }
+    async fn current_fact(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        id: Uuid,
+    ) -> Result<Option<Fact>> {
+        self.inner.current_fact(ctx, scope, id).await
     }
     async fn current_facts_for_subject(
         &self,

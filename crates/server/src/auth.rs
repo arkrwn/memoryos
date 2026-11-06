@@ -207,13 +207,20 @@ pub async fn authenticate(
 
 async fn resolve(state: &AppState, token: Option<String>) -> ApiResult<Caller> {
     let token = token.ok_or_else(ApiError::unauthorized)?;
-    let key = state
-        .services
-        .store
-        .find_api_key(&hash_token(&token))
-        .await?
-        .ok_or_else(ApiError::unauthorized)?;
-    Ok(Caller::new(key))
+    let hash = hash_token(&token);
+    state.failed_auth.check(&hash).map_err(|wait| {
+        ApiError::too_many_failed_tokens(wait.as_secs_f64().ceil().max(1.0) as u64)
+    })?;
+    match state.services.store.find_api_key(&hash).await? {
+        Some(key) => {
+            state.failed_auth.succeeded(&hash);
+            Ok(Caller::new(key))
+        }
+        None => {
+            state.failed_auth.failed();
+            Err(ApiError::unauthorized())
+        }
+    }
 }
 
 fn bearer_token(request: &Request) -> Option<&str> {

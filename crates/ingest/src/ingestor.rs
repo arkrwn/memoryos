@@ -69,7 +69,7 @@ impl Ingestor {
         let ops = self.reconcile_all(ctx, &episode, statements, batch).await?;
         let ops_applied = ops.len();
         let inserted = self.store.apply_extraction(ctx, episode_id, ops).await?;
-        add_earned_aliases(self.store.as_ref(), ctx, &episode, merges).await;
+        add_earned_aliases(self.store.as_ref(), ctx, &episode, merges, &inserted).await;
         tracing::info!(
             %episode_id,
             ops_applied,
