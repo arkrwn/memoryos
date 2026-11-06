@@ -6,9 +6,9 @@ actually run. States: `todo`, `doing`, `done`, `blocked`.
 | Task | State | Proof |
 |---|---|---|
 | T0 Spec, core, schema, OpenAPI | done | clippy clean, 2 core tests pass, migration applied on pgvector:pg17, psql check: no tenant sees 0 rows, cross-tenant insert rejected by RLS, app role denied on `jobs` |
-| T1 Postgres store | doing | |
-| T2 LLM and embedding clients | doing | |
-| T3 Eval harness | doing | |
+| T1 Postgres store | done | Lead run on `develop`: 4 unit and 51 integration tests pass against real Postgres. Open risk: common-word text search in a 1M-fact scope is estimated at about 450 ms, over the latency gate; T9 must measure it |
+| T2 LLM and embedding clients | done | Lead run on `develop`: 36 unit and 29 WireMock tests pass. Not run against live provider APIs |
+| T3 Eval harness | done | Lead run on `develop`: 51 unit and 6 WireMock tests pass. Not yet run against a real server |
 | T4 Ingest and worker | todo | |
 | T5 Hybrid retrieval | todo | |
 | T6 Agent runtime | todo | |
