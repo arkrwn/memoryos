@@ -1,0 +1,193 @@
+CREATE EXTENSION IF NOT EXISTS vector;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'memoryos_app') THEN
+        CREATE ROLE memoryos_app NOLOGIN;
+    END IF;
+END
+$$;
+
+CREATE TABLE episodes (
+    id              uuid PRIMARY KEY,
+    tenant          text NOT NULL,
+    scope           text NOT NULL,
+    source          text NOT NULL,
+    trust           text NOT NULL CHECK (trust IN ('external', 'agent', 'user', 'system')),
+    content         text NOT NULL,
+    metadata        jsonb NOT NULL DEFAULT '{}',
+    occurred_at     timestamptz NOT NULL,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    processed_at    timestamptz,
+    idempotency_key text,
+    content_tsv     tsvector GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED,
+    UNIQUE (tenant, idempotency_key)
+);
+CREATE INDEX episodes_scope_idx ON episodes (tenant, scope, created_at DESC);
+CREATE INDEX episodes_tsv_idx ON episodes USING gin (content_tsv);
+CREATE INDEX episodes_pending_idx ON episodes (tenant, scope) WHERE processed_at IS NULL;
+
+CREATE TABLE entities (
+    id              uuid PRIMARY KEY,
+    tenant          text NOT NULL,
+    scope           text NOT NULL,
+    kind            text NOT NULL,
+    name            text NOT NULL,
+    normalized_name text NOT NULL,
+    aliases         text[] NOT NULL DEFAULT '{}',
+    embedding       vector(1536) NOT NULL,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (tenant, scope, kind, normalized_name)
+);
+CREATE INDEX entities_embedding_idx ON entities USING hnsw (embedding vector_cosine_ops);
+
+CREATE TABLE facts (
+    id             uuid PRIMARY KEY,
+    tenant         text NOT NULL,
+    scope          text NOT NULL,
+    subject_id     uuid NOT NULL REFERENCES entities (id) ON DELETE CASCADE,
+    predicate      text NOT NULL,
+    object_id      uuid REFERENCES entities (id) ON DELETE CASCADE,
+    statement      text NOT NULL,
+    embedding      vector(1536) NOT NULL,
+    trust          text NOT NULL CHECK (trust IN ('external', 'agent', 'user', 'system')),
+    status         text NOT NULL CHECK (status IN ('active', 'quarantined', 'rejected')),
+    valid_from     timestamptz NOT NULL,
+    valid_to       timestamptz,
+    recorded_at    timestamptz NOT NULL DEFAULT now(),
+    invalidated_at timestamptz,
+    superseded_by  uuid REFERENCES facts (id) ON DELETE SET NULL,
+    -- Set on a quarantined fact: the fact that approval will close.
+    pending_supersede_of uuid REFERENCES facts (id) ON DELETE SET NULL,
+    statement_tsv  tsvector GENERATED ALWAYS AS (to_tsvector('simple', statement)) STORED,
+    CHECK (valid_to IS NULL OR valid_to >= valid_from)
+);
+CREATE INDEX facts_scope_idx ON facts (tenant, scope, status);
+CREATE INDEX facts_subject_idx ON facts (tenant, subject_id, predicate);
+CREATE INDEX facts_object_idx ON facts (tenant, object_id);
+CREATE INDEX facts_tsv_idx ON facts USING gin (statement_tsv);
+CREATE INDEX facts_embedding_idx ON facts USING hnsw (embedding vector_cosine_ops);
+
+CREATE TABLE fact_sources (
+    fact_id    uuid NOT NULL REFERENCES facts (id) ON DELETE CASCADE,
+    episode_id uuid NOT NULL REFERENCES episodes (id) ON DELETE CASCADE,
+    tenant     text NOT NULL,
+    PRIMARY KEY (fact_id, episode_id)
+);
+CREATE INDEX fact_sources_episode_idx ON fact_sources (episode_id);
+
+CREATE TABLE blocks (
+    id         uuid PRIMARY KEY,
+    tenant     text NOT NULL,
+    agent_id   text NOT NULL,
+    label      text NOT NULL,
+    content    text NOT NULL,
+    max_chars  integer NOT NULL CHECK (max_chars > 0),
+    version    bigint NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (tenant, agent_id, label)
+);
+
+CREATE TABLE block_versions (
+    block_id  uuid NOT NULL REFERENCES blocks (id) ON DELETE CASCADE,
+    tenant    text NOT NULL,
+    version   bigint NOT NULL,
+    content   text NOT NULL,
+    edited_by text NOT NULL,
+    edited_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (block_id, version)
+);
+
+CREATE TABLE sessions (
+    id              uuid PRIMARY KEY,
+    tenant          text NOT NULL,
+    agent_id        text NOT NULL,
+    scope           text NOT NULL,
+    summary         text,
+    compacted_through bigint NOT NULL DEFAULT 0,
+    next_seq        bigint NOT NULL DEFAULT 1,
+    created_at      timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX sessions_scope_idx ON sessions (tenant, scope);
+
+CREATE TABLE session_messages (
+    session_id uuid NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
+    tenant     text NOT NULL,
+    seq        bigint NOT NULL,
+    role       text NOT NULL,
+    content    jsonb NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (session_id, seq)
+);
+
+CREATE TABLE audit_events (
+    id         uuid PRIMARY KEY,
+    tenant     text NOT NULL,
+    actor      text NOT NULL,
+    action     text NOT NULL,
+    target_id  uuid,
+    detail     jsonb NOT NULL DEFAULT '{}',
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX audit_events_tenant_idx ON audit_events (tenant, created_at DESC);
+
+-- Not tenant-restricted: the worker claims across tenants, and keys are read before auth.
+CREATE TABLE jobs (
+    id           uuid PRIMARY KEY,
+    tenant       text NOT NULL,
+    kind         text NOT NULL,
+    payload      jsonb NOT NULL,
+    status       text NOT NULL CHECK (status IN ('pending', 'running', 'done', 'dead')),
+    attempts     integer NOT NULL DEFAULT 0,
+    run_after    timestamptz NOT NULL DEFAULT now(),
+    locked_by    text,
+    locked_until timestamptz,
+    last_error   text,
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX jobs_due_idx ON jobs (run_after) WHERE status IN ('pending', 'running');
+
+CREATE TABLE api_keys (
+    id         uuid PRIMARY KEY,
+    tenant     text NOT NULL,
+    name       text NOT NULL,
+    key_hash   text NOT NULL UNIQUE,
+    scopes     text[] NOT NULL,
+    max_trust  text NOT NULL CHECK (max_trust IN ('external', 'agent', 'user', 'system')),
+    is_admin   boolean NOT NULL DEFAULT false,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    revoked_at timestamptz
+);
+
+-- Row-level security. The store runs `SET LOCAL ROLE memoryos_app` and sets `app.tenant`
+-- in each tenant transaction, so policies apply even if the login role is a superuser.
+DO $$
+DECLARE
+    t text;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['episodes', 'entities', 'facts', 'fact_sources', 'blocks',
+                             'block_versions', 'sessions', 'session_messages', 'audit_events']
+    LOOP
+        EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
+        EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', t);
+        EXECUTE format(
+            'CREATE POLICY tenant_isolation ON %I TO memoryos_app
+             USING (tenant = current_setting(''app.tenant'', true))
+             WITH CHECK (tenant = current_setting(''app.tenant'', true))', t);
+        EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON %I TO memoryos_app', t);
+    END LOOP;
+END
+$$;
+
+-- memoryos_app gets no privileges on jobs or api_keys. insert_episode enqueues through this
+-- function so tenant transactions cannot read or alter other tenants' jobs.
+CREATE FUNCTION enqueue_job(p_id uuid, p_tenant text, p_kind text, p_payload jsonb)
+RETURNS void
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+    INSERT INTO jobs (id, tenant, kind, payload, status) VALUES (p_id, p_tenant, p_kind, p_payload, 'pending');
+$$;
+REVOKE ALL ON FUNCTION enqueue_job(uuid, text, text, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION enqueue_job(uuid, text, text, jsonb) TO memoryos_app;

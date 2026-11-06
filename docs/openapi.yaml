@@ -1,0 +1,514 @@
+openapi: 3.1.0
+info:
+  title: MemoryOS API
+  version: 0.1.0
+servers:
+  - url: http://localhost:8080
+security:
+  - bearer: []
+paths:
+  /healthz:
+    get:
+      summary: Liveness
+      security: []
+      responses:
+        "200": { description: Process is up }
+  /readyz:
+    get:
+      summary: Readiness, checks the database
+      security: []
+      responses:
+        "200": { description: Ready }
+        "503": { description: Database unavailable }
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      security: []
+      responses:
+        "200": { description: Metrics text }
+  /v1/episodes:
+    post:
+      summary: Store an episode and enqueue extraction
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NewEpisode" }
+      responses:
+        "202":
+          description: Accepted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Episode" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/episodes/{id}:
+    get:
+      summary: Read an episode. processed_at is set once extraction has finished
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200":
+          description: Episode
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Episode" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/episodes/{id}/purge:
+    post:
+      summary: Delete an episode and facts derived only from it. Admin only
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200":
+          description: Purged
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PurgeReport" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/recall:
+    post:
+      summary: Hybrid search over facts, plus episodes still being processed
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RecallRequest" }
+      responses:
+        "200":
+          description: Results
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RecallResponse" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/facts/{id}:
+    get:
+      summary: Read a fact
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200":
+          description: Fact
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Fact" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/facts/{id}/history:
+    get:
+      summary: All versions in the fact's supersession chain, oldest first
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200":
+          description: Versions
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [facts]
+                properties:
+                  facts: { type: array, items: { $ref: "#/components/schemas/Fact" } }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/facts/{id}/invalidate:
+    post:
+      summary: Retract a fact as wrong
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string }
+      responses:
+        "200":
+          description: Updated fact
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Fact" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/entities/{id}:
+    get:
+      summary: Read an entity
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200":
+          description: Entity
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Entity" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/entities/{id}/neighbors:
+    get:
+      summary: Graph neighborhood of an entity
+      parameters:
+        - { $ref: "#/components/parameters/Id" }
+        - name: scopes
+          in: query
+          required: true
+          description: Comma-separated scopes
+          schema: { type: string }
+        - name: depth
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 5, default: 1 }
+        - name: as_of
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        "200":
+          description: Neighborhood
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GraphNeighborhood" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/quarantine:
+    get:
+      summary: List quarantined facts. Admin only
+      parameters:
+        - name: scopes
+          in: query
+          required: true
+          description: Comma-separated scopes
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        "200":
+          description: Facts
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [facts]
+                properties:
+                  facts: { type: array, items: { $ref: "#/components/schemas/Fact" } }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/quarantine/{id}/approve:
+    post:
+      summary: Activate a quarantined fact. Admin only
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200":
+          description: Updated fact
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Fact" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/quarantine/{id}/reject:
+    post:
+      summary: Reject a quarantined fact. Admin only
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200":
+          description: Updated fact
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Fact" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/agents/{agent_id}/blocks:
+    get:
+      summary: List an agent's blocks
+      parameters: [{ $ref: "#/components/parameters/AgentId" }]
+      responses:
+        "200":
+          description: Blocks
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [blocks]
+                properties:
+                  blocks: { type: array, items: { $ref: "#/components/schemas/Block" } }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/agents/{agent_id}/blocks/{label}:
+    get:
+      summary: Read a block
+      parameters:
+        - { $ref: "#/components/parameters/AgentId" }
+        - { $ref: "#/components/parameters/Label" }
+      responses:
+        "200":
+          description: Block
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Block" }
+        default: { $ref: "#/components/responses/Error" }
+    put:
+      summary: Create a block, or update it when expected_version matches
+      parameters:
+        - { $ref: "#/components/parameters/AgentId" }
+        - { $ref: "#/components/parameters/Label" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content: { type: string }
+                max_chars: { type: integer, default: 2000 }
+                expected_version:
+                  type: [integer, "null"]
+                  description: Omit or null to create. Otherwise the version being replaced
+      responses:
+        "200":
+          description: Updated block
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Block" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/agents/{agent_id}/blocks/{label}/versions:
+    get:
+      summary: Block edit history
+      parameters:
+        - { $ref: "#/components/parameters/AgentId" }
+        - { $ref: "#/components/parameters/Label" }
+      responses:
+        "200":
+          description: Versions
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [versions]
+                properties:
+                  versions:
+                    type: array
+                    items:
+                      type: object
+                      required: [version, content, edited_by, edited_at]
+                      properties:
+                        version: { type: integer }
+                        content: { type: string }
+                        edited_by: { type: string }
+                        edited_at: { type: string, format: date-time }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/agents/{agent_id}/sessions:
+    post:
+      summary: Start an agent session
+      parameters: [{ $ref: "#/components/parameters/AgentId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scope]
+              properties:
+                scope: { type: string, description: Memory scope used by this session }
+      responses:
+        "201":
+          description: Session
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/sessions/{id}/messages:
+    get:
+      summary: Messages after the compaction point
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200":
+          description: Messages
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [messages]
+                properties:
+                  messages: { type: array, items: { type: object } }
+        default: { $ref: "#/components/responses/Error" }
+    post:
+      summary: Send a user message and run one agent turn
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text: { type: string }
+      responses:
+        "200":
+          description: Turn result
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [text, tool_calls, input_tokens, output_tokens]
+                properties:
+                  text: { type: string }
+                  tool_calls: { type: integer }
+                  input_tokens: { type: integer }
+                  output_tokens: { type: integer }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/users/{user_id}/memory:
+    delete:
+      summary: Hard-delete everything under scope user:{user_id}. Admin only
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PurgeReport" }
+        default: { $ref: "#/components/responses/Error" }
+  /mcp:
+    post:
+      summary: MCP Streamable HTTP endpoint. Tools remember, recall, block_read, block_replace, graph_neighbors
+      responses:
+        "200": { description: JSON-RPC response }
+components:
+  securitySchemes:
+    bearer: { type: http, scheme: bearer }
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    AgentId:
+      name: agent_id
+      in: path
+      required: true
+      schema: { type: string }
+    Label:
+      name: label
+      in: path
+      required: true
+      schema: { type: string }
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error]
+            properties:
+              error:
+                type: object
+                required: [code, message]
+                properties:
+                  code: { type: string }
+                  message: { type: string }
+  schemas:
+    Trust: { type: string, enum: [external, agent, user, system] }
+    NewEpisode:
+      type: object
+      required: [scope, source, trust, content]
+      properties:
+        scope: { type: string, examples: ["user:u_123"] }
+        source: { type: string, examples: ["chat"] }
+        trust: { $ref: "#/components/schemas/Trust" }
+        content: { type: string, maxLength: 100000 }
+        occurred_at: { type: [string, "null"], format: date-time }
+        metadata: { type: object }
+        idempotency_key: { type: [string, "null"] }
+    Episode:
+      type: object
+      required: [id, scope, source, trust, content, metadata, occurred_at, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        scope: { type: string }
+        source: { type: string }
+        trust: { $ref: "#/components/schemas/Trust" }
+        content: { type: string }
+        metadata: { type: object }
+        occurred_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        processed_at: { type: [string, "null"], format: date-time }
+    Entity:
+      type: object
+      required: [id, scope, kind, name, aliases]
+      properties:
+        id: { type: string, format: uuid }
+        scope: { type: string }
+        kind: { type: string }
+        name: { type: string }
+        aliases: { type: array, items: { type: string } }
+    Fact:
+      type: object
+      required: [id, scope, subject_id, predicate, statement, trust, status, valid_from, recorded_at, source_episode_ids]
+      properties:
+        id: { type: string, format: uuid }
+        scope: { type: string }
+        subject_id: { type: string, format: uuid }
+        predicate: { type: string }
+        object_id: { type: [string, "null"], format: uuid }
+        statement: { type: string }
+        trust: { $ref: "#/components/schemas/Trust" }
+        status: { type: string, enum: [active, quarantined, rejected] }
+        valid_from: { type: string, format: date-time }
+        valid_to: { type: [string, "null"], format: date-time }
+        recorded_at: { type: string, format: date-time }
+        invalidated_at: { type: [string, "null"], format: date-time }
+        superseded_by: { type: [string, "null"], format: uuid }
+        source_episode_ids: { type: array, items: { type: string, format: uuid } }
+    RecallRequest:
+      type: object
+      required: [scopes, query]
+      properties:
+        scopes: { type: array, items: { type: string }, maxItems: 50 }
+        query: { type: string }
+        limit: { type: integer, minimum: 1, maximum: 100, default: 10 }
+        as_of: { type: [string, "null"], format: date-time }
+        known_at: { type: [string, "null"], format: date-time }
+    RecallResponse:
+      type: object
+      required: [facts, pending_episodes]
+      properties:
+        facts:
+          type: array
+          items:
+            type: object
+            required: [fact, score]
+            properties:
+              fact: { $ref: "#/components/schemas/Fact" }
+              score: { type: number }
+        pending_episodes:
+          type: array
+          items:
+            type: object
+            required: [episode, score]
+            properties:
+              episode: { $ref: "#/components/schemas/Episode" }
+              score: { type: number }
+    GraphNeighborhood:
+      type: object
+      required: [root, entities, edges]
+      properties:
+        root: { type: string, format: uuid }
+        entities: { type: array, items: { $ref: "#/components/schemas/Entity" } }
+        edges: { type: array, items: { $ref: "#/components/schemas/Fact" } }
+    Block:
+      type: object
+      required: [id, agent_id, label, content, max_chars, version, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        agent_id: { type: string }
+        label: { type: string }
+        content: { type: string }
+        max_chars: { type: integer }
+        version: { type: integer }
+        updated_at: { type: string, format: date-time }
+    Session:
+      type: object
+      required: [id, agent_id, scope, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        agent_id: { type: string }
+        scope: { type: string }
+        created_at: { type: string, format: date-time }
+    PurgeReport:
+      type: object
+      required: [facts_deleted, episodes_deleted, entities_deleted]
+      properties:
+        facts_deleted: { type: integer }
+        episodes_deleted: { type: integer }
+        entities_deleted: { type: integer }
