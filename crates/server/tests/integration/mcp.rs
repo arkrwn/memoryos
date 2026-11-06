@@ -473,6 +473,30 @@ async fn the_same_authorization_applies_as_on_rest() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn tools_refuse_what_their_schemas_and_the_key_do_not_allow() {
+    let server = Server::host().await;
+    let external = server.key("schema", &["*"], Trust::External, false).await;
+    let root = server.root("schema").await;
+
+    let block = json!({"agent_id": "a1", "label": "notes", "content": "x"});
+    let (failed, reply) = call_tool(&server, &external, "block_replace", block.clone()).await;
+    assert!(failed, "{reply}");
+    assert_eq!(reply["error"]["code"], "forbidden", "{reply}");
+    let (failed, reply) = call_tool(&server, &root, "block_replace", block).await;
+    assert!(!failed, "{reply}");
+
+    let empty = json!({"scope": "agent:a1", "source": "s", "content": "c", "facts": []});
+    let (failed, reply) = call_tool(&server, &root, "commit_facts", empty).await;
+    assert!(failed, "{reply}");
+    assert_eq!(reply["error"]["code"], "invalid_input", "{reply}");
+
+    let unknown = json!({"scopes": ["agent:a1"], "query": "q", "surprise": true});
+    let (failed, reply) = call_tool(&server, &root, "recall", unknown).await;
+    assert!(failed, "{reply}");
+    assert_eq!(reply["error"]["code"], "invalid_input", "{reply}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn errors_take_the_documented_shapes() {
     let server = Server::host().await;
     let key = server.root("m7").await;

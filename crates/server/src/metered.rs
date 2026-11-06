@@ -107,8 +107,16 @@ impl MemoryStore for MeteredStore {
             .similar_entities(ctx, scope, embedding, limit)
             .await
     }
-    async fn add_entity_alias(&self, ctx: &RequestContext, id: Uuid, alias: &str) -> Result<()> {
-        self.inner.add_entity_alias(ctx, id, alias).await
+    async fn add_entity_alias(
+        &self,
+        ctx: &RequestContext,
+        id: Uuid,
+        alias: &str,
+        source_episode: Option<Uuid>,
+    ) -> Result<()> {
+        self.inner
+            .add_entity_alias(ctx, id, alias, source_episode)
+            .await
     }
     async fn find_entity(
         &self,
@@ -130,6 +138,14 @@ impl MemoryStore for MeteredStore {
     }
     async fn invalidate_fact(&self, ctx: &RequestContext, id: Uuid, reason: &str) -> Result<Fact> {
         self.inner.invalidate_fact(ctx, id, reason).await
+    }
+    async fn current_fact(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        id: Uuid,
+    ) -> Result<Option<Fact>> {
+        self.inner.current_fact(ctx, scope, id).await
     }
     async fn current_facts_for_subject(
         &self,

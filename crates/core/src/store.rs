@@ -64,7 +64,14 @@ pub trait MemoryStore: Send + Sync {
         embedding: &[f32],
         limit: i64,
     ) -> Result<Vec<(Entity, f64)>>;
-    async fn add_entity_alias(&self, ctx: &RequestContext, id: Uuid, alias: &str) -> Result<()>;
+    /// `source_episode` records who earned the alias: purging the last such episode removes it.
+    async fn add_entity_alias(
+        &self,
+        ctx: &RequestContext,
+        id: Uuid,
+        alias: &str,
+        source_episode: Option<Uuid>,
+    ) -> Result<()>;
     /// The entity in `scope` with exactly this `kind` whose name or a known alias equals `name`
     /// under `normalize_name`. A name match wins over an alias match.
     async fn find_entity(
@@ -84,7 +91,15 @@ pub trait MemoryStore: Send + Sync {
     async fn fact_history(&self, ctx: &RequestContext, id: Uuid) -> Result<Vec<Fact>>;
     /// Marks the fact retracted by setting `invalidated_at`. Writes an audit event.
     async fn invalidate_fact(&self, ctx: &RequestContext, id: Uuid, reason: &str) -> Result<Fact>;
-    /// Currently valid, active facts about `subject_id`, for reconciliation.
+    /// The fact if it is current in `scope`: active and visible now, as section 4 defines it.
+    async fn current_fact(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        id: Uuid,
+    ) -> Result<Option<Fact>>;
+    /// Currently valid, active facts about `subject_id`, for reconciliation, oldest first. At most
+    /// the 200 that started latest.
     async fn current_facts_for_subject(
         &self,
         ctx: &RequestContext,
@@ -162,6 +177,7 @@ pub trait MemoryStore: Send + Sync {
         max_chars: i32,
         expected_version: Option<i64>,
     ) -> Result<Block>;
+    /// The latest 100 versions, oldest first. Writes prune anything older.
     async fn block_versions(
         &self,
         ctx: &RequestContext,

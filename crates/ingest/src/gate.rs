@@ -34,7 +34,8 @@ pub(crate) enum Resolution {
     },
 }
 
-/// SPEC section 5. `contradicted` is the trust of the fact the statement would supersede.
+/// SPEC section 5. `contradicted` is the trust of the fact the statement would supersede. An `Add`
+/// that declares nothing can still be held by the store, on subject and predicate.
 pub(crate) fn status_for(scope: &Scope, trust: Trust, contradicted: Option<Trust>) -> FactStatus {
     let outranked = contradicted.is_some_and(|old| old > trust);
     if source_requires_quarantine(scope, trust) || outranked {

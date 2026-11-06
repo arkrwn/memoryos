@@ -1860,6 +1860,79 @@ async fn host_key_of_a_higher_trust_episode_cannot_borrow_its_trust() {
     assert_eq!(w.count("facts").await, 0);
 }
 
+/// One subject with more current facts than the subject query returns. The oldest is still current.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_current_target_is_accepted_on_a_subject_with_many_facts() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let subject = w
+        .store
+        .upsert_entity(
+            &ctx(),
+            NewEntity {
+                scope: scope.clone(),
+                kind: "person".into(),
+                name: "Ada".into(),
+                aliases: Vec::new(),
+                embedding: vector_for("ada"),
+            },
+        )
+        .await
+        .expect("entity");
+    let episode = w
+        .store
+        .insert_unqueued_episode(
+            &ctx(),
+            NewEpisode {
+                scope: scope.clone(),
+                source: "seed".into(),
+                trust: Trust::Agent,
+                content: "seed".into(),
+                occurred_at: None,
+                metadata: json!({}),
+                idempotency_key: None,
+            },
+        )
+        .await
+        .expect("episode");
+    let ops = (0..201)
+        .map(|i| {
+            memoryos_core::FactOp::Add(memoryos_core::NewFact {
+                scope: scope.clone(),
+                subject_id: subject.id,
+                predicate: "fact_about".into(),
+                object_id: None,
+                statement: format!("seed {i}"),
+                embedding: vector_for("seed"),
+                trust: Trust::Agent,
+                status: FactStatus::Active,
+                valid_from: date(2020),
+                valid_to: None,
+            })
+        })
+        .collect();
+    let ids = w
+        .store
+        .apply_extraction(&ctx(), episode.id, ops)
+        .await
+        .expect("seed");
+
+    w.stub_embed(&["Moved on", "ada"]).await;
+    let mut fact = add_fact("Moved on", "Ada");
+    fact.supersedes = Some(ids[0]);
+    let response = w
+        .host
+        .commit(
+            &ctx(),
+            commit_request(&scope, "moved", vec![fact]),
+            Trust::Agent,
+        )
+        .await
+        .expect("the oldest fact is a valid target");
+    let closed = w.store.get_fact(&ctx(), ids[0]).await.expect("old");
+    assert_eq!(closed.superseded_by, Some(response.facts[0].id));
+}
+
 // ---- Replays that fail ------------------------------------------------------------------------
 
 impl World {
@@ -1904,8 +1977,9 @@ async fn a_replay_failing_late_keeps_the_acknowledged_facts_of_the_winner() {
     w.stub_embed_after(&["Winner", "ada"], 1000, 200).await;
     w.stub_embed_after(&["Loser", "ada"], 3000, 400).await;
 
+    let context = ctx();
     let winner = w.host.commit(
-        &ctx(),
+        &context,
         keyed_request(&scope, "race", add_fact("Winner", "Ada")),
         Trust::Agent,
     );
@@ -1939,8 +2013,9 @@ async fn a_replay_failing_early_does_not_remove_the_episode_of_a_running_commit(
     let scope = Scope::agent("a1");
     w.stub_embed_after(&["Winner", "ada"], 1500, 200).await;
 
+    let context = ctx();
     let winner = w.host.commit(
-        &ctx(),
+        &context,
         keyed_request(&scope, "race", add_fact("Winner", "Ada")),
         Trust::Agent,
     );
@@ -2143,7 +2218,7 @@ async fn known_alias_resolves_even_when_ranked_out_of_the_similar_list() {
         .seed_entity(&scope, "Robert", sparse(&[0.0, 0.0, 1.0]))
         .await;
     w.store
-        .add_entity_alias(&ctx(), robert, "Bobby  Tables")
+        .add_entity_alias(&ctx(), robert, "Bobby  Tables", None)
         .await
         .expect("alias");
     w.seed_closer_entities(&scope).await;
@@ -2234,6 +2309,128 @@ impl World {
         self.drain_jobs().await;
         self.fact_by_statement("Seed").await
     }
+}
+
+impl World {
+    /// A current fact on Robert with no worker involved. The vector is what names merge against.
+    async fn seed_on_robert(&self, scope: &Scope, trust: Trust, text: &str) -> Fact {
+        let subject = self
+            .store
+            .upsert_entity(
+                &ctx(),
+                NewEntity {
+                    scope: scope.clone(),
+                    kind: "person".into(),
+                    name: "Robert".into(),
+                    aliases: Vec::new(),
+                    embedding: sparse(&[1.0]),
+                },
+            )
+            .await
+            .expect("entity");
+        let episode = self
+            .store
+            .insert_unqueued_episode(
+                &ctx(),
+                NewEpisode {
+                    scope: scope.clone(),
+                    source: "seed".into(),
+                    trust,
+                    content: text.into(),
+                    occurred_at: None,
+                    metadata: json!({}),
+                    idempotency_key: None,
+                },
+            )
+            .await
+            .expect("episode");
+        let op = memoryos_core::FactOp::Add(memoryos_core::NewFact {
+            scope: scope.clone(),
+            subject_id: subject.id,
+            predicate: "fact_about".into(),
+            object_id: None,
+            statement: text.into(),
+            embedding: vector_for(text),
+            trust,
+            status: FactStatus::Active,
+            valid_from: date(2020),
+            valid_to: None,
+        });
+        let ids = self
+            .store
+            .apply_extraction(&ctx(), episode.id, vec![op])
+            .await
+            .expect("seed");
+        self.store.get_fact(&ctx(), ids[0]).await.expect("fact")
+    }
+}
+
+/// The commit's new fact is held, and its only active link on Robert is a corroboration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_corroboration_link_does_not_earn_an_alias() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let linked = w.seed_on_robert(&scope, Trust::User, "linked").await;
+    let outranking = w.seed_on_robert(&scope, Trust::User, "outranking").await;
+
+    w.stub_embedding(&[("planted", vector_for("planted")), ("bob", sparse(&[1.0]))])
+        .await;
+    let mut corroborating = add_fact("restated", "Robert");
+    corroborating.corroborates = Some(linked.id);
+    let mut planted = add_fact("planted", "Bob");
+    planted.supersedes = Some(outranking.id);
+    let response = w
+        .host
+        .commit(
+            &ctx(),
+            commit_request(&scope, "both", vec![corroborating, planted]),
+            Trust::Agent,
+        )
+        .await
+        .expect("commit");
+    assert_eq!(response.facts[1].status, FactStatus::Quarantined);
+
+    let entity = w
+        .store
+        .get_entity(&ctx(), linked.subject_id)
+        .await
+        .expect("entity");
+    assert!(entity.aliases.is_empty(), "{:?}", entity.aliases);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn purging_the_source_of_an_alias_removes_the_alias() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let seed = w.seed_on_robert(&scope, Trust::Agent, "seed").await;
+
+    w.stub_embedding(&[("merged", vector_for("merged")), ("bob", sparse(&[1.0]))])
+        .await;
+    let response = w
+        .host
+        .commit(
+            &ctx(),
+            commit_request(&scope, "merge", vec![add_fact("merged", "Bob")]),
+            Trust::Agent,
+        )
+        .await
+        .expect("commit");
+    let aliases = |entity: memoryos_core::Entity| entity.aliases;
+    let got = w.store.get_entity(&ctx(), seed.subject_id).await;
+    assert_eq!(aliases(got.expect("entity")), ["Bob"]);
+
+    w.store
+        .purge_episode(&ctx(), response.episode_id)
+        .await
+        .expect("purge");
+    let got = w.store.get_entity(&ctx(), seed.subject_id).await;
+    assert!(aliases(got.expect("entity")).is_empty());
+    let found = w
+        .store
+        .find_entity(&ctx(), &scope, "person", "Bob")
+        .await
+        .expect("lookup");
+    assert!(found.is_none());
 }
 
 /// Not barred by its source, but outranked: every fact it would add is still quarantined.

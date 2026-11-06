@@ -25,6 +25,7 @@ use crate::telemetry::Metrics;
 
 const MAX_CONTENT_CHARS: usize = 100_000;
 const DEFAULT_MAX_BLOCK_CHARS: i32 = 2000;
+const MAX_BLOCK_CHARS: i32 = 100_000;
 const DEFAULT_CANDIDATES: i64 = 10;
 const DEFAULT_QUARANTINE_PAGE: i64 = 50;
 const MAX_QUARANTINE_PAGE: i64 = 200;
@@ -109,7 +110,10 @@ impl Services {
 
     pub async fn purge_episode(&self, caller: &Caller, id: Uuid) -> ApiResult<PurgeReport> {
         caller.require_admin()?;
-        self.get_episode(caller, id).await?;
+        // Episode trust covers what the purge can touch: a fact's trust is at most that of its
+        // highest source, and a fact with another source only loses this link.
+        let episode = self.get_episode(caller, id).await?;
+        require_trust(caller, "episode", episode.trust)?;
         Ok(self.store.purge_episode(&caller.ctx, id).await?)
     }
 
@@ -169,12 +173,12 @@ impl Services {
         reason: &str,
     ) -> ApiResult<Fact> {
         let fact = self.get_fact(caller, id).await?;
-        if fact.trust > caller.key.max_trust {
-            return Err(ApiError::forbidden(format!(
-                "fact trust {} is above this key's maximum of {}",
-                fact.trust.as_str(),
-                caller.key.max_trust.as_str()
-            )));
+        require_trust(caller, "fact", fact.trust)?;
+        // A key that cannot add here without review must not delete here by retraction either.
+        if caller.key.max_trust < Trust::User && !matches!(fact.scope, Scope::Agent(_)) {
+            return Err(ApiError::forbidden(
+                "invalidating a fact in a user or shared scope requires user trust",
+            ));
         }
         Ok(self.store.invalidate_fact(&caller.ctx, id, reason).await?)
     }
@@ -243,13 +247,15 @@ impl Services {
     /// message tells the caller to review again (SPEC section 5).
     pub async fn approve(&self, caller: &Caller, id: Uuid) -> ApiResult<Fact> {
         caller.require_admin()?;
-        self.get_fact(caller, id).await?;
+        let fact = self.get_fact(caller, id).await?;
+        require_trust(caller, "fact", fact.trust)?;
         Ok(self.store.approve_fact(&caller.ctx, id).await?)
     }
 
     pub async fn reject(&self, caller: &Caller, id: Uuid) -> ApiResult<Fact> {
         caller.require_admin()?;
-        self.get_fact(caller, id).await?;
+        let fact = self.get_fact(caller, id).await?;
+        require_trust(caller, "fact", fact.trust)?;
         Ok(self.store.reject_fact(&caller.ctx, id).await?)
     }
 
@@ -278,6 +284,16 @@ impl Services {
         req: PutBlockRequest,
     ) -> ApiResult<Block> {
         require_agent(caller, agent_id)?;
+        if caller.key.max_trust < Trust::Agent {
+            return Err(ApiError::forbidden(
+                "writing a block requires at least agent trust",
+            ));
+        }
+        if req.max_chars.is_some_and(|chars| chars > MAX_BLOCK_CHARS) {
+            return Err(ApiError::invalid_input(format!(
+                "max_chars must be at most {MAX_BLOCK_CHARS}"
+            )));
+        }
         let max_chars = match (req.max_chars, req.expected_version) {
             (Some(max_chars), _) => max_chars,
             (None, None) => DEFAULT_MAX_BLOCK_CHARS,
@@ -389,12 +405,26 @@ impl Services {
         caller.require_admin()?;
         let scope = parse_scope("user", user_id)?;
         caller.require_scope(&scope)?;
+        if let Some(highest) = self.pg.highest_trust_in_scope(&caller.ctx, &scope).await? {
+            require_trust(caller, "stored memory", highest)?;
+        }
         Ok(self.store.purge_scope(&caller.ctx, &scope).await?)
     }
 }
 
 fn is_blank(value: &str) -> bool {
     value.trim().is_empty()
+}
+
+fn require_trust(caller: &Caller, what: &str, trust: Trust) -> ApiResult<()> {
+    if trust > caller.key.max_trust {
+        return Err(ApiError::forbidden(format!(
+            "{what} trust {} is above this key's maximum of {}",
+            trust.as_str(),
+            caller.key.max_trust.as_str()
+        )));
+    }
+    Ok(())
 }
 
 fn parse_scope(kind: &str, id: &str) -> ApiResult<Scope> {

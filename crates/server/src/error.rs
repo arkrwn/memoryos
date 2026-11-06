@@ -63,6 +63,13 @@ impl ApiError {
         }
     }
 
+    pub fn too_many_failed_tokens(retry_after_secs: u64) -> Self {
+        Self {
+            message: "too many failed authentication attempts".to_owned(),
+            ..Self::rate_limited(retry_after_secs)
+        }
+    }
+
     pub fn internal() -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,

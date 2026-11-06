@@ -79,7 +79,7 @@ pub async fn handle(
     request: Request,
 ) -> Response {
     let headers = request.headers().clone();
-    if !origin_allowed(&headers, &state.mcp_allowed_origins) {
+    if !origin_allowed(&headers) {
         return rpc_error(
             StatusCode::FORBIDDEN,
             None,
@@ -113,14 +113,14 @@ pub async fn handle(
 
 /// Rejects a page on another site reaching a local server through DNS rebinding. Such a page sends
 /// its own origin, so comparing with the `Host` header would prove nothing.
-fn origin_allowed(headers: &HeaderMap, allowed: &[String]) -> bool {
+fn origin_allowed(headers: &HeaderMap) -> bool {
     let Some(origin) = headers.get(header::ORIGIN) else {
         return true;
     };
     let Ok(origin) = origin.to_str() else {
         return false;
     };
-    allowed.iter().any(|entry| entry == origin) || is_local_origin(origin)
+    is_local_origin(origin)
 }
 
 fn is_local_origin(origin: &str) -> bool {
@@ -447,8 +447,8 @@ mod tests {
     }
 
     #[test]
-    fn origin_is_local_or_listed() {
-        assert!(origin_allowed(&HeaderMap::new(), &[]));
+    fn origin_is_local_or_absent() {
+        assert!(origin_allowed(&HeaderMap::new()));
         for local in [
             "http://localhost",
             "http://localhost:3000",
@@ -456,19 +456,18 @@ mod tests {
             "http://[::1]:8080",
             "http://[::1]",
         ] {
-            assert!(origin_allowed(&with_origin(local), &[]), "{local}");
+            assert!(origin_allowed(&with_origin(local)), "{local}");
         }
         for foreign in [
             "http://evil.example",
             "http://localhost.evil.example",
             "http://127.0.0.1.evil.example",
             "http://[::1].evil.example",
+            "https://app.example",
             "null",
         ] {
-            assert!(!origin_allowed(&with_origin(foreign), &[]), "{foreign}");
+            assert!(!origin_allowed(&with_origin(foreign)), "{foreign}");
         }
-        let listed = ["https://app.example".to_owned()];
-        assert!(origin_allowed(&with_origin("https://app.example"), &listed));
     }
 
     #[test]
