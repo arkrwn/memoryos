@@ -1,4 +1,4 @@
-//! Fact write logic shared by `apply_extraction`, `approve_fact` and the purge paths.
+//! Fact write logic shared by `apply_commit`, `approve_fact` and the purge paths.
 //! Every function runs inside the caller's tenant transaction.
 
 use std::collections::{BTreeSet, HashMap};
@@ -55,7 +55,7 @@ pub(crate) async fn apply_ops(
     episode: &LockedEpisode,
     ops: &[FactOp],
 ) -> Result<Vec<Uuid>> {
-    // Taking the row locks in id order keeps two extractions touching the same facts from
+    // Taking the row locks in id order keeps two commits touching the same facts from
     // deadlocking. Missing rows are reported per op below.
     let referenced: Vec<Uuid> = ops
         .iter()
@@ -244,7 +244,7 @@ pub(crate) enum Settled {
 
 /// Applies SPEC section 4 between `new_id` and `old_id`.
 ///
-/// If another extraction already superseded `old_id`, the walk moves to the current head of the
+/// If another commit already superseded `old_id`, the walk moves to the current head of the
 /// chain, so a fact never gets two successors. A retracted or inactive head has nothing left to
 /// close and the new fact simply stays open. Trust is checked against the head, since the caller
 /// only saw `old_id`. `reviewed` names a fact an admin already decided this one may replace, which
@@ -662,7 +662,7 @@ async fn delete_orphan_entities(
     Ok(deleted)
 }
 
-/// Hard-deletes a scope's facts, episodes, entities and sessions, plus an agent scope's blocks.
+/// Hard-deletes a scope's facts, episodes and entities, plus an agent scope's blocks.
 pub(crate) async fn purge_scope(conn: &mut PgConnection, scope: &Scope) -> Result<PurgeReport> {
     let scope_text = scope.to_string();
     let mut deleted = [0_u64; 3];
@@ -679,22 +679,12 @@ pub(crate) async fn purge_scope(conn: &mut PgConnection, scope: &Scope) -> Resul
             .map_err(db)?
             .rows_affected();
     }
-    sqlx::query("DELETE FROM sessions WHERE scope = $1")
-        .bind(&scope_text)
-        .execute(&mut *conn)
-        .await
-        .map_err(db)?;
     if let Scope::Agent(agent_id) = scope {
-        for sql in [
-            "DELETE FROM sessions WHERE agent_id = $1",
-            "DELETE FROM blocks WHERE agent_id = $1",
-        ] {
-            sqlx::query(sql)
-                .bind(agent_id)
-                .execute(&mut *conn)
-                .await
-                .map_err(db)?;
-        }
+        sqlx::query("DELETE FROM blocks WHERE agent_id = $1")
+            .bind(agent_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(db)?;
     }
     let [facts_deleted, episodes_deleted, entities_deleted] = deleted;
     Ok(PurgeReport {

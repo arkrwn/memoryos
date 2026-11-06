@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use memoryos_core::{
     normalize_name, ApiKey, Block, BlockVersion, Entity, Episode, Error, Fact, FactFilter, FactOp,
-    FactStatus, GraphNeighborhood, Job, MemoryStore, NewEntity, NewEpisode, PurgeReport,
-    RequestContext, Result, Scope, ScoredEpisode, ScoredFact, Session, SessionMessage, Trust,
+    FactStatus, GraphNeighborhood, MemoryStore, NewEntity, NewEpisode, PurgeReport,
+    RequestContext, Result, Scope, ScoredFact, Trust,
 };
 use pgvector::Vector;
 use serde_json::{json, Value};
@@ -16,8 +16,7 @@ use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
 use crate::rows::{
-    self, visible, API_KEY_COLS, BLOCK_COLS, ENTITY_COLS, EPISODE_COLS, FACT_COLS, MESSAGE_COLS,
-    SESSION_COLS,
+    self, visible, API_KEY_COLS, BLOCK_COLS, ENTITY_COLS, EPISODE_COLS, FACT_COLS,
 };
 use crate::{db, facts, validate, PgStore};
 
@@ -91,23 +90,9 @@ async fn lock_quarantined(conn: &mut PgConnection, id: Uuid) -> Result<Quarantin
     Ok(state)
 }
 
-async fn require_session(conn: &mut PgConnection, id: Uuid) -> Result<i64> {
-    let row = sqlx::query("SELECT compacted_through FROM sessions WHERE id = $1")
-        .bind(id)
-        .fetch_optional(conn)
-        .await
-        .map_err(db)?
-        .ok_or_else(|| Error::NotFound(format!("session {id}")))?;
-    row.try_get("compacted_through").map_err(db)
-}
-
-impl PgStore {
-    async fn insert_episode_inner(
-        &self,
-        ctx: &RequestContext,
-        episode: NewEpisode,
-        enqueue: bool,
-    ) -> Result<Episode> {
+#[async_trait]
+impl MemoryStore for PgStore {
+    async fn insert_episode(&self, ctx: &RequestContext, episode: NewEpisode) -> Result<Episode> {
         validate::non_empty("source", &episode.source)?;
         validate::non_empty("content", &episode.content)?;
         let metadata = match episode.metadata {
@@ -115,7 +100,6 @@ impl PgStore {
             other => other,
         };
         let mut tx = self.tenant_tx(ctx).await?;
-        let id = Uuid::now_v7();
         let sql = format!(
             "INSERT INTO episodes (id, tenant, scope, source, trust, content, metadata, \
              occurred_at, idempotency_key) \
@@ -123,7 +107,7 @@ impl PgStore {
              ON CONFLICT (tenant, idempotency_key) DO NOTHING RETURNING {EPISODE_COLS}"
         );
         let inserted = sqlx::query(&sql)
-            .bind(id)
+            .bind(Uuid::now_v7())
             .bind(&ctx.tenant)
             .bind(episode.scope.to_string())
             .bind(&episode.source)
@@ -137,18 +121,7 @@ impl PgStore {
             .map_err(db)?;
 
         let row = match inserted {
-            Some(row) => {
-                if enqueue {
-                    sqlx::query("SELECT enqueue_job($1, $2, 'extract', $3::jsonb)")
-                        .bind(Uuid::now_v7())
-                        .bind(&ctx.tenant)
-                        .bind(json!({ "episode_id": id.to_string() }))
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(db)?;
-                }
-                row
-            }
+            Some(row) => row,
             // The conflicting insert has committed by now, so this statement's snapshot sees it.
             None => {
                 let sql = format!(
@@ -165,21 +138,6 @@ impl PgStore {
         let result = rows::episode(&row)?;
         tx.commit().await.map_err(db)?;
         Ok(result)
-    }
-}
-
-#[async_trait]
-impl MemoryStore for PgStore {
-    async fn insert_episode(&self, ctx: &RequestContext, episode: NewEpisode) -> Result<Episode> {
-        self.insert_episode_inner(ctx, episode, true).await
-    }
-
-    async fn insert_unqueued_episode(
-        &self,
-        ctx: &RequestContext,
-        episode: NewEpisode,
-    ) -> Result<Episode> {
-        self.insert_episode_inner(ctx, episode, false).await
     }
 
     async fn get_episode(&self, ctx: &RequestContext, id: Uuid) -> Result<Episode> {
@@ -222,7 +180,7 @@ impl MemoryStore for PgStore {
         Ok(report)
     }
 
-    async fn apply_extraction(
+    async fn apply_commit(
         &self,
         ctx: &RequestContext,
         episode_id: Uuid,
@@ -618,43 +576,6 @@ impl MemoryStore for PgStore {
         Ok(result)
     }
 
-    async fn search_pending_episodes(
-        &self,
-        ctx: &RequestContext,
-        scopes: &[Scope],
-        query: &str,
-        limit: i64,
-    ) -> Result<Vec<ScoredEpisode>> {
-        let limit = validate::limit(limit)?;
-        if scopes.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut tx = self.tenant_tx(ctx).await?;
-        // Same approach as search_facts_text. The function limits trust to user and system.
-        let sql = format!(
-            "SELECT {EPISODE_COLS}, s.hit_rank::float8 AS rank \
-             FROM search_pending_episode_ids($2, $1, $3) AS s(hit_id, hit_rank) \
-             JOIN episodes ON episodes.id = s.hit_id \
-             ORDER BY s.hit_rank DESC, episodes.id"
-        );
-        let found = sqlx::query(&sql)
-            .bind(query)
-            .bind(validate::scope_strings(scopes))
-            .bind(limit)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(db)?;
-        let mut result = Vec::with_capacity(found.len());
-        for row in &found {
-            result.push(ScoredEpisode {
-                episode: rows::episode(row)?,
-                score: row.try_get("rank").map_err(db)?,
-            });
-        }
-        tx.commit().await.map_err(db)?;
-        Ok(result)
-    }
-
     async fn list_quarantined(
         &self,
         ctx: &RequestContext,
@@ -1021,274 +942,6 @@ impl MemoryStore for PgStore {
             .collect::<Result<_>>()?;
         tx.commit().await.map_err(db)?;
         Ok(result)
-    }
-
-    async fn create_session(
-        &self,
-        ctx: &RequestContext,
-        agent_id: &str,
-        scope: &Scope,
-    ) -> Result<Session> {
-        validate::non_empty("agent_id", agent_id)?;
-        let mut tx = self.tenant_tx(ctx).await?;
-        let sql = format!(
-            "INSERT INTO sessions (id, tenant, agent_id, scope) VALUES ($1, $2, $3, $4) \
-             RETURNING {SESSION_COLS}"
-        );
-        let row = sqlx::query(&sql)
-            .bind(Uuid::now_v7())
-            .bind(&ctx.tenant)
-            .bind(agent_id)
-            .bind(scope.to_string())
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(db)?;
-        let result = rows::session(&row)?;
-        tx.commit().await.map_err(db)?;
-        Ok(result)
-    }
-
-    async fn get_session(&self, ctx: &RequestContext, id: Uuid) -> Result<Session> {
-        let mut tx = self.tenant_tx(ctx).await?;
-        let sql = format!("SELECT {SESSION_COLS} FROM sessions WHERE id = $1");
-        let row = sqlx::query(&sql)
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(db)?
-            .ok_or_else(|| Error::NotFound(format!("session {id}")))?;
-        let result = rows::session(&row)?;
-        tx.commit().await.map_err(db)?;
-        Ok(result)
-    }
-
-    async fn append_message(
-        &self,
-        ctx: &RequestContext,
-        session_id: Uuid,
-        role: &str,
-        content: Value,
-    ) -> Result<SessionMessage> {
-        validate::non_empty("role", role)?;
-        let mut tx = self.tenant_tx(ctx).await?;
-        // The row lock from this UPDATE serializes appenders until commit, which also makes `seq`
-        // gapless: a failed insert rolls the counter back.
-        let row = sqlx::query(
-            "UPDATE sessions SET next_seq = next_seq + 1 WHERE id = $1 \
-             RETURNING next_seq - 1 AS seq",
-        )
-        .bind(session_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(db)?
-        .ok_or_else(|| Error::NotFound(format!("session {session_id}")))?;
-        let seq: i64 = row.try_get("seq").map_err(db)?;
-        let sql = format!(
-            "INSERT INTO session_messages (session_id, tenant, seq, role, content) \
-             VALUES ($1, $2, $3, $4, $5) RETURNING {MESSAGE_COLS}"
-        );
-        let row = sqlx::query(&sql)
-            .bind(session_id)
-            .bind(&ctx.tenant)
-            .bind(seq)
-            .bind(role)
-            .bind(content)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(db)?;
-        let result = rows::message(&row)?;
-        tx.commit().await.map_err(db)?;
-        Ok(result)
-    }
-
-    async fn load_messages(
-        &self,
-        ctx: &RequestContext,
-        session_id: Uuid,
-    ) -> Result<Vec<SessionMessage>> {
-        let mut tx = self.tenant_tx(ctx).await?;
-        let compacted_through = require_session(&mut tx, session_id).await?;
-        let sql = format!(
-            "SELECT {MESSAGE_COLS} FROM session_messages \
-             WHERE session_id = $1 AND seq > $2 ORDER BY seq"
-        );
-        let found = sqlx::query(&sql)
-            .bind(session_id)
-            .bind(compacted_through)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(db)?;
-        let result = found.iter().map(rows::message).collect::<Result<_>>()?;
-        tx.commit().await.map_err(db)?;
-        Ok(result)
-    }
-
-    async fn compact_session(
-        &self,
-        ctx: &RequestContext,
-        session_id: Uuid,
-        through_seq: i64,
-        summary: &str,
-    ) -> Result<()> {
-        let mut tx = self.tenant_tx(ctx).await?;
-        let row = sqlx::query(
-            "SELECT compacted_through, next_seq FROM sessions WHERE id = $1 FOR UPDATE",
-        )
-        .bind(session_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(db)?
-        .ok_or_else(|| Error::NotFound(format!("session {session_id}")))?;
-        let compacted_through: i64 = row.try_get("compacted_through").map_err(db)?;
-        let next_seq: i64 = row.try_get("next_seq").map_err(db)?;
-        if through_seq >= next_seq {
-            return Err(Error::InvalidInput(format!(
-                "through_seq {through_seq} is past the last message"
-            )));
-        }
-        // An older compaction arriving late must not overwrite a newer summary.
-        if through_seq < compacted_through {
-            return Err(Error::InvalidInput(format!(
-                "session is already compacted through {compacted_through}"
-            )));
-        }
-        sqlx::query("UPDATE sessions SET summary = $2, compacted_through = $3 WHERE id = $1")
-            .bind(session_id)
-            .bind(summary)
-            .bind(through_seq)
-            .execute(&mut *tx)
-            .await
-            .map_err(db)?;
-        sqlx::query("DELETE FROM session_messages WHERE session_id = $1 AND seq <= $2")
-            .bind(session_id)
-            .bind(through_seq)
-            .execute(&mut *tx)
-            .await
-            .map_err(db)?;
-        tx.commit().await.map_err(db)
-    }
-
-    async fn session_summary(
-        &self,
-        ctx: &RequestContext,
-        session_id: Uuid,
-    ) -> Result<Option<String>> {
-        let mut tx = self.tenant_tx(ctx).await?;
-        let row = sqlx::query("SELECT summary FROM sessions WHERE id = $1")
-            .bind(session_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(db)?
-            .ok_or_else(|| Error::NotFound(format!("session {session_id}")))?;
-        let result = row.try_get("summary").map_err(db)?;
-        tx.commit().await.map_err(db)?;
-        Ok(result)
-    }
-
-    async fn claim_job(&self, worker_id: &str, lease_secs: i64) -> Result<Option<Job>> {
-        validate::non_empty("worker_id", worker_id)?;
-        if lease_secs <= 0 {
-            return Err(Error::InvalidInput("lease_secs must be positive".into()));
-        }
-        let row = sqlx::query(
-            "WITH due AS ( \
-                 SELECT id FROM jobs \
-                 WHERE (status = 'pending' AND run_after <= now()) \
-                    OR (status = 'running' AND locked_until < now()) \
-                 ORDER BY run_after, id \
-                 FOR UPDATE SKIP LOCKED LIMIT 1) \
-             UPDATE jobs j SET status = 'running', attempts = j.attempts + 1, locked_by = $1, \
-                 locked_until = now() + make_interval(secs => $2) \
-             FROM due WHERE j.id = due.id \
-             RETURNING j.id, j.tenant, j.kind, j.payload, j.attempts",
-        )
-        .bind(worker_id)
-        .bind(lease_secs as f64)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(db)?;
-        row.as_ref().map(rows::job).transpose()
-    }
-
-    async fn renew_job(&self, job: &Job, worker_id: &str, lease_secs: i64) -> Result<bool> {
-        if lease_secs <= 0 {
-            return Err(Error::InvalidInput("lease_secs must be positive".into()));
-        }
-        let updated = sqlx::query(
-            "UPDATE jobs SET locked_until = now() + make_interval(secs => $4) \
-             WHERE id = $1 AND status = 'running' AND locked_by = $2 AND attempts = $3",
-        )
-        .bind(job.id)
-        .bind(worker_id)
-        .bind(job.attempts)
-        .bind(lease_secs as f64)
-        .execute(&self.pool)
-        .await
-        .map_err(db)?;
-        Ok(updated.rows_affected() == 1)
-    }
-
-    async fn complete_job(&self, job: &Job, worker_id: &str) -> Result<bool> {
-        let updated = sqlx::query(
-            "UPDATE jobs SET status = 'done', locked_by = NULL, locked_until = NULL \
-             WHERE id = $1 AND status = 'running' AND locked_by = $2 AND attempts = $3",
-        )
-        .bind(job.id)
-        .bind(worker_id)
-        .bind(job.attempts)
-        .execute(&self.pool)
-        .await
-        .map_err(db)?;
-        Ok(updated.rows_affected() == 1)
-    }
-
-    async fn fail_job(
-        &self,
-        job: &Job,
-        worker_id: &str,
-        error: &str,
-        run_after: DateTime<Utc>,
-        max_attempts: i32,
-    ) -> Result<bool> {
-        // PostgreSQL rejects NUL in text, and failing here would lose the retry.
-        let error = error.replace('\0', "");
-        let updated = sqlx::query(
-            "UPDATE jobs SET \
-                 status = CASE WHEN attempts >= $6 THEN 'dead' ELSE 'pending' END, \
-                 last_error = $4, run_after = $5, locked_by = NULL, locked_until = NULL \
-             WHERE id = $1 AND status = 'running' AND locked_by = $2 AND attempts = $3",
-        )
-        .bind(job.id)
-        .bind(worker_id)
-        .bind(job.attempts)
-        .bind(error)
-        .bind(run_after)
-        .bind(max_attempts)
-        .execute(&self.pool)
-        .await
-        .map_err(db)?;
-        Ok(updated.rows_affected() == 1)
-    }
-
-    async fn release_job(
-        &self,
-        job: &Job,
-        worker_id: &str,
-        run_after: DateTime<Utc>,
-    ) -> Result<bool> {
-        let updated = sqlx::query(
-            "UPDATE jobs SET status = 'pending', attempts = attempts - 1, run_after = $4, \
-                 locked_by = NULL, locked_until = NULL \
-             WHERE id = $1 AND status = 'running' AND locked_by = $2 AND attempts = $3",
-        )
-        .bind(job.id)
-        .bind(worker_id)
-        .bind(job.attempts)
-        .bind(run_after)
-        .execute(&self.pool)
-        .await
-        .map_err(db)?;
-        Ok(updated.rows_affected() == 1)
     }
 
     async fn find_api_key(&self, key_hash: &str) -> Result<Option<ApiKey>> {

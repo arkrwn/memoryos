@@ -249,7 +249,7 @@ pub struct NewFact {
     pub valid_to: Option<DateTime<Utc>>,
 }
 
-/// One reconciliation decision, applied atomically by `MemoryStore::apply_extraction`.
+/// One decision of a commit, applied atomically by `MemoryStore::apply_commit`.
 #[derive(Debug, Clone)]
 pub enum FactOp {
     /// Insert a new fact, linked to the episode.
@@ -272,12 +272,6 @@ pub struct FactFilter {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoredFact {
     pub fact: Fact,
-    pub score: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScoredEpisode {
-    pub episode: Episode,
     pub score: f64,
 }
 
@@ -305,33 +299,6 @@ pub struct BlockVersion {
     pub content: String,
     pub edited_by: String,
     pub edited_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Session {
-    pub id: Uuid,
-    pub agent_id: String,
-    pub scope: Scope,
-    pub created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionMessage {
-    pub seq: i64,
-    pub role: String,
-    /// JSON array of `ContentBlock`.
-    pub content: serde_json::Value,
-    pub created_at: DateTime<Utc>,
-}
-
-/// Claimed background work. `jobs` is not tenant-restricted; the job carries its tenant.
-#[derive(Debug, Clone)]
-pub struct Job {
-    pub id: Uuid,
-    pub tenant: String,
-    pub kind: String,
-    pub payload: serde_json::Value,
-    pub attempts: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

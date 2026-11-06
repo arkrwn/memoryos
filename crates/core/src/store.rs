@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::error::Result;
@@ -12,30 +11,22 @@ use crate::types::*;
 #[async_trait]
 pub trait MemoryStore: Send + Sync {
     // Episodes
-    /// Inserts the episode and its `extract` job in one transaction. A repeated
-    /// `idempotency_key` returns the existing episode and enqueues nothing.
+    /// Stores the source of a commit. A repeated `idempotency_key` returns the existing episode.
     async fn insert_episode(&self, ctx: &RequestContext, episode: NewEpisode) -> Result<Episode>;
-    /// Same as `insert_episode` with no job, for host mode, where the host supplies the facts
-    /// and `apply_extraction` follows directly.
-    async fn insert_unqueued_episode(
-        &self,
-        ctx: &RequestContext,
-        episode: NewEpisode,
-    ) -> Result<Episode>;
     async fn get_episode(&self, ctx: &RequestContext, id: Uuid) -> Result<Episode>;
     /// Deletes the episode. Facts it alone supports are deleted; facts with other sources lose
     /// this source and stay, with trust recomputed as the highest among the remaining sources. A
     /// surviving active fact whose new trust falls under a source quarantine rule of SPEC section 5
     /// becomes quarantined. Entities left with no facts are deleted.
     async fn purge_episode(&self, ctx: &RequestContext, id: Uuid) -> Result<PurgeReport>;
-    /// Hard-deletes everything stored under `scope`, including sessions when it is an agent scope.
+    /// Hard-deletes everything stored under `scope`, including blocks when it is an agent scope.
     async fn purge_scope(&self, ctx: &RequestContext, scope: &Scope) -> Result<PurgeReport>;
 
-    // Extraction
+    // Commits
     /// Atomically applies `ops` and sets `episodes.processed_at`. If the episode is already
-    /// processed this is a no-op returning an empty list, which makes job retries idempotent.
+    /// processed this is a no-op returning an empty list, which makes a replayed commit idempotent.
     /// Returns ids of inserted facts.
-    async fn apply_extraction(
+    async fn apply_commit(
         &self,
         ctx: &RequestContext,
         episode_id: Uuid,
@@ -74,7 +65,7 @@ pub trait MemoryStore: Send + Sync {
     async fn fact_history(&self, ctx: &RequestContext, id: Uuid) -> Result<Vec<Fact>>;
     /// Marks the fact retracted by setting `invalidated_at`. Writes an audit event.
     async fn invalidate_fact(&self, ctx: &RequestContext, id: Uuid, reason: &str) -> Result<Fact>;
-    /// Currently valid, active facts about `subject_id`, for reconciliation.
+    /// Currently valid, active facts about `subject_id`.
     async fn current_facts_for_subject(
         &self,
         ctx: &RequestContext,
@@ -100,16 +91,6 @@ pub trait MemoryStore: Send + Sync {
         filter: &FactFilter,
         limit: i64,
     ) -> Result<Vec<ScoredFact>>;
-    /// Full-text search over episodes not yet processed, so writes are readable immediately.
-    /// Only `user` and `system` episodes are returned: others could carry poisoned content.
-    async fn search_pending_episodes(
-        &self,
-        ctx: &RequestContext,
-        scopes: &[Scope],
-        query: &str,
-        limit: i64,
-    ) -> Result<Vec<ScoredEpisode>>;
-
     // Quarantine
     async fn list_quarantined(
         &self,
@@ -158,72 +139,6 @@ pub trait MemoryStore: Send + Sync {
         agent_id: &str,
         label: &str,
     ) -> Result<Vec<BlockVersion>>;
-
-    // Sessions
-    async fn create_session(
-        &self,
-        ctx: &RequestContext,
-        agent_id: &str,
-        scope: &Scope,
-    ) -> Result<Session>;
-    async fn get_session(&self, ctx: &RequestContext, id: Uuid) -> Result<Session>;
-    /// Assigns the next `seq` and appends. Safe under concurrent callers.
-    async fn append_message(
-        &self,
-        ctx: &RequestContext,
-        session_id: Uuid,
-        role: &str,
-        content: serde_json::Value,
-    ) -> Result<SessionMessage>;
-    /// Messages with `seq` greater than the session's compaction point, oldest first.
-    async fn load_messages(
-        &self,
-        ctx: &RequestContext,
-        session_id: Uuid,
-    ) -> Result<Vec<SessionMessage>>;
-    /// Replaces messages up to and including `through_seq` with `summary`.
-    async fn compact_session(
-        &self,
-        ctx: &RequestContext,
-        session_id: Uuid,
-        through_seq: i64,
-        summary: &str,
-    ) -> Result<()>;
-    async fn session_summary(
-        &self,
-        ctx: &RequestContext,
-        session_id: Uuid,
-    ) -> Result<Option<String>>;
-
-    // Jobs: cross-tenant, used only by the worker
-    /// Claims one due job with `FOR UPDATE SKIP LOCKED`, leased until now + `lease_secs`.
-    /// Jobs whose lease expired are claimable, which recovers work from crashed workers.
-    async fn claim_job(&self, worker_id: &str, lease_secs: i64) -> Result<Option<Job>>;
-    /// Extends the lease. Returns `false` if this claim was lost. The fencing rule for the three
-    /// methods below: they apply only while the job is `running` with `locked_by = worker_id`
-    /// and the same `attempts` as `job`.
-    async fn renew_job(&self, job: &Job, worker_id: &str, lease_secs: i64) -> Result<bool>;
-    /// Returns `false` if this claim was lost.
-    async fn complete_job(&self, job: &Job, worker_id: &str) -> Result<bool>;
-    /// Reschedules at `run_after`, or marks `dead` once `attempts` reaches `max_attempts`.
-    /// Returns `false` if this claim was lost.
-    async fn fail_job(
-        &self,
-        job: &Job,
-        worker_id: &str,
-        error: &str,
-        run_after: DateTime<Utc>,
-        max_attempts: i32,
-    ) -> Result<bool>;
-    /// Gives the job back without counting this claim as an attempt, for a graceful shutdown that
-    /// says nothing about the job. Runnable again at `run_after`. Returns `false` if this claim
-    /// was lost.
-    async fn release_job(
-        &self,
-        job: &Job,
-        worker_id: &str,
-        run_after: DateTime<Utc>,
-    ) -> Result<bool>;
 
     // API keys: cross-tenant, looked up before the tenant is known
     /// `key_hash` is the hex SHA-256 of the presented token. Revoked keys return `None`.

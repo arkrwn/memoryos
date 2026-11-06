@@ -1,15 +1,12 @@
 //! Shared types, errors and traits for MemoryOS. This crate performs no I/O.
 
+pub mod embedder;
 pub mod error;
-pub mod llm;
 pub mod store;
 pub mod types;
 
+pub use embedder::Embedder;
 pub use error::{Error, Result};
-pub use llm::{
-    CompletionRequest, CompletionResponse, ContentBlock, Embedder, Llm, Message, Role, StopReason,
-    ToolChoice, ToolDef,
-};
 pub use store::MemoryStore;
 pub use types::*;
 

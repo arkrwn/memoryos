@@ -20,12 +20,9 @@ CREATE TABLE episodes (
     created_at      timestamptz NOT NULL DEFAULT now(),
     processed_at    timestamptz,
     idempotency_key text,
-    content_tsv     tsvector GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED,
     UNIQUE (tenant, idempotency_key)
 );
 CREATE INDEX episodes_scope_idx ON episodes (tenant, scope, created_at DESC);
-CREATE INDEX episodes_tsv_idx ON episodes USING gin (content_tsv);
-CREATE INDEX episodes_pending_idx ON episodes (tenant, scope) WHERE processed_at IS NULL;
 
 CREATE TABLE entities (
     id              uuid PRIMARY KEY,
@@ -104,28 +101,6 @@ CREATE TABLE block_versions (
     PRIMARY KEY (block_id, version)
 );
 
-CREATE TABLE sessions (
-    id              uuid PRIMARY KEY,
-    tenant          text NOT NULL,
-    agent_id        text NOT NULL,
-    scope           text NOT NULL,
-    summary         text,
-    compacted_through bigint NOT NULL DEFAULT 0,
-    next_seq        bigint NOT NULL DEFAULT 1,
-    created_at      timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX sessions_scope_idx ON sessions (tenant, scope);
-
-CREATE TABLE session_messages (
-    session_id uuid NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
-    tenant     text NOT NULL,
-    seq        bigint NOT NULL,
-    role       text NOT NULL,
-    content    jsonb NOT NULL,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (session_id, seq)
-);
-
 CREATE TABLE audit_events (
     id         uuid PRIMARY KEY,
     tenant     text NOT NULL,
@@ -137,22 +112,7 @@ CREATE TABLE audit_events (
 );
 CREATE INDEX audit_events_tenant_idx ON audit_events (tenant, created_at DESC);
 
--- Not tenant-restricted: the worker claims across tenants, and keys are read before auth.
-CREATE TABLE jobs (
-    id           uuid PRIMARY KEY,
-    tenant       text NOT NULL,
-    kind         text NOT NULL,
-    payload      jsonb NOT NULL,
-    status       text NOT NULL CHECK (status IN ('pending', 'running', 'done', 'dead')),
-    attempts     integer NOT NULL DEFAULT 0,
-    run_after    timestamptz NOT NULL DEFAULT now(),
-    locked_by    text,
-    locked_until timestamptz,
-    last_error   text,
-    created_at   timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX jobs_due_idx ON jobs (run_after) WHERE status IN ('pending', 'running');
-
+-- Not tenant-restricted: keys are read before the tenant is known.
 CREATE TABLE api_keys (
     id         uuid PRIMARY KEY,
     tenant     text NOT NULL,
@@ -172,7 +132,7 @@ DECLARE
     t text;
 BEGIN
     FOREACH t IN ARRAY ARRAY['episodes', 'entities', 'facts', 'fact_sources', 'blocks',
-                             'block_versions', 'sessions', 'session_messages', 'audit_events']
+                             'block_versions', 'audit_events']
     LOOP
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
         EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', t);
@@ -186,12 +146,11 @@ END
 $$;
 
 -- Text search under RLS cannot use GIN indexes, because `@@` is not leakproof (measured on
--- 200k facts: 0.5 ms with the index, 29 ms without). These functions run as the table owner and
--- take the tenant from app.tenant themselves, so callers cannot pass another tenant. They return
--- ids only; callers load rows under RLS. FORCE is off on these two tables so that a non-superuser
--- owner can run them. Tenant transactions still use memoryos_app, which stays subject to policy.
+-- 200k facts: 0.5 ms with the index, 29 ms without). This function runs as the table owner and
+-- takes the tenant from app.tenant itself, so callers cannot pass another tenant. It returns
+-- ids only; callers load rows under RLS. FORCE is off on this table so that a non-superuser owner
+-- can run it. Tenant transactions still use memoryos_app, which stays subject to policy.
 ALTER TABLE facts NO FORCE ROW LEVEL SECURITY;
-ALTER TABLE episodes NO FORCE ROW LEVEL SECURITY;
 
 CREATE FUNCTION search_fact_ids_text(p_scopes text[], p_query text, p_as_of timestamptz, p_known_at timestamptz, p_limit bigint)
 RETURNS TABLE (id uuid, rank real)
@@ -211,37 +170,5 @@ AS $$
     LIMIT p_limit;
 $$;
 
--- Only `user` and `system` episodes are readable before processing. See SPEC section 3.
-CREATE FUNCTION search_pending_episode_ids(p_scopes text[], p_query text, p_limit bigint)
-RETURNS TABLE (id uuid, rank real)
-LANGUAGE sql STABLE SECURITY DEFINER
-SET search_path = public
-AS $$
-    SELECT e.id, ts_rank(e.content_tsv, q) AS rank
-    FROM episodes e, websearch_to_tsquery('simple', p_query) q
-    WHERE e.tenant = current_setting('app.tenant', true)
-      AND e.scope = ANY (p_scopes)
-      AND e.processed_at IS NULL
-      AND e.trust IN ('user', 'system')
-      AND e.content_tsv @@ q
-    ORDER BY rank DESC, e.id
-    LIMIT p_limit;
-$$;
-
 REVOKE ALL ON FUNCTION search_fact_ids_text(text[], text, timestamptz, timestamptz, bigint) FROM PUBLIC;
-REVOKE ALL ON FUNCTION search_pending_episode_ids(text[], text, bigint) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION search_fact_ids_text(text[], text, timestamptz, timestamptz, bigint) TO memoryos_app;
-GRANT EXECUTE ON FUNCTION search_pending_episode_ids(text[], text, bigint) TO memoryos_app;
-
--- memoryos_app gets no privileges on jobs or api_keys. insert_episode enqueues through this
--- function so tenant transactions cannot read or alter other tenants' jobs.
-CREATE FUNCTION enqueue_job(p_id uuid, p_tenant text, p_kind text, p_payload jsonb)
-RETURNS void
-LANGUAGE sql
-SECURITY DEFINER
-SET search_path = public
-AS $$
-    INSERT INTO jobs (id, tenant, kind, payload, status) VALUES (p_id, p_tenant, p_kind, p_payload, 'pending');
-$$;
-REVOKE ALL ON FUNCTION enqueue_job(uuid, text, text, jsonb) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION enqueue_job(uuid, text, text, jsonb) TO memoryos_app;
