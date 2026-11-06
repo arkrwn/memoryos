@@ -7,17 +7,15 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use memoryos_core::{
     normalize_name, ApiKey, Block, BlockVersion, Entity, Episode, Error, Fact, FactFilter, FactOp,
-    FactStatus, GraphNeighborhood, MemoryStore, NewEntity, NewEpisode, PurgeReport,
-    RequestContext, Result, Scope, ScoredFact, Trust,
+    FactStatus, GraphNeighborhood, MemoryStore, NewEntity, NewEpisode, PurgeReport, RequestContext,
+    Result, Scope, ScoredFact, Trust,
 };
 use pgvector::Vector;
 use serde_json::{json, Value};
 use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
-use crate::rows::{
-    self, visible, API_KEY_COLS, BLOCK_COLS, ENTITY_COLS, EPISODE_COLS, FACT_COLS,
-};
+use crate::rows::{self, visible, API_KEY_COLS, BLOCK_COLS, ENTITY_COLS, EPISODE_COLS, FACT_COLS};
 use crate::{db, facts, validate, PgStore};
 
 /// Hard cap on `neighbors`, so a depth-5 walk through a hub cannot load an unbounded graph, whatever

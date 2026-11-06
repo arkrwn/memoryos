@@ -2,9 +2,7 @@
 
 use std::str::FromStr;
 
-use memoryos_core::{
-    ApiKey, Block, BlockVersion, Entity, Episode, Error, Fact, Result,
-};
+use memoryos_core::{ApiKey, Block, BlockVersion, Entity, Episode, Error, Fact, Result};
 use sqlx::postgres::PgRow;
 use sqlx::{Decode, Postgres, Row, Type};
 

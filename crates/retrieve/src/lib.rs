@@ -291,13 +291,8 @@ mod tests {
 
     #[test]
     fn response_serializes_the_openapi_fields() {
-        let response = RecallResponse {
-            facts: vec![],
-        };
+        let response = RecallResponse { facts: vec![] };
         let json = serde_json::to_value(&response).expect("serializes");
-        assert_eq!(
-            json,
-            serde_json::json!({"facts": []})
-        );
+        assert_eq!(json, serde_json::json!({"facts": []}));
     }
 }

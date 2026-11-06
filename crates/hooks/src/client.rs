@@ -336,9 +336,7 @@ mod tests {
     #[test]
     fn empty_results_say_so() {
         assert_eq!(quarantine_text(&[]), "no quarantined facts");
-        let response = RecallResponse {
-            facts: vec![],
-        };
+        let response = RecallResponse { facts: vec![] };
         assert_eq!(recall_text(&response), "no memories found");
         let value: Value = serde_json::from_str(&recall_json(&response)).expect("json");
         assert_eq!(value, json!({"facts": []}));
