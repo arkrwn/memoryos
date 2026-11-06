@@ -10,9 +10,9 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use memoryos_core::{MemoryStore, Trust};
-use memoryos_ingest::CancellationToken;
 use memoryos_store::PgStore;
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::auth::{generate_token, hash_token, validate_pattern};
@@ -33,14 +33,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Run the API server, plus the embedded worker in worker mode.
-    Serve {
-        /// Do not run the embedded worker.
-        #[arg(long)]
-        no_worker: bool,
-    },
-    /// Run only the job worker. Requires MEMORYOS_MODE=worker.
-    Worker,
+    /// Run the API server.
+    Serve,
     /// Apply database migrations.
     Migrate,
     /// Manage API keys.
@@ -74,13 +68,7 @@ pub enum KeyCommand {
 
 pub fn dispatch(cli: Cli) -> Result<(), String> {
     match cli.command {
-        Command::Serve { no_worker } => run_service(|config, shutdown| async move {
-            let listener = TcpListener::bind(&config.bind)
-                .await
-                .map_err(|e| format!("cannot bind {}: {e}", config.bind))?;
-            app::serve(config, listener, !no_worker, shutdown).await
-        }),
-        Command::Worker => run_service(app::run_worker),
+        Command::Serve => serve(),
         Command::Migrate => block_on(migrate()),
         Command::Key(KeyCommand::Create {
             tenant,
@@ -106,18 +94,17 @@ fn block_on<F: std::future::Future<Output = Result<(), String>>>(work: F) -> Res
 }
 
 /// Loads configuration first, so a missing requirement fails before anything starts.
-fn run_service<F, Fut>(run: F) -> Result<(), String>
-where
-    F: FnOnce(Config, CancellationToken) -> Fut,
-    Fut: std::future::Future<Output = Result<(), String>>,
-{
+fn serve() -> Result<(), String> {
     let config = Config::from_env()?;
     let telemetry = telemetry::init()?;
     let runtime = runtime()?;
     let result = runtime.block_on(async {
         let shutdown = CancellationToken::new();
         tokio::spawn(cancel_on_signal(shutdown.clone()));
-        run(config, shutdown).await
+        let listener = TcpListener::bind(&config.bind)
+            .await
+            .map_err(|e| format!("cannot bind {}: {e}", config.bind))?;
+        app::serve(config, listener, shutdown).await
     });
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
     telemetry.shutdown();
@@ -250,11 +237,5 @@ mod tests {
         };
         assert_eq!(scopes, ["user:*", "agent:a"]);
         assert!(admin);
-    }
-
-    #[test]
-    fn serve_takes_no_worker() {
-        let cli = Cli::parse_from(["memoryos", "serve", "--no-worker"]);
-        assert!(matches!(cli.command, Command::Serve { no_worker: true }));
     }
 }

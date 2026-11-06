@@ -1,5 +1,5 @@
 //! JSON logs, Prometheus metrics, and OTLP traces when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Metric
-//! labels are limited to method, route template, status and job result, so a tenant or a key can
+//! labels are limited to method, route template and status, so a tenant or a key can
 //! never add a time series.
 
 use opentelemetry::trace::TracerProvider as _;
@@ -77,7 +77,6 @@ pub struct Metrics {
     requests: IntCounterVec,
     request_seconds: HistogramVec,
     recall_seconds: Histogram,
-    jobs: IntCounterVec,
 }
 
 impl Metrics {
@@ -98,20 +97,14 @@ impl Metrics {
             "memoryos_recall_duration_seconds",
             "Recall latency, including the query embedding",
         ))?;
-        let jobs = IntCounterVec::new(
-            Opts::new("memoryos_jobs_processed_total", "Worker jobs finished"),
-            &["result"],
-        )?;
         registry.register(Box::new(requests.clone()))?;
         registry.register(Box::new(request_seconds.clone()))?;
         registry.register(Box::new(recall_seconds.clone()))?;
-        registry.register(Box::new(jobs.clone()))?;
         Ok(Self {
             registry,
             requests,
             request_seconds,
             recall_seconds,
-            jobs,
         })
     }
 
@@ -126,10 +119,6 @@ impl Metrics {
 
     pub fn recall_finished(&self, seconds: f64) {
         self.recall_seconds.observe(seconds);
-    }
-
-    pub fn job_finished(&self, result: &str) {
-        self.jobs.with_label_values(&[result]).inc();
     }
 
     pub fn render(&self) -> Result<String, String> {
@@ -150,13 +139,11 @@ mod tests {
         let metrics = Metrics::new().expect("metrics");
         metrics.request_finished("GET", "/v1/facts/{id}", 200, 0.01);
         metrics.recall_finished(0.02);
-        metrics.job_finished("completed");
         let text = metrics.render().expect("render");
         assert!(text.contains(
             r#"memoryos_http_requests_total{method="GET",route="/v1/facts/{id}",status="200"} 1"#
         ));
         assert!(text.contains("memoryos_http_request_duration_seconds_bucket"));
         assert!(text.contains("memoryos_recall_duration_seconds_count 1"));
-        assert!(text.contains(r#"memoryos_jobs_processed_total{result="completed"} 1"#));
     }
 }

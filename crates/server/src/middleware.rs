@@ -1,6 +1,6 @@
 //! Request id, per-request log line and metrics, and the request timeout.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::{HeaderName, HeaderValue, Method};
@@ -11,7 +11,6 @@ use uuid::Uuid;
 
 use crate::app::AppState;
 use crate::error::ApiError;
-use crate::routes::TURN_ROUTE;
 
 const REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 const MAX_REQUEST_ID_CHARS: usize = 128;
@@ -26,7 +25,7 @@ pub async fn observe(State(state): State<AppState>, request: Request, next: Next
         .map_or(UNMATCHED_ROUTE, MatchedPath::as_str)
         .to_owned();
     let method = method_label(request.method());
-    let limit = timeout_for(&state, request.method(), &route);
+    let limit = state.request_timeout;
 
     let span = tracing::info_span!("request", request_id = %request_id, method, route = %route);
     let started = Instant::now();
@@ -51,14 +50,6 @@ pub async fn observe(State(state): State<AppState>, request: Request, next: Next
         response.headers_mut().insert(REQUEST_ID, value);
     }
     response
-}
-
-fn timeout_for(state: &AppState, method: &Method, route: &str) -> Duration {
-    if method == Method::POST && route == TURN_ROUTE {
-        state.turn_timeout
-    } else {
-        state.request_timeout
-    }
 }
 
 /// A caller's id is kept only in a form that cannot forge log fields or a header.
