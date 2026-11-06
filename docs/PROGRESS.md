@@ -9,10 +9,11 @@ actually run. States: `todo`, `doing`, `done`, `blocked`.
 | T1 Postgres store | done | Lead run on `develop`: 4 unit and 51 integration tests pass against real Postgres. Open risk: common-word text search in a 1M-fact scope is estimated at about 450 ms, over the latency gate; T9 must measure it |
 | T2 LLM and embedding clients | done | Lead run on `develop`: 36 unit and 29 WireMock tests pass. Not run against live provider APIs |
 | T3 Eval harness | done | Lead run on `develop`: 51 unit and 6 WireMock tests pass. Not yet run against a real server |
-| T4 Ingest and worker | todo | |
-| T5 Hybrid retrieval | todo | |
-| T6 Agent runtime | todo | |
-| T11 Local embedder | todo | |
+| T4 Ingest and worker | done | Lead run on merged `develop`: 37 unit and 35 integration tests pass |
+| T5 Hybrid retrieval | done | Lead run on merged `develop`: 18 unit and 22 integration tests pass |
+| T6 Agent runtime | done | Lead run on merged `develop`: 24 unit and 30 integration tests pass. Not run against live providers |
+| T11 Local embedder | done | Lead run: 54 llm unit tests pass. Real-model test (6 pass) reported by the agent, not re-run by lead. Needs at least 1 GiB memory and glibc 2.38+ |
+| T13 Hardening after Wave 2 | doing | |
 | T7 Server, MCP, SDK, both modes | todo | |
 | T12 CLI commands and hooks | todo | |
 | T8 Deploy, CI, docs | todo | |

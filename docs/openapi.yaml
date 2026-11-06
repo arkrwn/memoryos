@@ -395,9 +395,10 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [text, tool_calls, input_tokens, output_tokens]
+                required: [text, truncated, tool_calls, input_tokens, output_tokens]
                 properties:
                   text: { type: string }
+                  truncated: { type: boolean, description: True if the reply is still cut off after one continuation }
                   tool_calls: { type: integer }
                   input_tokens: { type: integer }
                   output_tokens: { type: integer }

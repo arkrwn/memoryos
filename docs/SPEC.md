@@ -256,7 +256,7 @@ Entry points:
 ```rust
 // memoryos-ingest
 HostCommitter::new(store: Arc<dyn MemoryStore>, embedder: Arc<dyn Embedder>) -> Self
-HostCommitter::commit(&self, ctx: &RequestContext, req: CommitRequest) -> Result<CommitResponse>
+HostCommitter::commit(&self, ctx: &RequestContext, req: CommitRequest, max_trust: Trust) -> Result<CommitResponse>
 // CommitRequest, CommitFact, EntityRef, CommitResponse, CommittedFact are serde types in ingest
 
 // memoryos-llm, feature `local`, on by default
@@ -284,3 +284,6 @@ CLI, using `MEMORYOS_URL` and `MEMORYOS_API_KEY` (any agent without MCP can use 
 - `known_at` is not fully bitemporal: `valid_to` and `status` are not versioned, so a later close or
   approval shows up in reads at an earlier `known_at`.
 - Thinking blocks are not kept between agent tool calls, so the model loses that reasoning.
+- The agent runtime's per-session lock is in-process. With several server instances, clients must
+  not run concurrent turns on one session.
+- `LocalEmbedder` silently truncates inputs over 512 tokens and needs at least 1 GiB of memory.

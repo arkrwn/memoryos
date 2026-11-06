@@ -10,6 +10,8 @@ Goal: production-grade and ready to use. `docs/SPEC.md` section 12 defines done.
 3. If a contract is wrong, do not work around it silently. Report it in your final message.
 4. Prove your work: run the gates from SPEC section 11 for your crate and report the actual output.
 5. Commit to your worktree branch with a `feat: <crate> | <what>` message. Never merge or push.
+6. Run `cargo clean` in your worktree before your final message. Each target directory costs 2-4 GiB.
+7. Do not use `cargo test --all-features`: it enables `integration-local`, which downloads the model.
 
 ## Waves
 
