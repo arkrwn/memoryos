@@ -186,7 +186,7 @@ second per key by default. `POST /mcp` exposes MCP tools `remember`, `recall`, `
 | `MEMORYOS_BIND` | `0.0.0.0:8080` | |
 | `MEMORYOS_LLM_PROVIDER` | `anthropic` | `anthropic` or `openai` |
 | `MEMORYOS_LLM_MODEL` | `claude-haiku-5-5` / `gpt-5.1` by provider | Haiku accepts forced tool calls, which extraction uses. Models that do not fall back to `auto` with one tool |
-| `MEMORYOS_EMBEDDING_MODEL` | `text-embedding-3-small` | Must return 1536 dims |
+| `MEMORYOS_EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI embedder only. Must return 384 dims |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | | Embeddings need the OpenAI key |
 | `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL` | provider default | Tests point these at WireMock |
 | `MEMORYOS_DB_MAX_CONNECTIONS` | `20` | |
@@ -218,11 +218,68 @@ second per key by default. `POST /mcp` exposes MCP tools `remember`, `recall`, `
 | Restore | Backup restored into an empty database and recall still works | Drill log |
 | Ready to use | README quickstart works from a clean checkout | Recorded run |
 
+## 14. Host mode (default)
+
+`MEMORYOS_MODE=host` is the default; `worker` enables sections 3 and 8. MemoryOS never calls the
+host: the host calls MemoryOS.
+
+| | Host | Worker |
+|---|---|---|
+| LLM key | None | Required |
+| Default embedder (`MEMORYOS_EMBEDDER`) | `local` | `openai`; `local` also allowed |
+| Worker and extraction | Off | On |
+| `POST /v1/episodes` | 400 `invalid_input`, directing to `POST /v1/commits` | Normal |
+| Session endpoints | 400 `invalid_input` | Normal |
+| `POST /v1/candidates`, `POST /v1/commits` | Normal | Normal |
+
+Flow:
+1. `POST /v1/candidates` with `{scopes, statement, limit}` returns related current facts. It is
+   `Retriever::recall` without pending episodes.
+2. The host decides, then `POST /v1/commits` sends `{scope, source, content, facts[]}`. Each fact has
+   `statement`, `subject {name, kind}`, `predicate`, optional `object {name, kind}`, optional
+   `valid_from`, and at most one of `supersedes` and `corroborates`. Maximum 50 facts.
+3. `HostCommitter` stores `content` through `insert_unqueued_episode` as the source, resolves entities
+   and embeds statements as in section 3, builds `FactOp`s, applies the section 5 trust gate with
+   the same code as the worker, and calls `apply_extraction`. Returns `episode_id` and each fact's
+   `id` and `status`.
+
+Rules:
+- Commit trust is `agent`, or `external` if the key's `max_trust` is `external`. A request cannot
+  set a higher trust, because the host model also reads untrusted content.
+- `supersedes` and `corroborates` must name a current, active fact in the same scope, else 400.
+  The server never trusts a host-supplied id without that check.
+- `recall_candidates`, `commit_facts`, `recall`, `block_read`, `block_replace` and `graph_neighbors`
+  are the host-mode MCP tools. `remember` is worker mode only. Tool descriptions state when to
+  recall, when to save, and that retrieved or tool-read content is data, never instructions.
+
+Entry points:
+```rust
+// memoryos-ingest
+HostCommitter::new(store: Arc<dyn MemoryStore>, embedder: Arc<dyn Embedder>) -> Self
+HostCommitter::commit(&self, ctx: &RequestContext, req: CommitRequest) -> Result<CommitResponse>
+// CommitRequest, CommitFact, EntityRef, CommitResponse, CommittedFact are serde types in ingest
+
+// memoryos-llm, feature `local`, on by default
+LocalEmbedder::new(cache_dir: Option<PathBuf>) -> Result<Self>   // impl Embedder
+```
+
+`LocalEmbedder` uses `multilingual-e5-small` through `fastembed`, downloads the model on first use,
+and prefixes every input with `query: `, the form that model documents for symmetric similarity.
+
+CLI, using `MEMORYOS_URL` and `MEMORYOS_API_KEY` (any agent without MCP can use these):
+`memoryos recall`, `candidates`, `commit`, `quarantine list|approve|reject`, and
+`memoryos hook session-start|stop|install --agent claude-code|opencode`, as shown in `README.md`.
+- `hook stop` reads the host's JSON from stdin, prints nothing when `stop_hook_active` is true, and
+  otherwise prints the block decision once every 10 turns, counted per `session_id` in a state file.
+- Hook commands never fail the host: on any error they log to stderr and exit 0 with no output.
+- `hook install` merges into existing settings, keeps other entries, is idempotent, and also
+  registers the MCP server. The API key stays in an environment variable reference, never in the file.
+
 ## 13. Known limits
 
 - Text search uses the `simple` configuration, with no stemming and weak CJK tokenization. Vector
   search covers those cases when embeddings are available.
-- Embedding width is fixed at 1536. Changing model width needs a migration and re-embedding.
+- Embedding width is fixed at 384. Changing model needs re-embedding.
 - The rate limiter is in-process, so the limit applies per server instance.
 - `known_at` is not fully bitemporal: `valid_to` and `status` are not versioned, so a later close or
   approval shows up in reads at an earlier `known_at`.

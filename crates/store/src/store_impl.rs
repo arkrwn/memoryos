@@ -94,9 +94,13 @@ async fn require_session(conn: &mut PgConnection, id: Uuid) -> Result<i64> {
     row.try_get("compacted_through").map_err(db)
 }
 
-#[async_trait]
-impl MemoryStore for PgStore {
-    async fn insert_episode(&self, ctx: &RequestContext, episode: NewEpisode) -> Result<Episode> {
+impl PgStore {
+    async fn insert_episode_inner(
+        &self,
+        ctx: &RequestContext,
+        episode: NewEpisode,
+        enqueue: bool,
+    ) -> Result<Episode> {
         validate::non_empty("source", &episode.source)?;
         validate::non_empty("content", &episode.content)?;
         let metadata = match episode.metadata {
@@ -127,13 +131,15 @@ impl MemoryStore for PgStore {
 
         let row = match inserted {
             Some(row) => {
-                sqlx::query("SELECT enqueue_job($1, $2, 'extract', $3::jsonb)")
-                    .bind(Uuid::now_v7())
-                    .bind(&ctx.tenant)
-                    .bind(json!({ "episode_id": id.to_string() }))
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(db)?;
+                if enqueue {
+                    sqlx::query("SELECT enqueue_job($1, $2, 'extract', $3::jsonb)")
+                        .bind(Uuid::now_v7())
+                        .bind(&ctx.tenant)
+                        .bind(json!({ "episode_id": id.to_string() }))
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db)?;
+                }
                 row
             }
             // The conflicting insert has committed by now, so this statement's snapshot sees it.
@@ -152,6 +158,21 @@ impl MemoryStore for PgStore {
         let result = rows::episode(&row)?;
         tx.commit().await.map_err(db)?;
         Ok(result)
+    }
+}
+
+#[async_trait]
+impl MemoryStore for PgStore {
+    async fn insert_episode(&self, ctx: &RequestContext, episode: NewEpisode) -> Result<Episode> {
+        self.insert_episode_inner(ctx, episode, true).await
+    }
+
+    async fn insert_unqueued_episode(
+        &self,
+        ctx: &RequestContext,
+        episode: NewEpisode,
+    ) -> Result<Episode> {
+        self.insert_episode_inner(ctx, episode, false).await
     }
 
     async fn get_episode(&self, ctx: &RequestContext, id: Uuid) -> Result<Episode> {

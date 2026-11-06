@@ -15,6 +15,13 @@ pub trait MemoryStore: Send + Sync {
     /// Inserts the episode and its `extract` job in one transaction. A repeated
     /// `idempotency_key` returns the existing episode and enqueues nothing.
     async fn insert_episode(&self, ctx: &RequestContext, episode: NewEpisode) -> Result<Episode>;
+    /// Same as `insert_episode` with no job, for host mode, where the host supplies the facts
+    /// and `apply_extraction` follows directly.
+    async fn insert_unqueued_episode(
+        &self,
+        ctx: &RequestContext,
+        episode: NewEpisode,
+    ) -> Result<Episode>;
     async fn get_episode(&self, ctx: &RequestContext, id: Uuid) -> Result<Episode>;
     /// Deletes the episode. Facts it alone supports are deleted; facts with other sources
     /// lose this source and stay. Entities left with no facts are deleted.

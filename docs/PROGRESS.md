@@ -12,7 +12,9 @@ actually run. States: `todo`, `doing`, `done`, `blocked`.
 | T4 Ingest and worker | todo | |
 | T5 Hybrid retrieval | todo | |
 | T6 Agent runtime | todo | |
-| T7 Server, MCP, SDK | todo | |
+| T11 Local embedder | todo | |
+| T7 Server, MCP, SDK, both modes | todo | |
+| T12 CLI commands and hooks | todo | |
 | T8 Deploy, CI, docs | todo | |
 | T9 Integration and gates | todo | |
 | T10 Independent review | todo | |
@@ -44,3 +46,8 @@ After Wave 1, from agent findings:
 - Default Anthropic model changed to `claude-haiku-5-5` for forced tool calls. Not verified against
   the live API because no Anthropic key is available.
 - Work merges to `develop`, not `main`.
+
+Host mode, chosen by the user:
+
+- Host mode is the default (ADR 0005, SPEC section 14). `insert_unqueued_episode` added.
+- Embedding width changed from 1536 to 384 (ADR 0003).

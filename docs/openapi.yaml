@@ -78,6 +78,65 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/RecallResponse" }
         default: { $ref: "#/components/responses/Error" }
+  /v1/candidates:
+    post:
+      summary: Related current facts, so the host can decide whether a statement adds, replaces or repeats
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scopes, statement]
+              properties:
+                scopes: { type: array, items: { type: string }, maxItems: 50 }
+                statement: { type: string }
+                limit: { type: integer, minimum: 1, maximum: 100, default: 10 }
+      responses:
+        "200":
+          description: Candidates
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [facts]
+                properties:
+                  facts:
+                    type: array
+                    items:
+                      type: object
+                      required: [fact, score]
+                      properties:
+                        fact: { $ref: "#/components/schemas/Fact" }
+                        score: { type: number }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/commits:
+    post:
+      summary: Store facts decided by the host. Trust is at most agent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CommitRequest" }
+      responses:
+        "200":
+          description: Stored
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [episode_id, facts]
+                properties:
+                  episode_id: { type: string, format: uuid }
+                  facts:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, status]
+                      properties:
+                        id: { type: string, format: uuid }
+                        status: { type: string, enum: [active, quarantined, rejected] }
+        default: { $ref: "#/components/responses/Error" }
   /v1/facts/{id}:
     get:
       summary: Read a fact
@@ -399,6 +458,34 @@ components:
                   message: { type: string }
   schemas:
     Trust: { type: string, enum: [external, agent, user, system] }
+    EntityRef:
+      type: object
+      required: [name, kind]
+      properties:
+        name: { type: string }
+        kind: { type: string }
+    CommitRequest:
+      type: object
+      required: [scope, source, content, facts]
+      properties:
+        scope: { type: string }
+        source: { type: string }
+        content: { type: string, maxLength: 100000, description: Source text kept for provenance }
+        idempotency_key: { type: [string, "null"] }
+        facts:
+          type: array
+          maxItems: 50
+          items:
+            type: object
+            required: [statement, subject, predicate]
+            properties:
+              statement: { type: string }
+              subject: { $ref: "#/components/schemas/EntityRef" }
+              predicate: { type: string }
+              object: { oneOf: [{ $ref: "#/components/schemas/EntityRef" }, { type: "null" }] }
+              valid_from: { type: [string, "null"], format: date-time }
+              supersedes: { type: [string, "null"], format: uuid }
+              corroborates: { type: [string, "null"], format: uuid }
     NewEpisode:
       type: object
       required: [scope, source, trust, content]

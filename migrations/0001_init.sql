@@ -35,7 +35,7 @@ CREATE TABLE entities (
     name            text NOT NULL,
     normalized_name text NOT NULL,
     aliases         text[] NOT NULL DEFAULT '{}',
-    embedding       vector(1536) NOT NULL,
+    embedding       vector(384) NOT NULL,
     created_at      timestamptz NOT NULL DEFAULT now(),
     UNIQUE (tenant, scope, kind, normalized_name)
 );
@@ -49,7 +49,7 @@ CREATE TABLE facts (
     predicate      text NOT NULL,
     object_id      uuid REFERENCES entities (id) ON DELETE CASCADE,
     statement      text NOT NULL,
-    embedding      vector(1536) NOT NULL,
+    embedding      vector(384) NOT NULL,
     trust          text NOT NULL CHECK (trust IN ('external', 'agent', 'user', 'system')),
     status         text NOT NULL CHECK (status IN ('active', 'quarantined', 'rejected')),
     valid_from     timestamptz NOT NULL,

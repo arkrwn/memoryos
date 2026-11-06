@@ -22,8 +22,10 @@ Goal: production-grade and ready to use. `docs/SPEC.md` section 12 defines done.
 | 2 | T4 Ingest and worker | Agent | `crates/ingest` | T1, T2 |
 | 2 | T5 Hybrid retrieval | Agent | `crates/retrieve` | T1, T2 |
 | 2 | T6 Agent runtime | Agent | `crates/agent` | T1, T2 |
-| 3 | T7 Server, MCP, SDK | Agent | `crates/server`, `crates/sdk` | T4, T5, T6 |
-| 3 | T8 Deploy, CI, docs | Agent | `Dockerfile`, `deploy/`, `.github/`, `README.md`, `deny.toml`, `docs/runbook.md` | T4, T5, T6 |
+| 2 | T11 Local embedder | Agent | `crates/llm` | T2 |
+| 3 | T7 Server, MCP, SDK, both modes | Agent | `crates/server`, `crates/sdk` | T4, T5, T6, T11 |
+| 3b | T12 CLI commands and hooks | Agent | `crates/hooks` | T7 |
+| 3b | T8 Deploy, CI, docs | Agent | `Dockerfile`, `deploy/`, `.github/`, `README.md`, `deny.toml`, `docs/runbook.md` | T7 |
 | 4 | T9 Integration and gates | Lead | Whole repo | T7, T8 |
 | 4 | T10 Independent review | Fresh agent | Read-only | T7, T8 |
 

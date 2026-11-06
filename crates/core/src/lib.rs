@@ -14,4 +14,4 @@ pub use store::MemoryStore;
 pub use types::*;
 
 /// Embedding width fixed by `migrations/0001_init.sql`. See ADR 0003.
-pub const EMBEDDING_DIMS: usize = 1536;
+pub const EMBEDDING_DIMS: usize = 384;
