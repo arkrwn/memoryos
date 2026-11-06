@@ -1,5 +1,5 @@
 //! Real Postgres tests for `PgStore`. One container per test binary; each test clones a migrated
-//! template into its own database, so tests run in parallel without sharing jobs or rows.
+//! template into its own database, so tests run in parallel without sharing rows.
 //!
 //! Tests log in as the superuser on purpose: tenant isolation must hold through the role switch
 //! alone, not because the login role lacks privileges.
@@ -31,6 +31,25 @@ type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const TEMPLATE_DB: &str = "memoryos_template";
+
+/// `claim_episode` for a test that does not care which call created the row.
+trait InsertEpisode {
+    async fn insert_episode(
+        &self,
+        ctx: &RequestContext,
+        episode: NewEpisode,
+    ) -> memoryos_core::Result<memoryos_core::Episode>;
+}
+
+impl InsertEpisode for PgStore {
+    async fn insert_episode(
+        &self,
+        ctx: &RequestContext,
+        episode: NewEpisode,
+    ) -> memoryos_core::Result<memoryos_core::Episode> {
+        self.claim_episode(ctx, episode).await.map(|(row, _)| row)
+    }
+}
 
 // ---- Harness ---------------------------------------------------------------------------------
 
@@ -174,6 +193,10 @@ fn user(id: &str) -> Scope {
     Scope::user(id)
 }
 
+fn agent_scope() -> Scope {
+    Scope::agent("a1")
+}
+
 fn date(year: i32, month: u32) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(year, month, 1, 0, 0, 0)
         .single()
@@ -244,7 +267,7 @@ async fn add_fact(db: &Db, c: &RequestContext, fact: NewFact) -> Res<(Uuid, Uuid
     let episode_id = new_episode(db, c, &fact.scope, fact.trust).await?;
     let ids = db
         .store
-        .apply_extraction(c, episode_id, vec![FactOp::Add(fact)])
+        .apply_commit(c, episode_id, vec![FactOp::Add(fact)])
         .await?;
     Ok((episode_id, ids[0]))
 }
@@ -253,7 +276,7 @@ async fn supersede(db: &Db, c: &RequestContext, old_fact_id: Uuid, new: NewFact)
     let episode_id = new_episode(db, c, &new.scope, new.trust).await?;
     let ids = db
         .store
-        .apply_extraction(c, episode_id, vec![FactOp::Supersede { old_fact_id, new }])
+        .apply_commit(c, episode_id, vec![FactOp::Supersede { old_fact_id, new }])
         .await?;
     Ok(ids[0])
 }
@@ -289,28 +312,29 @@ async fn ping_and_repeat_migrate_succeed() -> TestResult {
 
 #[tokio::test]
 async fn role_and_tenant_do_not_leak_to_the_pooled_connection() -> TestResult {
-    // One connection: every call below reuses it. memoryos_app has no privileges on jobs, so
-    // claim_job fails if the role survives a commit or a rollback.
+    // One connection: every call below reuses it. memoryos_app has no privileges on api_keys, so
+    // find_api_key fails if the role survives a commit or a rollback.
+    let hash = "0".repeat(64);
     let db = db_with_pool(1).await;
     let c = ctx("t1");
     db.store
         .put_block(&c, "a", "persona", "v1", 100, None)
         .await?;
-    assert!(db.store.claim_job("w", 30).await?.is_none());
+    assert!(db.store.find_api_key(&hash).await?.is_none());
 
     let conflict = db
         .store
         .put_block(&c, "a", "persona", "x", 100, Some(9))
         .await;
     assert!(matches!(conflict, Err(Error::VersionConflict { .. })));
-    assert!(db.store.claim_job("w", 30).await?.is_none());
+    assert!(db.store.find_api_key(&hash).await?.is_none());
     Ok(())
 }
 
 // ---- Episodes --------------------------------------------------------------------------------
 
 #[tokio::test]
-async fn insert_episode_is_idempotent_and_enqueues_one_job() -> TestResult {
+async fn insert_episode_is_idempotent_per_tenant() -> TestResult {
     let db = db().await;
     let c = ctx("t1");
     let scope = user("u1");
@@ -321,17 +345,10 @@ async fn insert_episode_is_idempotent_and_enqueues_one_job() -> TestResult {
     let second = db.store.insert_episode(&c, new.clone()).await?;
     assert_eq!(first.id, second.id);
     assert_eq!(count(&db, "SELECT count(*) FROM episodes").await?, 1);
-    assert_eq!(count(&db, "SELECT count(*) FROM jobs").await?, 1);
-
-    let job = db.store.claim_job("w", 30).await?.expect("job");
-    assert_eq!(job.kind, "extract");
-    assert_eq!(job.tenant, "t1");
-    assert_eq!(job.payload, json!({ "episode_id": first.id.to_string() }));
 
     // The key is per tenant.
     let other = db.store.insert_episode(&ctx("t2"), new).await?;
     assert_ne!(other.id, first.id);
-    assert_eq!(count(&db, "SELECT count(*) FROM jobs").await?, 2);
     Ok(())
 }
 
@@ -351,7 +368,6 @@ async fn concurrent_inserts_with_one_key_create_one_episode() -> TestResult {
         .map(|r| r.expect("task").expect("insert").id)
         .collect();
     assert_eq!(ids.len(), 1);
-    assert_eq!(count(&db, "SELECT count(*) FROM jobs").await?, 1);
     Ok(())
 }
 
@@ -366,6 +382,388 @@ async fn null_metadata_and_missing_occurred_at_get_defaults() -> TestResult {
     Ok(())
 }
 
+/// The API limit on entity names has to fit the unique index in the worst case. Distinct code points
+/// keep PostgreSQL from compressing the key.
+#[tokio::test]
+async fn an_entity_name_at_the_api_limit_fits_the_unique_index() -> TestResult {
+    let db = db().await;
+    let name: String = (0..512_u32)
+        .map(|i| char::from_u32(0x10000 + i).expect("code point"))
+        .collect();
+    let created = db
+        .store
+        .upsert_entity(
+            &ctx("t1"),
+            NewEntity {
+                scope: user("u1"),
+                kind: "k".repeat(64),
+                name,
+                aliases: vec![],
+                embedding: axis(1),
+            },
+        )
+        .await?;
+    assert_eq!(created.name.chars().count(), 512);
+    Ok(())
+}
+
+#[tokio::test]
+async fn subject_query_returns_the_latest_200_oldest_first() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = user("u1");
+    let subject = entity(&db, &c, &scope, "Ada").await?;
+    let ops = (0..201)
+        .map(|i| FactOp::Add(new_fact(&scope, subject, &format!("f{i}"), date(2020, 1))))
+        .collect();
+    let episode_id = new_episode(&db, &c, &scope, Trust::User).await?;
+    let ids = db.store.apply_commit(&c, episode_id, ops).await?;
+
+    let current = db
+        .store
+        .current_facts_for_subject(&c, &scope, subject)
+        .await?;
+    let got: Vec<Uuid> = current.iter().map(|fact| fact.id).collect();
+    assert_eq!(got, ids[1..]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn current_fact_applies_the_scope_and_the_current_filter() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = user("u1");
+    let subject = entity(&db, &c, &scope, "Ada").await?;
+    let (_, id) = add_fact(&db, &c, new_fact(&scope, subject, "f", date(2020, 1))).await?;
+    assert!(db.store.current_fact(&c, &scope, id).await?.is_some());
+    assert!(db.store.current_fact(&c, &user("u2"), id).await?.is_none());
+    assert!(db
+        .store
+        .current_fact(&ctx("t2"), &scope, id)
+        .await?
+        .is_none());
+    db.store.invalidate_fact(&c, id, "wrong").await?;
+    assert!(db.store.current_fact(&c, &scope, id).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalidating_a_fact_reopens_what_it_closed() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = user("u1");
+    let subject = entity(&db, &c, &scope, "Ada").await?;
+    let (_, first) = add_fact(&db, &c, new_fact(&scope, subject, "first", date(2020, 1))).await?;
+    let second = supersede(
+        &db,
+        &c,
+        first,
+        new_fact(&scope, subject, "second", date(2021, 1)),
+    )
+    .await?;
+
+    db.store.invalidate_fact(&c, second, "wrong").await?;
+    let reopened = db.store.get_fact(&c, first).await?;
+    assert_eq!((reopened.valid_to, reopened.superseded_by), (None, None));
+    let current = db
+        .store
+        .current_facts_for_subject(&c, &scope, subject)
+        .await?;
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].id, first);
+    // A repeat does nothing, even though the fact was reopened and may have moved on.
+    let third = supersede(
+        &db,
+        &c,
+        first,
+        new_fact(&scope, subject, "third", date(2022, 1)),
+    )
+    .await?;
+    db.store.invalidate_fact(&c, second, "again").await?;
+    assert_eq!(
+        db.store.get_fact(&c, first).await?.superseded_by,
+        Some(third)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalidating_the_middle_of_a_chain_links_around_it_and_moves_pending_facts() -> TestResult
+{
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = agent_scope();
+    let subject = entity(&db, &c, &scope, "Ada").await?;
+    let (_, first) = add_fact(&db, &c, new_fact(&scope, subject, "first", date(2020, 1))).await?;
+    let middle = supersede(
+        &db,
+        &c,
+        first,
+        new_fact(&scope, subject, "middle", date(2021, 1)),
+    )
+    .await?;
+    let last = supersede(
+        &db,
+        &c,
+        middle,
+        new_fact(&scope, subject, "last", date(2022, 1)),
+    )
+    .await?;
+
+    db.store.invalidate_fact(&c, middle, "wrong").await?;
+    let linked = db.store.get_fact(&c, first).await?;
+    assert_eq!(linked.superseded_by, Some(last));
+    assert_eq!(linked.valid_to, Some(date(2022, 1)));
+
+    // Pending on the head, which is then retracted: approval closes the reopened predecessor.
+    let mut held = new_fact(&scope, subject, "held", date(2023, 1));
+    held.trust = Trust::External;
+    held.status = FactStatus::Quarantined;
+    let pending = supersede(&db, &c, last, held).await?;
+    db.store.invalidate_fact(&c, last, "wrong").await?;
+    assert_eq!(
+        db.store.get_fact(&c, pending).await?.pending_supersede_of,
+        Some(first)
+    );
+    db.store.approve_fact(&c, pending).await?;
+    assert_eq!(
+        db.store.get_fact(&c, first).await?.superseded_by,
+        Some(pending)
+    );
+    Ok(())
+}
+
+/// A fact in an agent scope, so the source rule does not already hold it.
+#[tokio::test]
+async fn an_add_under_a_higher_trust_fact_of_the_same_subject_and_predicate_is_held() -> TestResult
+{
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = agent_scope();
+    let subject = entity(&db, &c, &scope, "Ada").await?;
+    let (_, user_fact) = add_fact(
+        &db,
+        &c,
+        new_fact(&scope, subject, "lives in Paris", date(2020, 1)),
+    )
+    .await?;
+    let agent_fact = |statement: &str, predicate: &str| {
+        let mut fact = new_fact(&scope, subject, statement, date(2021, 1));
+        fact.trust = Trust::Agent;
+        fact.predicate = predicate.into();
+        fact
+    };
+    let status = |id: Uuid| {
+        let db = &db;
+        let c = &c;
+        async move { Res::Ok(db.store.get_fact(c, id).await?) }
+    };
+
+    let (_, held) = add_fact(&db, &c, agent_fact("lives in Rome", "says")).await?;
+    let held = status(held).await?;
+    assert_eq!(held.status, FactStatus::Quarantined);
+    assert_eq!(held.pending_supersede_of, None);
+    assert_eq!(status(user_fact).await?.valid_to, None);
+
+    let (_, other) = add_fact(&db, &c, agent_fact("likes tea", "likes")).await?;
+    assert_eq!(status(other).await?.status, FactStatus::Active);
+    let (_, equal) = add_fact(&db, &c, agent_fact("likes coffee", "likes")).await?;
+    assert_eq!(status(equal).await?.status, FactStatus::Active);
+
+    // Approval activates it and closes nothing, since it never declared a contradiction.
+    assert_eq!(
+        db.store.approve_fact(&c, held.id).await?.status,
+        FactStatus::Active
+    );
+    assert_eq!(status(user_fact).await?.valid_to, None);
+
+    // A retracted fact outranks nothing.
+    db.store.invalidate_fact(&c, user_fact, "wrong").await?;
+    let (_, after) = add_fact(&db, &c, agent_fact("lives in Oslo", "says")).await?;
+    assert_eq!(status(after).await?.status, FactStatus::Active);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_block_keeps_and_returns_its_latest_100_versions() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let mut block = db
+        .store
+        .put_block(&c, "a1", "notes", "v1", 100, None)
+        .await?;
+    for i in 2..=105 {
+        block = db
+            .store
+            .put_block(
+                &c,
+                "a1",
+                "notes",
+                &format!("v{i}"),
+                100,
+                Some(block.version),
+            )
+            .await?;
+    }
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM block_versions").await?,
+        100
+    );
+    let versions = db.store.block_versions(&c, "a1", "notes").await?;
+    assert_eq!(versions.len(), 100);
+    assert_eq!(versions[0].version, 6);
+    assert_eq!(versions[99].version, 105);
+
+    // Rows from before pruning existed must not widen a read.
+    sqlx::query(
+        "INSERT INTO block_versions (block_id, tenant, version, content, edited_by) \
+         SELECT $1, 't1', v, 'old', 'test' FROM generate_series(1, 5) AS v",
+    )
+    .bind(block.id)
+    .execute(&db.admin)
+    .await?;
+    let versions = db.store.block_versions(&c, "a1", "notes").await?;
+    assert_eq!(versions.len(), 100);
+    assert_eq!(versions[0].version, 6);
+    Ok(())
+}
+
+/// A[10,20), B[20,), and a fact backdated to 5 becomes [5,10), whichever of the two it names.
+#[tokio::test]
+async fn a_backdated_fact_ends_at_the_earliest_later_fact_of_the_chain() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    for name_b_as_target in [false, true] {
+        let scope = user(if name_b_as_target { "u1" } else { "u2" });
+        let subject = entity(&db, &c, &scope, "Ada").await?;
+        let (_, a) = add_fact(&db, &c, new_fact(&scope, subject, "a", date(2010, 1))).await?;
+        let b = supersede(&db, &c, a, new_fact(&scope, subject, "b", date(2020, 1))).await?;
+        let target = if name_b_as_target { b } else { a };
+        let old = supersede(
+            &db,
+            &c,
+            target,
+            new_fact(&scope, subject, "old", date(2005, 1)),
+        )
+        .await?;
+
+        let got = db.store.get_fact(&c, old).await?;
+        assert_eq!(got.valid_to, Some(date(2010, 1)));
+        assert_eq!(got.superseded_by, Some(a));
+        assert_eq!(
+            db.store.get_fact(&c, a).await?.valid_to,
+            Some(date(2020, 1))
+        );
+        assert_eq!(db.store.get_fact(&c, b).await?.valid_to, None);
+
+        for (when, expected) in [(2007, old), (2015, a), (2025, b)] {
+            let found = db
+                .store
+                .search_facts_vector(
+                    &c,
+                    std::slice::from_ref(&scope),
+                    &axis(0),
+                    &at(date(when, 1)),
+                    10,
+                )
+                .await?;
+            let ids: Vec<Uuid> = found.iter().map(|hit| hit.fact.id).collect();
+            assert_eq!(ids, [expected], "as of {when}");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_alias_goes_when_the_last_episode_that_earned_it_is_purged() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = user("u1");
+    let subject = entity(&db, &c, &scope, "Robert").await?;
+    let (first, _) = add_fact(&db, &c, new_fact(&scope, subject, "kept", date(2020, 1))).await?;
+    let second = new_episode(&db, &c, &scope, Trust::User).await?;
+    let third = new_episode(&db, &c, &scope, Trust::User).await?;
+    db.store
+        .add_entity_alias(&c, subject, "Bob", Some(second))
+        .await?;
+    db.store
+        .add_entity_alias(&c, subject, "Bob", Some(third))
+        .await?;
+    db.store.add_entity_alias(&c, subject, "Rob", None).await?;
+
+    db.store.purge_episode(&c, second).await?;
+    let names = db.store.get_entity(&c, subject).await?.aliases;
+    assert_eq!(names, ["Bob", "Rob"], "another episode also earned it");
+
+    db.store.purge_episode(&c, third).await?;
+    let names = db.store.get_entity(&c, subject).await?.aliases;
+    assert_eq!(names, ["Rob"], "an alias with no recorded source stays");
+    assert!(db
+        .store
+        .find_entity(&c, &scope, "thing", "bob")
+        .await?
+        .is_none());
+    db.store.get_episode(&c, first).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn claim_says_whether_this_call_created_the_episode() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let mut new = episode(&user("u1"), Trust::Agent, "source");
+    new.idempotency_key = Some("k".into());
+    let (first, created) = db.store.claim_episode(&c, new.clone()).await?;
+    assert!(created);
+    let (second, created) = db.store.claim_episode(&c, new).await?;
+    assert!(!created);
+    assert_eq!(first.id, second.id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn discard_leaves_a_processed_episode_and_its_facts() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = user("u1");
+    let subject = entity(&db, &c, &scope, "Ada").await?;
+    let (episode_id, fact_id) =
+        add_fact(&db, &c, new_fact(&scope, subject, "kept", date(2025, 1))).await?;
+    assert!(!db.store.discard_unprocessed_episode(&c, episode_id).await?);
+    db.store.get_episode(&c, episode_id).await?;
+    db.store.get_fact(&c, fact_id).await?;
+    Ok(())
+}
+
+/// Whichever gets the row first, the other sees that: no acknowledged fact can lose its episode.
+#[tokio::test(flavor = "multi_thread")]
+async fn discard_and_apply_racing_leave_exactly_one_outcome() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = user("u1");
+    let subject = entity(&db, &c, &scope, "Ada").await?;
+    for round in 0..20 {
+        let (claimed, _) = db
+            .store
+            .claim_episode(&c, episode(&scope, Trust::User, "source"))
+            .await?;
+        let op = FactOp::Add(new_fact(&scope, subject, "raced", date(2025, 1)));
+        let (discarded, applied) = tokio::join!(
+            db.store.discard_unprocessed_episode(&c, claimed.id),
+            db.store.apply_commit(&c, claimed.id, vec![op]),
+        );
+        if discarded? {
+            assert!(is_not_found(applied), "round {round}");
+            assert!(is_not_found(db.store.get_episode(&c, claimed.id).await));
+        } else {
+            let ids = applied?;
+            db.store.get_fact(&c, ids[0]).await?;
+            db.store.get_episode(&c, claimed.id).await?;
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn nul_byte_in_content_is_invalid_input_not_storage_error() -> TestResult {
     let db = db().await;
@@ -374,10 +772,10 @@ async fn nul_byte_in_content_is_invalid_input_not_storage_error() -> TestResult 
     Ok(())
 }
 
-// ---- apply_extraction ------------------------------------------------------------------------
+// ---- apply_commit ------------------------------------------------------------------------
 
 #[tokio::test]
-async fn apply_extraction_retry_is_a_no_op() -> TestResult {
+async fn apply_commit_retry_is_a_no_op() -> TestResult {
     let db = db().await;
     let c = ctx("t1");
     let scope = user("u1");
@@ -385,9 +783,9 @@ async fn apply_extraction_retry_is_a_no_op() -> TestResult {
     let episode_id = new_episode(&db, &c, &scope, Trust::User).await?;
     let ops = || vec![FactOp::Add(new_fact(&scope, subject, "one", date(2020, 1)))];
 
-    let first = db.store.apply_extraction(&c, episode_id, ops()).await?;
+    let first = db.store.apply_commit(&c, episode_id, ops()).await?;
     assert_eq!(first.len(), 1);
-    let second = db.store.apply_extraction(&c, episode_id, ops()).await?;
+    let second = db.store.apply_commit(&c, episode_id, ops()).await?;
     assert!(second.is_empty());
     assert_eq!(count(&db, "SELECT count(*) FROM facts").await?, 1);
     assert!(db
@@ -400,7 +798,7 @@ async fn apply_extraction_retry_is_a_no_op() -> TestResult {
 }
 
 #[tokio::test]
-async fn concurrent_apply_extraction_applies_exactly_once() -> TestResult {
+async fn concurrent_apply_commit_applies_exactly_once() -> TestResult {
     let db = db().await;
     let c = ctx("t1");
     let scope = user("u1");
@@ -418,7 +816,7 @@ async fn concurrent_apply_extraction_applies_exactly_once() -> TestResult {
                 new: new_fact(&scope, subject, "newer", date(2021, 2)),
             },
         ];
-        tokio::spawn(async move { store.apply_extraction(&c, episode_id, ops).await })
+        tokio::spawn(async move { store.apply_commit(&c, episode_id, ops).await })
     });
     let results = futures::future::join_all(calls).await;
     let mut applied = 0;
@@ -433,7 +831,7 @@ async fn concurrent_apply_extraction_applies_exactly_once() -> TestResult {
 }
 
 #[tokio::test]
-async fn failed_apply_extraction_rolls_back_and_can_retry() -> TestResult {
+async fn failed_apply_commit_rolls_back_and_can_retry() -> TestResult {
     let db = db().await;
     let c = ctx("t1");
     let scope = user("u1");
@@ -442,7 +840,7 @@ async fn failed_apply_extraction_rolls_back_and_can_retry() -> TestResult {
 
     let bad = db
         .store
-        .apply_extraction(
+        .apply_commit(
             &c,
             episode_id,
             vec![
@@ -464,7 +862,7 @@ async fn failed_apply_extraction_rolls_back_and_can_retry() -> TestResult {
 
     let retry = db
         .store
-        .apply_extraction(
+        .apply_commit(
             &c,
             episode_id,
             vec![FactOp::Add(new_fact(
@@ -495,7 +893,7 @@ async fn store_refuses_facts_that_break_trust_or_scope_rules() -> TestResult {
     poisoned.trust = Trust::External;
     assert!(is_invalid(
         db.store
-            .apply_extraction(&c, external, vec![FactOp::Add(poisoned)])
+            .apply_commit(&c, external, vec![FactOp::Add(poisoned)])
             .await
     ));
 
@@ -517,9 +915,7 @@ async fn store_refuses_facts_that_break_trust_or_scope_rules() -> TestResult {
         reversed,
     ] {
         assert!(is_invalid(
-            db.store
-                .apply_extraction(&c, e, vec![FactOp::Add(bad)])
-                .await
+            db.store.apply_commit(&c, e, vec![FactOp::Add(bad)]).await
         ));
     }
     assert_eq!(count(&db, "SELECT count(*) FROM facts").await?, 0);
@@ -537,7 +933,7 @@ async fn agent_facts_can_go_active_only_in_agent_scopes() -> TestResult {
         planted.trust = Trust::Agent;
         assert!(is_invalid(
             db.store
-                .apply_extraction(&c, episode_id, vec![FactOp::Add(planted.clone())])
+                .apply_commit(&c, episode_id, vec![FactOp::Add(planted.clone())])
                 .await
         ));
         // The same statement through quarantine is accepted and stays out of recall.
@@ -573,7 +969,7 @@ async fn corroborate_links_a_second_source_without_raising_trust() -> TestResult
 
     let inserted = db
         .store
-        .apply_extraction(&c, second_source, vec![FactOp::Corroborate { fact_id }])
+        .apply_commit(&c, second_source, vec![FactOp::Corroborate { fact_id }])
         .await?;
     assert!(inserted.is_empty());
 
@@ -636,7 +1032,7 @@ async fn second_supersede_of_a_closed_fact_extends_the_chain() -> TestResult {
         new_fact(&scope, subject, "b", date(2021, 1)),
     )
     .await?;
-    // A job whose reconciliation read `first` before it closed.
+    // A commit that read `first` before it closed.
     let third = supersede(
         &db,
         &c,
@@ -774,11 +1170,12 @@ async fn as_of_and_known_at_follow_the_spec_filter() -> TestResult {
     // Retraction: hidden now, still visible to a read from before the retraction.
     let invalidated = db.store.invalidate_fact(&c, new, "wrong").await?;
     let retracted_at = invalidated.invalidated_at.expect("retraction time");
-    assert!(db
+    assert!(!db
         .store
         .current_facts_for_subject(&c, &scope, subject)
         .await?
-        .is_empty());
+        .iter()
+        .any(|fact| fact.id == new));
     let before_retraction = FactFilter {
         as_of: None,
         known_at: Some(retracted_at - chrono::Duration::microseconds(1)),
@@ -953,7 +1350,7 @@ async fn seed_selective(db: &Db, c: &RequestContext) -> Res<()> {
         let mut fact = new_fact(&rare, rare_subject, "rare fact", date(2020, 1));
         fact.embedding = noisy(10_000 + batch, 0.7);
         db.store
-            .apply_extraction(c, episode_id, vec![FactOp::Add(fact)])
+            .apply_commit(c, episode_id, vec![FactOp::Add(fact)])
             .await?;
 
         let episode_id = new_episode(db, c, &big, Trust::User).await?;
@@ -964,7 +1361,7 @@ async fn seed_selective(db: &Db, c: &RequestContext) -> Res<()> {
                 FactOp::Add(fact)
             })
             .collect();
-        db.store.apply_extraction(c, episode_id, ops).await?;
+        db.store.apply_commit(c, episode_id, ops).await?;
     }
     sqlx::query("ANALYZE facts").execute(&db.admin).await?;
     Ok(())
@@ -1121,48 +1518,6 @@ async fn text_search_ranks_filters_scope_and_treats_query_as_data() -> TestResul
     Ok(())
 }
 
-#[tokio::test]
-async fn pending_episode_search_returns_only_unprocessed_user_and_system() -> TestResult {
-    let db = db().await;
-    let c = ctx("t1");
-    let scope = user("u1");
-    let scopes = [scope.clone()];
-    let trusted = db
-        .store
-        .insert_episode(&c, episode(&scope, Trust::User, "the quick fox"))
-        .await?;
-    db.store
-        .insert_episode(&c, episode(&scope, Trust::External, "the quick poison"))
-        .await?;
-    db.store
-        .insert_episode(&c, episode(&scope, Trust::Agent, "the quick planted"))
-        .await?;
-    let system = db
-        .store
-        .insert_episode(&c, episode(&scope, Trust::System, "the quick system"))
-        .await?;
-    db.store
-        .insert_episode(&c, episode(&user("u2"), Trust::User, "the quick other"))
-        .await?;
-
-    let found = db
-        .store
-        .search_pending_episodes(&c, &scopes, "quick", 10)
-        .await?;
-    let ids: BTreeSet<Uuid> = found.iter().map(|s| s.episode.id).collect();
-    assert_eq!(ids, BTreeSet::from([trusted.id, system.id]));
-    assert!(found[0].score > 0.0);
-
-    db.store.apply_extraction(&c, trusted.id, vec![]).await?;
-    db.store.apply_extraction(&c, system.id, vec![]).await?;
-    assert!(db
-        .store
-        .search_pending_episodes(&c, &scopes, "quick", 10)
-        .await?
-        .is_empty());
-    Ok(())
-}
-
 // ---- Entities --------------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1196,14 +1551,20 @@ async fn entities_upsert_by_normalized_name_and_rank_by_similarity() -> TestResu
     assert_eq!(found[1].0.id, far.id);
     assert!(found[1].1.abs() < 1e-6);
 
-    db.store.add_entity_alias(&c, first.id, "Countess").await?;
-    db.store.add_entity_alias(&c, first.id, "Countess").await?;
+    db.store
+        .add_entity_alias(&c, first.id, "Countess", None)
+        .await?;
+    db.store
+        .add_entity_alias(&c, first.id, "Countess", None)
+        .await?;
     assert_eq!(
         db.store.get_entity(&c, first.id).await?.aliases,
         vec!["Countess".to_owned()]
     );
     assert!(is_not_found(
-        db.store.add_entity_alias(&c, Uuid::now_v7(), "x").await
+        db.store
+            .add_entity_alias(&c, Uuid::now_v7(), "x", None)
+            .await
     ));
     assert!(is_not_found(db.store.get_entity(&c, Uuid::now_v7()).await));
     Ok(())
@@ -1301,14 +1662,16 @@ async fn neighbors_applies_scope_and_time_filter_to_edges() -> TestResult {
         vec![old_edge]
     );
 
-    // Retraction removes an edge from the graph as well.
+    // Retraction removes an edge from the graph as well, and the edge it closed is current again.
     db.store.invalidate_fact(&c, new_edge, "wrong").await?;
-    assert!(db
+    let after = db
         .store
         .neighbors(&c, &scopes, a, 2, &FactFilter::default(), 5000)
-        .await?
-        .edges
-        .is_empty());
+        .await?;
+    assert_eq!(
+        after.edges.iter().map(|f| f.id).collect::<Vec<_>>(),
+        vec![old_edge]
+    );
 
     // A root outside the caller's scopes is indistinguishable from a missing one.
     assert!(is_not_found(
@@ -1340,7 +1703,7 @@ async fn purge_episode_keeps_shared_facts_and_removes_sole_sourced_ones() -> Tes
     lonely.object_id = Some(lonely_object);
     let inserted = db
         .store
-        .apply_extraction(
+        .apply_commit(
             &c,
             bad,
             vec![
@@ -1358,7 +1721,7 @@ async fn purge_episode_keeps_shared_facts_and_removes_sole_sourced_ones() -> Tes
 
     let good = new_episode(&db, &c, &scope, Trust::User).await?;
     db.store
-        .apply_extraction(
+        .apply_commit(
             &c,
             good,
             vec![FactOp::Corroborate {
@@ -1406,7 +1769,7 @@ async fn purge_episode_reopens_the_fact_a_poisoned_fact_had_closed() -> TestResu
     let bad = new_episode(&db, &c, &scope, Trust::User).await?;
     let lie = db
         .store
-        .apply_extraction(
+        .apply_commit(
             &c,
             bad,
             vec![FactOp::Supersede {
@@ -1442,7 +1805,7 @@ async fn purge_episode_in_the_middle_of_a_chain_relinks_it() -> TestResult {
     let bad = new_episode(&db, &c, &scope, Trust::User).await?;
     let middle = db
         .store
-        .apply_extraction(
+        .apply_commit(
             &c,
             bad,
             vec![FactOp::Supersede {
@@ -1481,7 +1844,7 @@ async fn corroborate(
 ) -> Res<Uuid> {
     let episode_id = new_episode(db, c, scope, trust).await?;
     db.store
-        .apply_extraction(c, episode_id, vec![FactOp::Corroborate { fact_id: id }])
+        .apply_commit(c, episode_id, vec![FactOp::Corroborate { fact_id: id }])
         .await?;
     Ok(episode_id)
 }
@@ -1575,7 +1938,7 @@ async fn requarantined_fact_reopens_what_it_closed_and_approval_restores_it() ->
     let good = new_episode(&db, &c, &scope, Trust::User).await?;
     let claim = db
         .store
-        .apply_extraction(
+        .apply_commit(
             &c,
             good,
             vec![FactOp::Supersede {
@@ -1618,7 +1981,7 @@ async fn requarantined_fact_in_the_middle_of_a_chain_leaves_it_linked() -> TestR
     let good = new_episode(&db, &c, &scope, Trust::User).await?;
     let middle = db
         .store
-        .apply_extraction(
+        .apply_commit(
             &c,
             good,
             vec![FactOp::Supersede {
@@ -1671,7 +2034,7 @@ async fn supersede_from_episode(
     let episode_id = new_episode(db, c, &new.scope, new.trust).await?;
     let ids = db
         .store
-        .apply_extraction(c, episode_id, vec![FactOp::Supersede { old_fact_id, new }])
+        .apply_commit(c, episode_id, vec![FactOp::Supersede { old_fact_id, new }])
         .await?;
     Ok((episode_id, ids[0]))
 }
@@ -1913,7 +2276,7 @@ async fn purge_keeps_a_fact_active_when_what_it_closed_does_not_outrank_it() -> 
         supersede_from_episode(&db, &c, first, system("second", date(2021, 1))).await?;
     let shared = new_episode(&db, &c, &scope, Trust::System).await?;
     db.store
-        .apply_extraction(
+        .apply_commit(
             &c,
             shared,
             vec![
@@ -1950,7 +2313,7 @@ async fn purge_applies_the_contradiction_rule_across_a_deleted_middle_fact() -> 
         supersede_from_episode(&db, &c, middle, system("claim", date(2022, 1))).await?;
     let shared = new_episode(&db, &c, &scope, Trust::System).await?;
     db.store
-        .apply_extraction(
+        .apply_commit(
             &c,
             shared,
             vec![
@@ -2080,7 +2443,7 @@ async fn supersede_that_reaches_an_equal_trust_head_closes_it() -> TestResult {
     Ok(())
 }
 
-/// A quarantined fact pending on `old`, as an extraction would leave it.
+/// A quarantined fact pending on `old`, as a commit would leave it.
 async fn pending_on(
     db: &Db,
     c: &RequestContext,
@@ -2168,7 +2531,7 @@ async fn approval_closes_a_moved_head_of_equal_trust_and_skips_a_retracted_one()
     Ok(())
 }
 
-// ---- Episode facts, entity lookup, edge limits and job release -------------------------------
+// ---- Episode facts, entity lookup and edge limits ---------------------------------------------
 
 #[tokio::test]
 async fn facts_for_episode_lists_created_and_corroborated_facts_in_any_status() -> TestResult {
@@ -2183,7 +2546,7 @@ async fn facts_for_episode_lists_created_and_corroborated_facts_in_any_status() 
     let episode_id = new_episode(&db, &c, &scope, Trust::User).await?;
     let inserted = db
         .store
-        .apply_extraction(
+        .apply_commit(
             &c,
             episode_id,
             vec![
@@ -2218,7 +2581,9 @@ async fn find_entity_matches_normalized_names_and_aliases_exactly() -> TestResul
     let (c, other) = (ctx("t1"), ctx("t2"));
     let scope = user("u1");
     let robert = entity(&db, &c, &scope, "Robert  Smith").await?;
-    db.store.add_entity_alias(&c, robert, "Bobby  S").await?;
+    db.store
+        .add_entity_alias(&c, robert, "Bobby  S", None)
+        .await?;
     let bob = entity(&db, &c, &scope, "Bob").await?;
 
     let find = |name: &'static str| {
@@ -2231,7 +2596,7 @@ async fn find_entity_matches_normalized_names_and_aliases_exactly() -> TestResul
     assert!(find("Rob").await?.is_none());
 
     // A name beats another entity's alias.
-    db.store.add_entity_alias(&c, robert, "Bob").await?;
+    db.store.add_entity_alias(&c, robert, "Bob", None).await?;
     assert_eq!(find("bob").await?.map(|e| e.id), Some(bob));
 
     let store = &db.store;
@@ -2303,55 +2668,6 @@ async fn neighbors_returns_the_newest_edges_up_to_the_limit() -> TestResult {
 }
 
 #[tokio::test]
-async fn release_job_gives_the_attempt_back_and_is_fenced() -> TestResult {
-    let db = db().await;
-    let c = ctx("t1");
-    new_episode(&db, &c, &user("u1"), Trust::User).await?;
-    let job = db.store.claim_job("w", 30).await?.expect("a job");
-    assert_eq!(job.attempts, 1);
-
-    let later = Utc::now() + chrono::Duration::hours(1);
-    assert!(!db.store.release_job(&job, "other", later).await?);
-    let mut stale = job.clone();
-    stale.attempts = 9;
-    assert!(!db.store.release_job(&stale, "w", later).await?);
-    assert_eq!(
-        count(
-            &db,
-            "SELECT count(*) FROM jobs WHERE status = 'running' AND attempts = 1"
-        )
-        .await?,
-        1
-    );
-
-    assert!(db.store.release_job(&job, "w", later).await?);
-    let row = sqlx::query("SELECT status, attempts, locked_by, locked_until, last_error FROM jobs")
-        .fetch_one(&db.admin)
-        .await?;
-    assert_eq!(row.try_get::<String, _>("status")?, "pending");
-    assert_eq!(row.try_get::<i32, _>("attempts")?, 0);
-    assert_eq!(row.try_get::<Option<String>, _>("locked_by")?, None);
-    assert_eq!(
-        row.try_get::<Option<DateTime<Utc>>, _>("locked_until")?,
-        None
-    );
-    assert_eq!(row.try_get::<Option<String>, _>("last_error")?, None);
-
-    // Not due until `run_after`, and a second release of the same claim does nothing.
-    assert!(db.store.claim_job("w", 30).await?.is_none());
-    assert!(!db.store.release_job(&job, "w", later).await?);
-
-    sqlx::query("UPDATE jobs SET run_after = now()")
-        .execute(&db.admin)
-        .await?;
-    let again = db.store.claim_job("w", 30).await?.expect("claimable");
-    assert_eq!(again.attempts, 1);
-    assert!(db.store.complete_job(&again, "w").await?);
-    assert!(!db.store.release_job(&again, "w", Utc::now()).await?);
-    Ok(())
-}
-
-#[tokio::test]
 async fn purge_scope_removes_everything_under_it_and_nothing_else() -> TestResult {
     let db = db().await;
     let c = ctx("t1");
@@ -2379,34 +2695,16 @@ async fn purge_scope_removes_everything_under_it_and_nothing_else() -> TestResul
     db.store
         .put_block(&c, "other", "persona", "p", 100, None)
         .await?;
-    let agent_session = db.store.create_session(&c, "bot", &doomed).await?;
-    db.store
-        .append_message(&c, agent_session.id, "user", json!([]))
-        .await?;
-    // The agent's session held under a user scope still belongs to the agent being purged.
-    let bot_user_session = db.store.create_session(&c, "bot", &kept).await?;
-    let other_session = db.store.create_session(&c, "other", &kept).await?;
 
     let report = db.store.purge_scope(&c, &doomed).await?;
     assert_eq!(report.facts_deleted, 1);
     assert_eq!(report.episodes_deleted, 1);
     assert_eq!(report.entities_deleted, 1);
 
-    assert!(is_not_found(
-        db.store.get_session(&c, agent_session.id).await
-    ));
-    assert!(is_not_found(
-        db.store.get_session(&c, bot_user_session.id).await
-    ));
     assert!(is_not_found(db.store.get_block(&c, "bot", "persona").await));
-    assert_eq!(
-        count(&db, "SELECT count(*) FROM session_messages").await?,
-        0
-    );
 
     db.store.get_fact(&c, kept_fact).await?;
     db.store.get_block(&c, "other", "persona").await?;
-    db.store.get_session(&c, other_session.id).await?;
     assert_eq!(
         count(
             &db,
@@ -2416,12 +2714,8 @@ async fn purge_scope_removes_everything_under_it_and_nothing_else() -> TestResul
         1
     );
 
-    // A user purge removes that user's sessions too, since their messages are the user's data.
     let report = db.store.purge_scope(&c, &kept).await?;
     assert_eq!(report.facts_deleted, 1);
-    assert!(is_not_found(
-        db.store.get_session(&c, other_session.id).await
-    ));
     Ok(())
 }
 
@@ -2544,284 +2838,6 @@ async fn concurrent_put_block_has_one_winner_per_version() -> TestResult {
     Ok(())
 }
 
-// ---- Sessions --------------------------------------------------------------------------------
-
-#[tokio::test]
-async fn concurrent_append_message_assigns_gapless_unique_seq() -> TestResult {
-    let db = db().await;
-    let c = ctx("t1");
-    let session = db.store.create_session(&c, "a", &user("u1")).await?;
-    let calls = (0..32).map(|i| {
-        let store = db.store.clone();
-        let c = c.clone();
-        let id = session.id;
-        tokio::spawn(async move { store.append_message(&c, id, "user", json!([i])).await })
-    });
-    let mut seqs = Vec::new();
-    for result in futures::future::join_all(calls).await {
-        seqs.push(result??.seq);
-    }
-    seqs.sort_unstable();
-    assert_eq!(seqs, (1..=32).collect::<Vec<i64>>());
-    assert_eq!(db.store.load_messages(&c, session.id).await?.len(), 32);
-    Ok(())
-}
-
-#[tokio::test]
-async fn compact_session_replaces_old_messages_with_a_summary() -> TestResult {
-    let db = db().await;
-    let c = ctx("t1");
-    let session = db.store.create_session(&c, "a", &user("u1")).await?;
-    assert_eq!(db.store.session_summary(&c, session.id).await?, None);
-    for i in 0..5 {
-        db.store
-            .append_message(&c, session.id, "user", json!([{ "n": i }]))
-            .await?;
-    }
-
-    db.store
-        .compact_session(&c, session.id, 3, "first three")
-        .await?;
-    let left = db.store.load_messages(&c, session.id).await?;
-    assert_eq!(left.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![4, 5]);
-    assert_eq!(left[0].content, json!([{ "n": 3 }]));
-    assert_eq!(
-        db.store.session_summary(&c, session.id).await?.as_deref(),
-        Some("first three")
-    );
-
-    // New messages continue the sequence.
-    let next = db
-        .store
-        .append_message(&c, session.id, "user", json!([]))
-        .await?;
-    assert_eq!(next.seq, 6);
-
-    assert!(is_invalid(
-        db.store.compact_session(&c, session.id, 2, "stale").await
-    ));
-    assert!(is_invalid(
-        db.store.compact_session(&c, session.id, 99, "future").await
-    ));
-    assert_eq!(
-        db.store.session_summary(&c, session.id).await?.as_deref(),
-        Some("first three")
-    );
-
-    let ghost = Uuid::now_v7();
-    assert!(is_not_found(
-        db.store.append_message(&c, ghost, "user", json!([])).await
-    ));
-    assert!(is_not_found(db.store.load_messages(&c, ghost).await));
-    assert!(is_not_found(db.store.session_summary(&c, ghost).await));
-    assert!(is_not_found(
-        db.store.compact_session(&c, ghost, 1, "x").await
-    ));
-    Ok(())
-}
-
-// ---- Jobs ------------------------------------------------------------------------------------
-
-#[tokio::test]
-async fn concurrent_claimers_never_get_the_same_job() -> TestResult {
-    let db = db().await;
-    let c = ctx("t1");
-    let scope = user("u1");
-    for _ in 0..10 {
-        new_episode(&db, &c, &scope, Trust::User).await?;
-    }
-    let claimers = (0..16).map(|i| {
-        let store = db.store.clone();
-        tokio::spawn(async move { store.claim_job(&format!("w{i}"), 60).await })
-    });
-    let mut claimed = Vec::new();
-    for result in futures::future::join_all(claimers).await {
-        if let Some(job) = result?? {
-            assert_eq!(job.attempts, 1);
-            claimed.push(job.id);
-        }
-    }
-    let unique: BTreeSet<Uuid> = claimed.iter().copied().collect();
-    assert_eq!(unique.len(), claimed.len());
-    assert!(!claimed.is_empty());
-
-    // SKIP LOCKED may leave a job for a later call, never hand it out twice.
-    while let Some(job) = db.store.claim_job("drain", 60).await? {
-        assert!(!unique.contains(&job.id));
-        claimed.push(job.id);
-    }
-    assert_eq!(claimed.len(), 10);
-    assert_eq!(claimed.iter().copied().collect::<BTreeSet<_>>().len(), 10);
-    Ok(())
-}
-
-#[tokio::test]
-async fn two_concurrent_claimers_of_one_job_produce_one_winner() -> TestResult {
-    let db = db().await;
-    new_episode(&db, &ctx("t1"), &user("u1"), Trust::User).await?;
-    let (a, b) = tokio::join!(db.store.claim_job("a", 60), db.store.claim_job("b", 60));
-    let winners = [a?, b?].into_iter().flatten().count();
-    assert_eq!(winners, 1);
-    Ok(())
-}
-
-#[tokio::test]
-async fn expired_lease_is_reclaimed_with_attempts_incremented() -> TestResult {
-    let db = db().await;
-    new_episode(&db, &ctx("t1"), &user("u1"), Trust::User).await?;
-    let first = db.store.claim_job("crashed", 1).await?.expect("job");
-    assert_eq!(first.attempts, 1);
-    assert!(db.store.claim_job("early", 60).await?.is_none());
-
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-    let second = db.store.claim_job("rescuer", 60).await?.expect("reclaimed");
-    assert_eq!(second.id, first.id);
-    assert_eq!(second.attempts, 2);
-    let holder: String = sqlx::query_scalar("SELECT locked_by FROM jobs WHERE id = $1")
-        .bind(second.id)
-        .fetch_one(&db.admin)
-        .await?;
-    assert_eq!(holder, "rescuer");
-    Ok(())
-}
-
-#[tokio::test]
-async fn fail_job_reschedules_then_goes_dead_at_the_limit() -> TestResult {
-    let db = db().await;
-    new_episode(&db, &ctx("t1"), &user("u1"), Trust::User).await?;
-    let job = db.store.claim_job("w", 60).await?.expect("job");
-
-    // Future run_after: not claimable yet.
-    let later = Utc::now() + chrono::Duration::hours(1);
-    assert!(db.store.fail_job(&job, "w", "boom\0", later, 2).await?);
-    assert!(db.store.claim_job("w", 60).await?.is_none());
-    let row = sqlx::query("SELECT status, last_error, locked_by FROM jobs WHERE id = $1")
-        .bind(job.id)
-        .fetch_one(&db.admin)
-        .await?;
-    assert_eq!(row.try_get::<String, _>("status")?, "pending");
-    assert_eq!(row.try_get::<String, _>("last_error")?, "boom");
-    assert_eq!(row.try_get::<Option<String>, _>("locked_by")?, None);
-
-    // Due again: claimed for attempt 2, which reaches the limit of 2 on failure.
-    let past = Utc::now() - chrono::Duration::hours(1);
-    sqlx::query("UPDATE jobs SET run_after = $1")
-        .bind(past)
-        .execute(&db.admin)
-        .await?;
-    let retry = db.store.claim_job("w", 60).await?.expect("retry");
-    assert_eq!(retry.attempts, 2);
-    assert!(db.store.fail_job(&retry, "w", "boom", past, 2).await?);
-    let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1")
-        .bind(job.id)
-        .fetch_one(&db.admin)
-        .await?;
-    assert_eq!(status, "dead");
-    assert!(db.store.claim_job("w", 60).await?.is_none());
-
-    Ok(())
-}
-
-async fn job_row(db: &Db, id: Uuid) -> Res<(String, Option<String>, Option<String>)> {
-    let row = sqlx::query("SELECT status, locked_by, last_error FROM jobs WHERE id = $1")
-        .bind(id)
-        .fetch_one(&db.admin)
-        .await?;
-    Ok((
-        row.try_get("status")?,
-        row.try_get("locked_by")?,
-        row.try_get("last_error")?,
-    ))
-}
-
-#[tokio::test]
-async fn completed_job_is_not_claimed_or_revived_by_a_late_failure() -> TestResult {
-    let db = db().await;
-    new_episode(&db, &ctx("t1"), &user("u1"), Trust::User).await?;
-    let job = db.store.claim_job("w", 60).await?.expect("job");
-    assert!(db.store.complete_job(&job, "w").await?);
-    assert!(db.store.claim_job("w", 60).await?.is_none());
-
-    // The same worker, after its claim is finished: every further call reports a lost claim.
-    assert!(!db.store.complete_job(&job, "w").await?);
-    assert!(!db.store.renew_job(&job, "w", 60).await?);
-    assert!(!db.store.fail_job(&job, "w", "late", Utc::now(), 5).await?);
-    assert_eq!(job_row(&db, job.id).await?.0, "done");
-    assert!(db.store.claim_job("w", 60).await?.is_none());
-    Ok(())
-}
-
-#[tokio::test]
-async fn stale_worker_cannot_touch_a_job_another_worker_reclaimed() -> TestResult {
-    let db = db().await;
-    new_episode(&db, &ctx("t1"), &user("u1"), Trust::User).await?;
-    let stale = db.store.claim_job("old", 1).await?.expect("job");
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-    let current = db.store.claim_job("new", 60).await?.expect("reclaimed");
-    assert_eq!(current.id, stale.id);
-
-    let later = Utc::now() + chrono::Duration::hours(1);
-    assert!(!db.store.complete_job(&stale, "old").await?);
-    assert!(!db.store.fail_job(&stale, "old", "x", later, 1).await?);
-    assert!(!db.store.renew_job(&stale, "old", 3600).await?);
-    assert_eq!(
-        job_row(&db, stale.id).await?,
-        ("running".to_owned(), Some("new".to_owned()), None)
-    );
-
-    // Each part of the fence holds alone: the current worker with the old attempts, and the old
-    // worker with the current attempts.
-    assert!(!db.store.complete_job(&stale, "new").await?);
-    assert!(!db.store.complete_job(&current, "old").await?);
-    assert!(!db.store.fail_job(&current, "old", "x", later, 1).await?);
-    assert_eq!(job_row(&db, stale.id).await?.0, "running");
-
-    assert!(db.store.complete_job(&current, "new").await?);
-    assert_eq!(job_row(&db, stale.id).await?.0, "done");
-    Ok(())
-}
-
-#[tokio::test]
-async fn same_worker_id_reclaiming_is_still_fenced_by_attempts() -> TestResult {
-    let db = db().await;
-    new_episode(&db, &ctx("t1"), &user("u1"), Trust::User).await?;
-    let stale = db.store.claim_job("w", 1).await?.expect("job");
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-    let current = db.store.claim_job("w", 60).await?.expect("reclaimed");
-    assert!(!db.store.complete_job(&stale, "w").await?);
-    assert!(db.store.complete_job(&current, "w").await?);
-    Ok(())
-}
-
-#[tokio::test]
-async fn renew_job_extends_the_lease_so_it_cannot_be_reclaimed() -> TestResult {
-    let db = db().await;
-    new_episode(&db, &ctx("t1"), &user("u1"), Trust::User).await?;
-    let job = db.store.claim_job("w", 1).await?.expect("job");
-    assert!(db.store.renew_job(&job, "w", 60).await?);
-    assert!(is_invalid(db.store.renew_job(&job, "w", 0).await));
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-    assert!(db.store.claim_job("other", 60).await?.is_none());
-    assert!(db.store.complete_job(&job, "w").await?);
-    Ok(())
-}
-
-#[tokio::test]
-async fn lost_claim_on_a_missing_job_is_false() -> TestResult {
-    let db = db().await;
-    let ghost = memoryos_core::Job {
-        id: Uuid::now_v7(),
-        tenant: "t1".into(),
-        kind: "extract".into(),
-        payload: json!({}),
-        attempts: 1,
-    };
-    assert!(!db.store.renew_job(&ghost, "w", 60).await?);
-    assert!(!db.store.complete_job(&ghost, "w").await?);
-    assert!(!db.store.fail_job(&ghost, "w", "x", Utc::now(), 5).await?);
-    Ok(())
-}
-
 // ---- API keys --------------------------------------------------------------------------------
 
 #[tokio::test]
@@ -2882,7 +2898,7 @@ async fn tenant_b_cannot_read_or_change_any_table_family_of_tenant_a() -> TestRe
     secret.object_id = Some(object);
     let fact = db
         .store
-        .apply_extraction(&a, source.id, vec![FactOp::Add(secret)])
+        .apply_commit(&a, source.id, vec![FactOp::Add(secret)])
         .await?[0];
     let pending = db
         .store
@@ -2894,17 +2910,10 @@ async fn tenant_b_cannot_read_or_change_any_table_family_of_tenant_a() -> TestRe
     held.status = FactStatus::Quarantined;
     let quarantined = db
         .store
-        .apply_extraction(&a, external, vec![FactOp::Add(held)])
+        .apply_commit(&a, external, vec![FactOp::Add(held)])
         .await?[0];
     db.store
         .put_block(&a, "bot", "persona", "secret", 100, None)
-        .await?;
-    let session = db.store.create_session(&a, "bot", &scope).await?;
-    db.store
-        .append_message(&a, session.id, "user", json!(["secret"]))
-        .await?;
-    db.store
-        .compact_session(&a, session.id, 0, "secret summary")
         .await?;
     db.store
         .invalidate_fact(&a, quarantined, "audit me")
@@ -2915,9 +2924,6 @@ async fn tenant_b_cannot_read_or_change_any_table_family_of_tenant_a() -> TestRe
     assert!(is_not_found(db.store.get_entity(&b, subject).await));
     assert!(is_not_found(db.store.get_fact(&b, fact).await));
     assert!(is_not_found(db.store.fact_history(&b, fact).await));
-    assert!(is_not_found(db.store.get_session(&b, session.id).await));
-    assert!(is_not_found(db.store.load_messages(&b, session.id).await));
-    assert!(is_not_found(db.store.session_summary(&b, session.id).await));
     assert!(is_not_found(db.store.get_block(&b, "bot", "persona").await));
     assert!(is_not_found(
         db.store.block_versions(&b, "bot", "persona").await
@@ -2941,11 +2947,6 @@ async fn tenant_b_cannot_read_or_change_any_table_family_of_tenant_a() -> TestRe
         .is_empty());
     assert!(db
         .store
-        .search_pending_episodes(&b, &scopes, "secret", 10)
-        .await?
-        .is_empty());
-    assert!(db
-        .store
         .similar_entities(&b, &scope, &axis(1), 10)
         .await?
         .is_empty());
@@ -2963,15 +2964,7 @@ async fn tenant_b_cannot_read_or_change_any_table_family_of_tenant_a() -> TestRe
     assert!(is_not_found(db.store.invalidate_fact(&b, fact, "x").await));
     assert!(is_not_found(db.store.purge_episode(&b, source.id).await));
     assert!(is_not_found(
-        db.store.add_entity_alias(&b, subject, "x").await
-    ));
-    assert!(is_not_found(
-        db.store
-            .append_message(&b, session.id, "user", json!([]))
-            .await
-    ));
-    assert!(is_not_found(
-        db.store.compact_session(&b, session.id, 0, "x").await
+        db.store.add_entity_alias(&b, subject, "x", None).await
     ));
     assert!(is_not_found(
         db.store
@@ -2979,7 +2972,7 @@ async fn tenant_b_cannot_read_or_change_any_table_family_of_tenant_a() -> TestRe
             .await
     ));
     assert!(is_not_found(
-        db.store.apply_extraction(&b, pending.id, vec![]).await
+        db.store.apply_commit(&b, pending.id, vec![]).await
     ));
 
     // Foreign keys bypass RLS, so these are stopped by the store's own tenant-scoped reads.
@@ -3000,7 +2993,7 @@ async fn tenant_b_cannot_read_or_change_any_table_family_of_tenant_a() -> TestRe
     ];
     for op in foreign_ops {
         assert!(is_not_found(
-            db.store.apply_extraction(&b, b_episode, vec![op]).await
+            db.store.apply_commit(&b, b_episode, vec![op]).await
         ));
     }
 
@@ -3022,11 +3015,6 @@ async fn tenant_b_cannot_read_or_change_any_table_family_of_tenant_a() -> TestRe
         Vec::<String>::new()
     );
     assert_eq!(
-        db.store.session_summary(&a, session.id).await?.as_deref(),
-        Some("secret summary")
-    );
-    assert_eq!(db.store.load_messages(&a, session.id).await?.len(), 1);
-    assert_eq!(
         db.store.get_fact(&a, quarantined).await?.status,
         FactStatus::Quarantined
     );
@@ -3043,10 +3031,6 @@ async fn row_level_security_holds_under_the_superuser_login() -> TestResult {
     let (_, fact) = add_fact(&db, &a, new_fact(&scope, subject, "f", date(2020, 1))).await?;
     db.store.invalidate_fact(&a, fact, "audit").await?;
     db.store.put_block(&a, "bot", "p", "x", 10, None).await?;
-    let session = db.store.create_session(&a, "bot", &scope).await?;
-    db.store
-        .append_message(&a, session.id, "user", json!([]))
-        .await?;
 
     let tables = [
         "episodes",
@@ -3055,8 +3039,6 @@ async fn row_level_security_holds_under_the_superuser_login() -> TestResult {
         "fact_sources",
         "blocks",
         "block_versions",
-        "sessions",
-        "session_messages",
         "audit_events",
     ];
     for table in tables {
@@ -3082,7 +3064,7 @@ async fn row_level_security_holds_under_the_superuser_login() -> TestResult {
         }
     }
 
-    // Cross-tenant insert is rejected by WITH CHECK, and jobs and api_keys are off limits.
+    // Cross-tenant insert is rejected by WITH CHECK, and api_keys is off limits.
     let mut tx = db.admin.begin().await?;
     sqlx::query("SET LOCAL ROLE memoryos_app")
         .execute(&mut *tx)
@@ -3091,7 +3073,8 @@ async fn row_level_security_holds_under_the_superuser_login() -> TestResult {
         .execute(&mut *tx)
         .await?;
     let forged = sqlx::query(
-        "INSERT INTO sessions (id, tenant, agent_id, scope) VALUES ($1, 'tenant-a', 'x', 'user:x')",
+        "INSERT INTO blocks (id, tenant, agent_id, label, content, max_chars, version) \
+         VALUES ($1, 'tenant-a', 'x', 'l', 'c', 10, 1)",
     )
     .bind(Uuid::now_v7())
     .execute(&mut *tx)
@@ -3103,27 +3086,25 @@ async fn row_level_security_holds_under_the_superuser_login() -> TestResult {
     assert_eq!(code.as_deref(), Some("42501"));
     tx.rollback().await?;
 
-    for table in ["jobs", "api_keys"] {
-        let mut tx = db.admin.begin().await?;
-        sqlx::query("SET LOCAL ROLE memoryos_app")
-            .execute(&mut *tx)
-            .await?;
-        let denied = sqlx::query(&format!("SELECT count(*) FROM {table}"))
-            .execute(&mut *tx)
-            .await;
-        assert!(denied.is_err(), "{table} must be denied");
-        tx.rollback().await?;
-    }
+    let mut tx = db.admin.begin().await?;
+    sqlx::query("SET LOCAL ROLE memoryos_app")
+        .execute(&mut *tx)
+        .await?;
+    let denied = sqlx::query("SELECT count(*) FROM api_keys")
+        .execute(&mut *tx)
+        .await;
+    assert!(denied.is_err(), "api_keys must be denied");
+    tx.rollback().await?;
     Ok(())
 }
 
-/// Calls both search functions as memoryos_app. `tenant = None` leaves app.tenant unset.
+/// Calls the search function as memoryos_app. `tenant = None` leaves app.tenant unset.
 async fn search_ids_as_app(
     pool: &PgPool,
     tenant: Option<&str>,
     scope: &str,
     word: &str,
-) -> Res<(Vec<Uuid>, Vec<Uuid>)> {
+) -> Res<Vec<Uuid>> {
     let mut tx = pool.begin().await?;
     sqlx::query("SET LOCAL ROLE memoryos_app")
         .execute(&mut *tx)
@@ -3141,18 +3122,12 @@ async fn search_ids_as_app(
             .bind(word)
             .fetch_all(&mut *tx)
             .await?;
-    let episodes: Vec<Uuid> =
-        sqlx::query_scalar("SELECT id FROM search_pending_episode_ids($1, $2, 10)")
-            .bind(&scopes)
-            .bind(word)
-            .fetch_all(&mut *tx)
-            .await?;
     tx.rollback().await?;
-    Ok((facts, episodes))
+    Ok(facts)
 }
 
-/// A fact and a pending episode for `a`, both containing "secret". Returns (fact, episode).
-async fn seed_secret(store: &PgStore, a: &RequestContext, scope: &Scope) -> Res<(Uuid, Uuid)> {
+/// A fact for `a` containing "secret".
+async fn seed_secret(store: &PgStore, a: &RequestContext, scope: &Scope) -> Res<Uuid> {
     let subject = store
         .upsert_entity(
             a,
@@ -3171,7 +3146,7 @@ async fn seed_secret(store: &PgStore, a: &RequestContext, scope: &Scope) -> Res<
         .await?
         .id;
     let fact = store
-        .apply_extraction(
+        .apply_commit(
             a,
             source,
             vec![FactOp::Add(new_fact(
@@ -3182,11 +3157,7 @@ async fn seed_secret(store: &PgStore, a: &RequestContext, scope: &Scope) -> Res<
             ))],
         )
         .await?[0];
-    let pending = store
-        .insert_episode(a, episode(scope, Trust::User, "secret pending"))
-        .await?
-        .id;
-    Ok((fact, pending))
+    Ok(fact)
 }
 
 #[tokio::test]
@@ -3194,20 +3165,20 @@ async fn search_functions_return_nothing_for_another_or_unset_tenant() -> TestRe
     let db = db().await;
     let a = ctx("tenant-a");
     let scope = user("u1");
-    let (fact, pending) = seed_secret(&db.store, &a, &scope).await?;
+    let fact = seed_secret(&db.store, &a, &scope).await?;
     let scope_text = scope.to_string();
 
     let own = search_ids_as_app(&db.admin, Some("tenant-a"), &scope_text, "secret").await?;
-    assert_eq!(own, (vec![fact], vec![pending]));
+    assert_eq!(own, vec![fact]);
 
     for tenant in [Some("tenant-b"), Some(""), Some("%"), None] {
         let seen = search_ids_as_app(&db.admin, tenant, &scope_text, "secret").await?;
-        assert_eq!(seen, (vec![], vec![]), "tenant {tenant:?}");
+        assert_eq!(seen, Vec::<Uuid>::new(), "tenant {tenant:?}");
     }
 
     // Through the store as well, with tenant B holding its own row under the same scope name.
     let b = ctx("tenant-b");
-    let (b_fact, b_pending) = seed_secret(&db.store, &b, &scope).await?;
+    let b_fact = seed_secret(&db.store, &b, &scope).await?;
     let filter = FactFilter::default();
     let scopes = [scope];
     let facts = db
@@ -3217,14 +3188,6 @@ async fn search_functions_return_nothing_for_another_or_unset_tenant() -> TestRe
     assert_eq!(
         facts.iter().map(|s| s.fact.id).collect::<Vec<_>>(),
         vec![b_fact]
-    );
-    let episodes = db
-        .store
-        .search_pending_episodes(&b, &scopes, "secret", 10)
-        .await?;
-    assert_eq!(
-        episodes.iter().map(|s| s.episode.id).collect::<Vec<_>>(),
-        vec![b_pending]
     );
     Ok(())
 }
@@ -3275,14 +3238,14 @@ async fn text_search_keeps_time_and_status_filters_through_the_function() -> Tes
     };
     assert_eq!(search(before).await?, Vec::<Uuid>::new());
     db.store.invalidate_fact(&c, new, "wrong").await?;
-    assert_eq!(search(FactFilter::default()).await?, Vec::<Uuid>::new());
+    assert_eq!(search(FactFilter::default()).await?, vec![old]);
     Ok(())
 }
 
 /// The production shape: a non-superuser login owns the tables and is granted memoryos_app. A
 /// superuser only prepares the role and the extension, as a managed database would.
 #[tokio::test]
-async fn non_superuser_owner_login_runs_migration_tenancy_search_and_jobs() -> TestResult {
+async fn non_superuser_owner_login_runs_migration_tenancy_and_search() -> TestResult {
     let server = server_url();
     // The template migration created memoryos_app, which is cluster-wide.
     let bootstrap = connect_with_retry(&format!("{server}/postgres")).await;
@@ -3323,7 +3286,7 @@ async fn non_superuser_owner_login_runs_migration_tenancy_search_and_jobs() -> T
     let scope = user("u1");
     let scopes = [scope.clone()];
     let filter = FactFilter::default();
-    let (fact, pending) = seed_secret(&store, &a, &scope).await?;
+    let fact = seed_secret(&store, &a, &scope).await?;
 
     let found = store
         .search_facts_text(&a, &scopes, "secret", &filter, 10)
@@ -3331,22 +3294,13 @@ async fn non_superuser_owner_login_runs_migration_tenancy_search_and_jobs() -> T
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].fact.id, fact);
     assert!(found[0].score > 0.0);
-    let found = store
-        .search_pending_episodes(&a, &scopes, "secret", 10)
-        .await?;
-    assert_eq!(found.len(), 1);
-    assert_eq!(found[0].episode.id, pending);
 
     assert!(store
         .search_facts_text(&b, &scopes, "secret", &filter, 10)
         .await?
         .is_empty());
-    assert!(store
-        .search_pending_episodes(&b, &scopes, "secret", 10)
-        .await?
-        .is_empty());
     assert!(is_not_found(store.get_fact(&b, fact).await));
-    let nothing = (vec![], vec![]);
+    let nothing = Vec::<Uuid>::new();
     let scope_text = scope.to_string();
     assert_eq!(
         search_ids_as_app(&owner, Some("tenant-b"), &scope_text, "secret").await?,
@@ -3365,11 +3319,9 @@ async fn non_superuser_owner_login_runs_migration_tenancy_search_and_jobs() -> T
             .await?;
     assert!(direct.is_empty());
 
-    // Writes, audit, enqueue_job and the job methods all work under this login.
+    // Writes and audit work under this login.
     store.invalidate_fact(&a, fact, "audit").await?;
     store.put_block(&a, "bot", "persona", "p", 10, None).await?;
-    let job = store.claim_job("w", 60).await?.expect("job");
-    assert!(store.complete_job(&job, "w").await?);
     let report = store.purge_scope(&a, &scope).await?;
     assert_eq!(report.facts_deleted, 1);
     Ok(())
@@ -3419,5 +3371,80 @@ async fn quarantine_prefixes_match_literally_and_stay_in_the_tenant() -> TestRes
     );
     assert!(listed(vec![], vec![], "a").await?.is_empty());
     assert!(listed(vec![], vec![""], "b").await?.is_empty());
+    Ok(())
+}
+
+// ---- Text search candidate cap -----------------------------------------------------------------
+
+/// The cap on ranked candidates applies after every filter, so 1100 newer matches that the reader
+/// may not see cannot push out the one match it may see.
+#[tokio::test]
+async fn the_text_candidate_cap_applies_after_isolation_and_time_filters() -> TestResult {
+    let db = db().await;
+    let c = ctx("a");
+    let scope = user("capped");
+    let subject = entity(&db, &c, &scope, "Ada").await?;
+    let (_, visible) = add_fact(
+        &db,
+        &c,
+        new_fact(&scope, subject, "common word", date(2020, 1)),
+    )
+    .await?;
+
+    // All match the word: other tenant, other scope, not yet valid at the read time, closed by then.
+    let other = ctx("b");
+    let other_subject = entity(&db, &other, &scope, "Ada").await?;
+    for (tenant, scope_text, entity_id, from, to) in [
+        ("b", "user:capped", other_subject, "2020-01-01", None),
+        ("a", "user:elsewhere", subject, "2020-01-01", None),
+        ("a", "user:capped", subject, "2023-01-01", None),
+        (
+            "a",
+            "user:capped",
+            subject,
+            "2020-01-01",
+            Some("2020-01-02"),
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO facts (id, tenant, scope, subject_id, predicate, statement, embedding, \
+                 trust, status, valid_from, valid_to) \
+             SELECT gen_random_uuid(), $1, $2, $3, 'says', 'common word', \
+                 (SELECT embedding FROM facts LIMIT 1), 'user', 'active', $4::timestamptz, \
+                 $5::timestamptz \
+             FROM generate_series(1, 1100)",
+        )
+        .bind(tenant)
+        .bind(scope_text)
+        .bind(entity_id)
+        .bind(from)
+        .bind(to)
+        .execute(&db.admin)
+        .await?;
+    }
+    // Sorted above every other id, so a cap applied before the filters would see only these.
+    sqlx::query("UPDATE facts SET id = ('ffffffff' || substr(id::text, 9))::uuid WHERE id <> $1")
+        .bind(visible)
+        .execute(&db.admin)
+        .await?;
+
+    let read_at = at(date(2022, 1));
+    let found = db
+        .store
+        .search_facts_text(&c, std::slice::from_ref(&scope), "common", &read_at, 50)
+        .await?;
+    assert_eq!(
+        found.iter().map(|hit| hit.fact.id).collect::<Vec<_>>(),
+        [visible]
+    );
+
+    // A word in more facts than the cap returns from the newest ones, up to the limit asked for.
+    let now = FactFilter::default();
+    let many = db
+        .store
+        .search_facts_text(&c, std::slice::from_ref(&scope), "common", &now, 50)
+        .await?;
+    assert_eq!(many.len(), 50);
+    assert!(many.iter().all(|hit| hit.fact.id != visible));
     Ok(())
 }

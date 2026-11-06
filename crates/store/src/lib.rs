@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use memoryos_core::{Error, Fact, RequestContext, Result, Scope};
+use memoryos_core::{Error, Fact, RequestContext, Result, Scope, Trust};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Postgres, Transaction};
 
@@ -66,6 +66,25 @@ impl PgStore {
         let result = found.iter().map(rows::fact).collect::<Result<_>>()?;
         tx.commit().await.map_err(db)?;
         Ok(result)
+    }
+
+    /// The highest trust among the scope's facts and episodes, `None` if it holds neither.
+    pub async fn highest_trust_in_scope(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+    ) -> Result<Option<Trust>> {
+        let mut tx = self.tenant_tx(ctx).await?;
+        let trusts: Vec<String> = sqlx::query_scalar(
+            "SELECT trust FROM facts WHERE scope = $1 \
+             UNION SELECT trust FROM episodes WHERE scope = $1",
+        )
+        .bind(scope.to_string())
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        facts::highest_trust(trusts)
     }
 
     pub async fn migrate(&self) -> Result<()> {

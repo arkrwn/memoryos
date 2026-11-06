@@ -1,4 +1,4 @@
-//! Entity resolution (SPEC section 3b), shared by both write modes.
+//! Entity resolution (SPEC section 3).
 
 use std::collections::HashMap;
 
@@ -101,18 +101,22 @@ pub(crate) async fn embed_and_resolve(
     })
 }
 
-/// Runs after `apply_extraction`, because only then is each fact's status final. An alias changes
-/// how a shared entity resolves for everyone, so a name is kept only when this episode has an active
-/// fact on that entity. A source whose facts are all quarantined earns none, and its link to a
-/// fact it corroborated does not count. A failure here costs an alias and not the commit, which has
-/// already happened, so it is logged.
+/// Runs after `apply_commit`, because only then is each fact's status final. An alias changes
+/// how a shared entity resolves for everyone, so a name is kept only when this episode created an
+/// active fact on that entity: `created` is what `apply_commit` returned, which leaves out
+/// facts the episode only corroborated. A source whose facts are all quarantined earns none. A
+/// failure here costs an alias and not the commit, which has already happened, so it is logged.
 pub(crate) async fn add_earned_aliases(
     store: &dyn MemoryStore,
     ctx: &RequestContext,
     episode: &Episode,
     merges: Vec<Merge>,
+    created: &[Uuid],
 ) {
-    if merges.is_empty() || source_requires_quarantine(&episode.scope, episode.trust) {
+    if merges.is_empty()
+        || created.is_empty()
+        || source_requires_quarantine(&episode.scope, episode.trust)
+    {
         return;
     }
     let facts = match store.facts_for_episode(ctx, episode.id).await {
@@ -124,12 +128,13 @@ pub(crate) async fn add_earned_aliases(
     };
     for merge in merges {
         let earned = facts.iter().any(|fact| {
-            fact.status == FactStatus::Active
+            created.contains(&fact.id)
+                && fact.status == FactStatus::Active
                 && (fact.subject_id == merge.entity_id || fact.object_id == Some(merge.entity_id))
         });
         if earned {
             if let Err(err) = store
-                .add_entity_alias(ctx, merge.entity_id, &merge.alias)
+                .add_entity_alias(ctx, merge.entity_id, &merge.alias, Some(episode.id))
                 .await
             {
                 tracing::warn!(entity_id = %merge.entity_id, error = %err, "could not add alias");

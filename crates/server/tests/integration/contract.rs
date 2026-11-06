@@ -71,7 +71,7 @@ fn served_routes_match_the_openapi_file_exactly() {
 /// `served_routes` is only a list. This proves the router really answers each one.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_documented_operation_reaches_a_handler() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let key = server.root("contract").await;
     for operation in operations() {
         let path = operation

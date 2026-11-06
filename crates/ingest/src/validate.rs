@@ -1,4 +1,4 @@
-//! Text checks and normalization shared by both write modes.
+//! Text checks and normalization for commits.
 
 /// Maximum episode content, in characters (SPEC section 9).
 pub(crate) const MAX_CONTENT_CHARS: usize = 100_000;

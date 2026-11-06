@@ -1,33 +1,13 @@
-# Real-model and real-host results
+# Real-host results
 
 Date: 2026-11-06. Commit under test: `89e81e0`. Task: T9b.
 
-**Status: neither part completed. The staleness and poisoning gates are not proven, and nothing here
-counts as a pass.**
+**Status: not completed. Nothing here counts as a pass, and it says nothing about the staleness and
+poisoning gates.**
 
-## Part A: eval gates against OpenAI
+## Real agent hosts
 
-Not run. No recall@5, MRR, staleness rate or poisoning number exists, because no case was executed.
-
-| Item | Value |
-|---|---|
-| Blocker | Every OpenAI call on the approved key returns HTTP 429 |
-| Exact error | `credit_balance_exhausted`: "You have no credits remaining. Add credits to continue using the API" |
-| Models probed | `gpt-5.1`, `gpt-5-mini`, and `text-embedding-3-small` at 384 dims |
-| When | Before the DNS outage (16:33 UTC) and after it (18:23 and 18:43 UTC) |
-| Model availability | Unknown. A 429 for credit does not say whether `gpt-5.1` exists for this key |
-| Tokens used | 0 |
-| Cost | US$0 (no request was accepted) |
-| 3-case estimate | Not possible without a working key |
-| Gates | Staleness: not measured. Poisoning: not measured |
-| Changes to `crates/ingest` | None, because no real-model failure was observed to justify one |
-
-To run it: add credit to the key, or supply another approved key, then repeat the brief. The model
-probe takes seconds.
-
-## Part B: real agent hosts
-
-Server: host mode, real local embedder, compose project `memoryos-t9b-host`, image built from `89e81e0`.
+Server: real local embedder, compose project `memoryos-t9b-host`, image built from `89e81e0`.
 
 ### Claude Code 2.1.319
 
@@ -50,7 +30,7 @@ Project-scoped install, with config, data and cache directories inside the temp 
 | `opencode.json` format | Accepted, and normalized to `mcp.servers.memoryos` by `opencode debug config` |
 | `opencode mcp list` | Prints `No MCP servers configured` while the same config connects at run time. Also printed for a hand-written v2 shape, so this is not specific to the installed file. Cause not traced |
 | **Installed plugin** | **Fails to load.** See below |
-| Model turn | Not reached: `credit_balance_exhausted`. No tool was called by a model |
+| Model turn | Not reached: the account behind OpenCode's own model had no credit. No tool was called by a model |
 
 The plugin error, from `.opencode/plugins/memoryos.ts`:
 
@@ -81,7 +61,7 @@ No host consumed this output, so whether a real host accepts `hook stop` output 
 
 ### Server behaviour over REST, using curl
 
-This is not a host-mode loop through a model.
+This is not a loop through a model.
 
 | Write | Result |
 |---|---|

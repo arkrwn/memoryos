@@ -2,7 +2,7 @@
 //! depends on nothing server-side.
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
-use memoryos_core::{FactStatus, Scope, ScoredEpisode, ScoredFact, Trust};
+use memoryos_core::{FactStatus, Scope, ScoredFact};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -15,57 +15,6 @@ pub fn date(year: i32, month: u32, day: u32) -> DateTime<Utc> {
         .and_then(|date| date.and_hms_opt(0, 0, 0))
         .expect("a valid calendar date");
     Utc.from_utc_datetime(&naive)
-}
-
-/// Input to `MemoryOs::remember`. The stored row comes back as `StoredEpisode`.
-#[derive(Debug, Clone)]
-pub struct Episode {
-    pub source: String,
-    pub trust: Trust,
-    pub content: String,
-    pub occurred_at: Option<DateTime<Utc>>,
-    pub metadata: serde_json::Value,
-    pub idempotency_key: Option<String>,
-}
-
-impl Episode {
-    /// A chat message from the user, with `user` trust. The key must allow that trust.
-    pub fn message(content: impl Into<String>) -> Self {
-        Self {
-            source: "message".to_owned(),
-            trust: Trust::User,
-            content: content.into(),
-            occurred_at: None,
-            metadata: serde_json::json!({}),
-            idempotency_key: None,
-        }
-    }
-
-    pub fn source(mut self, source: impl Into<String>) -> Self {
-        self.source = source.into();
-        self
-    }
-
-    pub fn trust(mut self, trust: Trust) -> Self {
-        self.trust = trust;
-        self
-    }
-
-    pub fn occurred_at(mut self, at: DateTime<Utc>) -> Self {
-        self.occurred_at = Some(at);
-        self
-    }
-
-    pub fn metadata(mut self, metadata: serde_json::Value) -> Self {
-        self.metadata = metadata;
-        self
-    }
-
-    /// Makes a retry of this write safe: a repeated key returns the first episode.
-    pub fn idempotency_key(mut self, key: impl Into<String>) -> Self {
-        self.idempotency_key = Some(key.into());
-        self
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,7 +132,6 @@ pub struct CommittedFact {
 #[derive(Debug, Clone, Deserialize)]
 pub struct RecallResponse {
     pub facts: Vec<ScoredFact>,
-    pub pending_episodes: Vec<ScoredEpisode>,
 }
 
 /// Input to `MemoryOs::put_block`.
@@ -216,15 +164,6 @@ impl PutBlock {
         self.max_chars = Some(max_chars);
         self
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct TurnResult {
-    pub text: String,
-    pub truncated: bool,
-    pub tool_calls: u32,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
 }
 
 #[cfg(test)]
@@ -263,12 +202,5 @@ mod tests {
                 }],
             })
         );
-    }
-
-    #[test]
-    fn episode_message_defaults_to_user_trust() {
-        let episode = Episode::message("hi").idempotency_key("k");
-        assert_eq!(episode.trust, Trust::User);
-        assert_eq!(episode.idempotency_key.as_deref(), Some("k"));
     }
 }

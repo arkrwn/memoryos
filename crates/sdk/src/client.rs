@@ -5,8 +5,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use memoryos_core::{
-    Block, BlockVersion, Entity, Episode as StoredEpisode, Fact, GraphNeighborhood, PurgeReport,
-    Scope, ScoredFact, Session, SessionMessage,
+    Block, BlockVersion, Entity, Episode, Fact, GraphNeighborhood, PurgeReport, Scope, ScoredFact,
 };
 use reqwest::header::RETRY_AFTER;
 use reqwest::{Client, Method, RequestBuilder, Response, StatusCode, Url};
@@ -16,10 +15,9 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::error::{from_response, Error, Result};
-use crate::types::{Commit, CommitResponse, Episode, PutBlock, RecallResponse, TurnResult};
+use crate::types::{Commit, CommitResponse, PutBlock, RecallResponse};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_TURN_TIMEOUT: Duration = Duration::from_secs(310);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_READ_RETRIES: u32 = 2;
 const RETRY_BASE: Duration = Duration::from_millis(200);
@@ -28,10 +26,8 @@ const DEFAULT_RECALL_LIMIT: i64 = 10;
 
 #[derive(Debug, Clone)]
 pub struct Options {
-    /// Limit for one attempt of any call except a session turn.
+    /// Limit for one attempt of any call.
     pub timeout: Duration,
-    /// Limit for a session turn, which makes several model calls on the server.
-    pub turn_timeout: Duration,
     /// Extra attempts for reads. Writes never retry.
     pub read_retries: u32,
 }
@@ -40,7 +36,6 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             timeout: DEFAULT_TIMEOUT,
-            turn_timeout: DEFAULT_TURN_TIMEOUT,
             read_retries: DEFAULT_READ_RETRIES,
         }
     }
@@ -140,22 +135,7 @@ impl MemoryOs {
 
     // ---- Episodes -----------------------------------------------------------------------------
 
-    /// Stores an episode for extraction. Worker mode only.
-    pub async fn remember(&self, scope: Scope, episode: Episode) -> Result<StoredEpisode> {
-        let body = json!({
-            "scope": scope,
-            "source": episode.source,
-            "trust": episode.trust,
-            "content": episode.content,
-            "occurred_at": episode.occurred_at,
-            "metadata": episode.metadata,
-            "idempotency_key": episode.idempotency_key,
-        });
-        let request = self.request(Method::POST, &["v1", "episodes"]).json(&body);
-        self.send(request, Retry::No).await
-    }
-
-    pub async fn get_episode(&self, id: Uuid) -> Result<StoredEpisode> {
+    pub async fn get_episode(&self, id: Uuid) -> Result<Episode> {
         let request = self.request(Method::GET, &["v1", "episodes", &id.to_string()]);
         self.send(request, Retry::Yes).await
     }
@@ -317,40 +297,6 @@ impl MemoryOs {
         );
         let response: Versions = self.send(request, Retry::Yes).await?;
         Ok(response.versions)
-    }
-
-    // ---- Sessions: worker mode only -----------------------------------------------------------
-
-    pub async fn create_session(&self, agent_id: &str, scope: Scope) -> Result<Session> {
-        let request = self
-            .request(Method::POST, &["v1", "agents", agent_id, "sessions"])
-            .json(&json!({"scope": scope}));
-        self.send(request, Retry::No).await
-    }
-
-    pub async fn session_messages(&self, session_id: Uuid) -> Result<Vec<SessionMessage>> {
-        let request = self.request(
-            Method::GET,
-            &["v1", "sessions", &session_id.to_string(), "messages"],
-        );
-        let response: Messages = self.send(request, Retry::Yes).await?;
-        Ok(response.messages)
-    }
-
-    /// Runs one agent turn. Takes as long as the model does, up to `Options::turn_timeout`.
-    pub async fn send_message(
-        &self,
-        session_id: Uuid,
-        text: impl Into<String>,
-    ) -> Result<TurnResult> {
-        let request = self
-            .request(
-                Method::POST,
-                &["v1", "sessions", &session_id.to_string(), "messages"],
-            )
-            .json(&json!({"text": text.into()}))
-            .timeout(self.options.turn_timeout);
-        self.send(request, Retry::No).await
     }
 
     // ---- Users --------------------------------------------------------------------------------
@@ -522,11 +468,6 @@ struct Blocks {
 #[derive(Deserialize)]
 struct Versions {
     versions: Vec<BlockVersion>,
-}
-
-#[derive(Deserialize)]
-struct Messages {
-    messages: Vec<SessionMessage>,
 }
 
 #[cfg(test)]

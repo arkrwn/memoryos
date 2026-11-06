@@ -1,5 +1,5 @@
 //! Commands that talk to a running server through `MEMORYOS_URL` and `MEMORYOS_API_KEY`, the agent
-//! hooks, and the hook installer. See `docs/SPEC.md` section 14.
+//! hooks, and the hook installer. See `docs/SPEC.md` section 3.
 //!
 //! The server binary flattens [`Command`] into its own command line and calls [`run`].
 

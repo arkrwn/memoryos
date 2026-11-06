@@ -1,16 +1,13 @@
 //! Every operation of the API, with its authorization. REST handlers and MCP tools both call these,
-//! so the two surfaces cannot disagree on a check (SPEC sections 6 and 14).
+//! so the two surfaces cannot disagree on a check (SPEC sections 3 and 6).
 
 use std::sync::Arc;
 use std::time::Instant;
 
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use memoryos_agent::{AgentRuntime, MemoryRecall, TurnResult};
 use memoryos_core::{
     Block, BlockVersion, Entity, Episode, Fact, FactFilter, GraphNeighborhood, MemoryStore,
-    NewEpisode, PurgeReport, RequestContext, Result, Scope, ScoredFact, Session, SessionMessage,
-    Trust,
+    PurgeReport, Scope, ScoredFact, Trust,
 };
 use memoryos_ingest::{CommitRequest, CommitResponse, HostCommitter};
 use memoryos_retrieve::{RecallRequest, RecallResponse, Retriever};
@@ -19,12 +16,11 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::auth::Caller;
-use crate::config::Mode;
 use crate::error::{ApiError, ApiResult};
 use crate::telemetry::Metrics;
 
-const MAX_CONTENT_CHARS: usize = 100_000;
 const DEFAULT_MAX_BLOCK_CHARS: i32 = 2000;
+const MAX_BLOCK_CHARS: i32 = 100_000;
 const DEFAULT_CANDIDATES: i64 = 10;
 const DEFAULT_QUARANTINE_PAGE: i64 = 50;
 const MAX_QUARANTINE_PAGE: i64 = 200;
@@ -58,48 +54,11 @@ pub struct Services {
     pub pg: PgStore,
     pub retriever: Arc<Retriever>,
     pub committer: HostCommitter,
-    /// `Some` exactly in worker mode, the only mode that has an LLM.
-    pub runtime: Option<AgentRuntime>,
-    pub mode: Mode,
     pub metrics: Metrics,
 }
 
 impl Services {
     // Episodes
-
-    pub async fn create_episode(&self, caller: &Caller, new: NewEpisode) -> ApiResult<Episode> {
-        if self.mode == Mode::Host {
-            return Err(ApiError::invalid_input(
-                "episodes need extraction, which host mode does not run: use POST /v1/commits",
-            ));
-        }
-        caller.require_scope(&new.scope)?;
-        if new.trust > caller.key.max_trust {
-            return Err(ApiError::forbidden(format!(
-                "trust {} is above this key's maximum of {}",
-                new.trust.as_str(),
-                caller.key.max_trust.as_str()
-            )));
-        }
-        if new.content.chars().count() > MAX_CONTENT_CHARS {
-            return Err(ApiError::invalid_input(format!(
-                "content exceeds {MAX_CONTENT_CHARS} characters"
-            )));
-        }
-        if new.idempotency_key.as_deref().is_some_and(is_blank) {
-            return Err(ApiError::invalid_input("idempotency_key must not be blank"));
-        }
-        let requested_scope = new.scope.clone();
-        let episode = self.store.insert_episode(&caller.ctx, new).await?;
-        // A key is unique per tenant, so a replay can return a row from a scope this caller named
-        // no right to. The check above covers only the scope in the request.
-        if episode.scope != requested_scope {
-            return Err(ApiError::invalid_input(
-                "idempotency_key was already used for a different request",
-            ));
-        }
-        Ok(episode)
-    }
 
     pub async fn get_episode(&self, caller: &Caller, id: Uuid) -> ApiResult<Episode> {
         let episode = self.store.get_episode(&caller.ctx, id).await?;
@@ -109,7 +68,10 @@ impl Services {
 
     pub async fn purge_episode(&self, caller: &Caller, id: Uuid) -> ApiResult<PurgeReport> {
         caller.require_admin()?;
-        self.get_episode(caller, id).await?;
+        // Episode trust covers what the purge can touch: a fact's trust is at most that of its
+        // highest source, and a fact with another source only loses this link.
+        let episode = self.get_episode(caller, id).await?;
+        require_trust(caller, "episode", episode.trust)?;
         Ok(self.store.purge_episode(&caller.ctx, id).await?)
     }
 
@@ -169,12 +131,12 @@ impl Services {
         reason: &str,
     ) -> ApiResult<Fact> {
         let fact = self.get_fact(caller, id).await?;
-        if fact.trust > caller.key.max_trust {
-            return Err(ApiError::forbidden(format!(
-                "fact trust {} is above this key's maximum of {}",
-                fact.trust.as_str(),
-                caller.key.max_trust.as_str()
-            )));
+        require_trust(caller, "fact", fact.trust)?;
+        // A key that cannot add here without review must not delete here by retraction either.
+        if caller.key.max_trust < Trust::User && !matches!(fact.scope, Scope::Agent(_)) {
+            return Err(ApiError::forbidden(
+                "invalidating a fact in a user or shared scope requires user trust",
+            ));
         }
         Ok(self.store.invalidate_fact(&caller.ctx, id, reason).await?)
     }
@@ -239,17 +201,25 @@ impl Services {
         Ok(facts)
     }
 
+    /// Approving closes the fact it is pending on, so the key must reach that fact's trust too.
     /// When the chain moved to a higher-trust head, the store holds the fact and its `InvalidInput`
-    /// message tells the caller to review again (SPEC section 5).
+    /// message tells the caller to review again, and that review is checked here against the new
+    /// head (SPEC section 5).
     pub async fn approve(&self, caller: &Caller, id: Uuid) -> ApiResult<Fact> {
         caller.require_admin()?;
-        self.get_fact(caller, id).await?;
+        let fact = self.get_fact(caller, id).await?;
+        require_trust(caller, "fact", fact.trust)?;
+        if let Some(target) = fact.pending_supersede_of {
+            let target = self.store.get_fact(&caller.ctx, target).await?;
+            require_trust(caller, "superseded fact", target.trust)?;
+        }
         Ok(self.store.approve_fact(&caller.ctx, id).await?)
     }
 
     pub async fn reject(&self, caller: &Caller, id: Uuid) -> ApiResult<Fact> {
         caller.require_admin()?;
-        self.get_fact(caller, id).await?;
+        let fact = self.get_fact(caller, id).await?;
+        require_trust(caller, "fact", fact.trust)?;
         Ok(self.store.reject_fact(&caller.ctx, id).await?)
     }
 
@@ -278,6 +248,16 @@ impl Services {
         req: PutBlockRequest,
     ) -> ApiResult<Block> {
         require_agent(caller, agent_id)?;
+        if caller.key.max_trust < Trust::Agent {
+            return Err(ApiError::forbidden(
+                "writing a block requires at least agent trust",
+            ));
+        }
+        if req.max_chars.is_some_and(|chars| chars > MAX_BLOCK_CHARS) {
+            return Err(ApiError::invalid_input(format!(
+                "max_chars must be at most {MAX_BLOCK_CHARS}"
+            )));
+        }
         let max_chars = match (req.max_chars, req.expected_version) {
             (Some(max_chars), _) => max_chars,
             (None, None) => DEFAULT_MAX_BLOCK_CHARS,
@@ -315,70 +295,6 @@ impl Services {
             .await?)
     }
 
-    // Sessions
-
-    fn runtime(&self) -> ApiResult<&AgentRuntime> {
-        self.runtime.as_ref().ok_or_else(|| {
-            ApiError::invalid_input(
-                "sessions run an agent loop, which host mode does not have: \
-                 the host's own model is the agent",
-            )
-        })
-    }
-
-    pub async fn create_session(
-        &self,
-        caller: &Caller,
-        agent_id: &str,
-        scope: &Scope,
-    ) -> ApiResult<Session> {
-        self.runtime()?;
-        require_agent(caller, agent_id)?;
-        caller.require_scope(scope)?;
-        Ok(self
-            .store
-            .create_session(&caller.ctx, agent_id, scope)
-            .await?)
-    }
-
-    /// A session acts in two scopes, its memory scope and its agent's, and the key needs both.
-    async fn visible_session(&self, caller: &Caller, id: Uuid) -> ApiResult<Session> {
-        let session = self.store.get_session(&caller.ctx, id).await?;
-        let agent_scope: Scope = format!("agent:{}", session.agent_id)
-            .parse()
-            .map_err(|_| ApiError::not_found())?;
-        caller.require_visible(&agent_scope)?;
-        caller.require_visible(&session.scope)?;
-        Ok(session)
-    }
-
-    pub async fn session_messages(
-        &self,
-        caller: &Caller,
-        id: Uuid,
-    ) -> ApiResult<Vec<SessionMessage>> {
-        self.runtime()?;
-        self.visible_session(caller, id).await?;
-        Ok(self.store.load_messages(&caller.ctx, id).await?)
-    }
-
-    pub async fn send_message(
-        &self,
-        caller: &Caller,
-        id: Uuid,
-        text: String,
-    ) -> ApiResult<TurnResult> {
-        let runtime = self.runtime()?;
-        self.visible_session(caller, id).await?;
-        // The turn's `memory_remember` writes episodes with trust `agent`.
-        if caller.key.max_trust < Trust::Agent {
-            return Err(ApiError::forbidden(
-                "an agent turn writes agent trust, which is above this key's maximum",
-            ));
-        }
-        Ok(runtime.run_turn(&caller.ctx, id, text).await?)
-    }
-
     // Users
 
     pub async fn delete_user_memory(
@@ -389,12 +305,22 @@ impl Services {
         caller.require_admin()?;
         let scope = parse_scope("user", user_id)?;
         caller.require_scope(&scope)?;
+        if let Some(highest) = self.pg.highest_trust_in_scope(&caller.ctx, &scope).await? {
+            require_trust(caller, "stored memory", highest)?;
+        }
         Ok(self.store.purge_scope(&caller.ctx, &scope).await?)
     }
 }
 
-fn is_blank(value: &str) -> bool {
-    value.trim().is_empty()
+fn require_trust(caller: &Caller, what: &str, trust: Trust) -> ApiResult<()> {
+    if trust > caller.key.max_trust {
+        return Err(ApiError::forbidden(format!(
+            "{what} trust {} is above this key's maximum of {}",
+            trust.as_str(),
+            caller.key.max_trust.as_str()
+        )));
+    }
+    Ok(())
 }
 
 fn parse_scope(kind: &str, id: &str) -> ApiResult<Scope> {
@@ -403,21 +329,4 @@ fn parse_scope(kind: &str, id: &str) -> ApiResult<Scope> {
 
 fn require_agent(caller: &Caller, agent_id: &str) -> ApiResult<()> {
     caller.require_scope(&parse_scope("agent", agent_id)?)
-}
-
-/// `AgentRuntime`'s view of retrieval. `memory_recall` wants current facts, which is what
-/// `candidates` returns: recall without pending episodes.
-pub struct RetrieverRecall(pub Arc<Retriever>);
-
-#[async_trait]
-impl MemoryRecall for RetrieverRecall {
-    async fn recall(
-        &self,
-        ctx: &RequestContext,
-        scopes: Vec<Scope>,
-        query: String,
-        limit: i64,
-    ) -> Result<Vec<ScoredFact>> {
-        self.0.candidates(ctx, &scopes, &query, limit).await
-    }
 }
