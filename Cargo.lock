@@ -1530,7 +1530,20 @@ dependencies = [
 name = "memoryos-ingest"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "fastrand",
  "memoryos-core",
+ "memoryos-llm",
+ "memoryos-store",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "testcontainers",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
