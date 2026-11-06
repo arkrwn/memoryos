@@ -5,7 +5,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::*;
-use memoryos_core::{ContentBlock, Embedder, Llm, EMBEDDING_DIMS};
+use memoryos_core::{ContentBlock, Embedder, Llm, StopReason, EMBEDDING_DIMS};
 use memoryos_llm::{OpenAiClient, OpenAiEmbedder};
 use serde_json::{json, Value};
 
@@ -118,6 +118,7 @@ async fn text_reply_maps_response_and_sends_bearer_key() {
             text: "hello".into()
         }]
     );
+    assert_eq!(response.stop_reason, StopReason::EndTurn);
     assert_eq!((response.input_tokens, response.output_tokens), (11, 7));
 }
 
@@ -141,6 +142,7 @@ async fn forced_tool_call_parses_string_arguments() {
             input: json!({"facts": ["a"]}),
         }]
     );
+    assert_eq!(response.stop_reason, StopReason::ToolUse);
     let expected = json!({
         "tool_choice": {"type": "function", "function": {"name": "extract"}},
         "tools": [{
@@ -178,6 +180,60 @@ async fn tool_result_round_trips_in_the_request_body() {
         "tool_choice": "auto",
     });
     assert_eq!(wiremock.count_posts_with_body(CHAT_URL, expected).await, 1);
+}
+
+#[tokio::test]
+async fn truncated_text_returns_ok_with_max_tokens() {
+    let wiremock = WireMock::start().await;
+    wiremock
+        .stub_post(
+            CHAT_URL,
+            200,
+            chat_reply(json!({"role": "assistant", "content": "partial"}), "length"),
+        )
+        .await;
+
+    let response = client(&wiremock)
+        .complete(text_request("hi"))
+        .await
+        .expect("truncated text is not an error");
+
+    assert_eq!(response.stop_reason, StopReason::MaxTokens);
+    assert_eq!(
+        response.content,
+        vec![ContentBlock::Text {
+            text: "partial".into()
+        }]
+    );
+    assert_eq!(wiremock.count_posts(CHAT_URL).await, 1);
+}
+
+#[tokio::test]
+async fn truncated_tool_call_is_a_provider_error() {
+    let wiremock = WireMock::start().await;
+    wiremock
+        .stub_post(
+            CHAT_URL,
+            200,
+            chat_reply(
+                json!({
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "extract", "arguments": "{}"},
+                    }],
+                }),
+                "length",
+            ),
+        )
+        .await;
+
+    let message = provider_error(client(&wiremock).complete(forced_request()).await);
+
+    assert!(message.contains("truncated"), "{message}");
+    assert_eq!(wiremock.count_posts(CHAT_URL).await, 1);
 }
 
 #[tokio::test]
