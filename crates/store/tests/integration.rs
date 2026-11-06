@@ -1653,6 +1653,332 @@ async fn requarantined_fact_in_the_middle_of_a_chain_leaves_it_linked() -> TestR
     Ok(())
 }
 
+async fn current_ids(db: &Db, c: &RequestContext, scope: &Scope, subject: Uuid) -> Res<Vec<Uuid>> {
+    let current = db
+        .store
+        .current_facts_for_subject(c, scope, subject)
+        .await?;
+    Ok(current.iter().map(|f| f.id).collect())
+}
+
+/// Like `supersede`, also returning the episode. Returns (episode id, fact id).
+async fn supersede_from_episode(
+    db: &Db,
+    c: &RequestContext,
+    old_fact_id: Uuid,
+    new: NewFact,
+) -> Res<(Uuid, Uuid)> {
+    let episode_id = new_episode(db, c, &new.scope, new.trust).await?;
+    let ids = db
+        .store
+        .apply_extraction(c, episode_id, vec![FactOp::Supersede { old_fact_id, new }])
+        .await?;
+    Ok((episode_id, ids[0]))
+}
+
+#[tokio::test]
+async fn purge_never_raises_trust_above_the_current_value() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+
+    // Active in its own scope: the system corroboration must not lift it.
+    let scope = Scope::agent("a1");
+    let subject = entity(&db, &c, &scope, "ada").await?;
+    let fact = with_trust(
+        new_fact(&scope, subject, "claim", date(2020, 1)),
+        Trust::Agent,
+    );
+    let (agent, fact) = add_fact(&db, &c, fact).await?;
+    corroborate(&db, &c, &scope, Trust::System, fact).await?;
+    db.store.purge_episode(&c, agent).await?;
+    let left = db.store.get_fact(&c, fact).await?;
+    assert_eq!(
+        (left.status, left.trust),
+        (FactStatus::Active, Trust::Agent)
+    );
+
+    // Quarantined: losing the external source must not launder it into a trusted fact.
+    let scope = user("u1");
+    let subject = entity(&db, &c, &scope, "ada").await?;
+    let mut fact = with_trust(
+        new_fact(&scope, subject, "claim", date(2020, 1)),
+        Trust::External,
+    );
+    fact.status = FactStatus::Quarantined;
+    let (external, fact) = add_fact(&db, &c, fact).await?;
+    corroborate(&db, &c, &scope, Trust::System, fact).await?;
+    db.store.purge_episode(&c, external).await?;
+    let left = db.store.get_fact(&c, fact).await?;
+    assert_eq!(
+        (left.status, left.trust),
+        (FactStatus::Quarantined, Trust::External)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_link_on_a_purged_head_moves_to_the_reopened_predecessor() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = user("u1");
+    let subject = entity(&db, &c, &scope, "ada").await?;
+    let (_, truth) = add_fact(&db, &c, new_fact(&scope, subject, "truth", date(2020, 1))).await?;
+    let (bad, lie) = supersede_from_episode(
+        &db,
+        &c,
+        truth,
+        new_fact(&scope, subject, "lie", date(2021, 1)),
+    )
+    .await?;
+    let pending = pending_on(&db, &c, &scope, subject, lie).await?;
+
+    db.store.purge_episode(&c, bad).await?;
+    assert_eq!(
+        db.store.get_fact(&c, pending).await?.pending_supersede_of,
+        Some(truth)
+    );
+
+    db.store.approve_fact(&c, pending).await?;
+    assert_eq!(current_ids(&db, &c, &scope, subject).await?, vec![pending]);
+    assert_eq!(
+        db.store.get_fact(&c, truth).await?.superseded_by,
+        Some(pending)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_link_on_a_purged_middle_moves_to_the_current_fact() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = user("u1");
+    let subject = entity(&db, &c, &scope, "ada").await?;
+    let (_, first) = add_fact(&db, &c, new_fact(&scope, subject, "a", date(2020, 1))).await?;
+    let (bad, middle) = supersede_from_episode(
+        &db,
+        &c,
+        first,
+        new_fact(&scope, subject, "b", date(2021, 1)),
+    )
+    .await?;
+    let last = supersede(
+        &db,
+        &c,
+        middle,
+        new_fact(&scope, subject, "c", date(2022, 1)),
+    )
+    .await?;
+    let pending = pending_on(&db, &c, &scope, subject, middle).await?;
+
+    db.store.purge_episode(&c, bad).await?;
+    assert_eq!(
+        db.store.get_fact(&c, pending).await?.pending_supersede_of,
+        Some(last)
+    );
+
+    db.store.approve_fact(&c, pending).await?;
+    assert_eq!(current_ids(&db, &c, &scope, subject).await?, vec![pending]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_link_on_a_requarantined_fact_moves_to_the_reopened_predecessor() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = user("u1");
+    let subject = entity(&db, &c, &scope, "ada").await?;
+    let (_, truth) = add_fact(&db, &c, new_fact(&scope, subject, "truth", date(2020, 1))).await?;
+    let (good, claim) = supersede_from_episode(
+        &db,
+        &c,
+        truth,
+        new_fact(&scope, subject, "claim", date(2021, 1)),
+    )
+    .await?;
+    corroborate(&db, &c, &scope, Trust::External, claim).await?;
+    let pending = pending_on(&db, &c, &scope, subject, claim).await?;
+
+    db.store.purge_episode(&c, good).await?;
+    assert_eq!(
+        db.store.get_fact(&c, claim).await?.status,
+        FactStatus::Quarantined
+    );
+    assert_eq!(
+        db.store.get_fact(&c, pending).await?.pending_supersede_of,
+        Some(truth)
+    );
+
+    db.store.approve_fact(&c, pending).await?;
+    assert_eq!(current_ids(&db, &c, &scope, subject).await?, vec![pending]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_link_is_cleared_when_the_purge_leaves_nothing_to_close() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = user("u1");
+    let subject = entity(&db, &c, &scope, "ada").await?;
+    let (bad, lie) = add_fact(&db, &c, new_fact(&scope, subject, "lie", date(2020, 1))).await?;
+    let pending = pending_on(&db, &c, &scope, subject, lie).await?;
+
+    db.store.purge_episode(&c, bad).await?;
+    assert_eq!(
+        db.store.get_fact(&c, pending).await?.pending_supersede_of,
+        None
+    );
+
+    db.store.approve_fact(&c, pending).await?;
+    assert_eq!(current_ids(&db, &c, &scope, subject).await?, vec![pending]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn purge_that_leaves_a_fact_below_what_it_closed_quarantines_it() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = user("u1");
+    let subject = entity(&db, &c, &scope, "ada").await?;
+    let system = with_trust(
+        new_fact(&scope, subject, "system says", date(2020, 1)),
+        Trust::System,
+    );
+    let (_, truth) = add_fact(&db, &c, system).await?;
+    let (source, claim) = supersede_from_episode(
+        &db,
+        &c,
+        truth,
+        with_trust(
+            new_fact(&scope, subject, "claim", date(2021, 1)),
+            Trust::System,
+        ),
+    )
+    .await?;
+    corroborate(&db, &c, &scope, Trust::User, claim).await?;
+
+    db.store.purge_episode(&c, source).await?;
+    let reopened = db.store.get_fact(&c, truth).await?;
+    assert_eq!((reopened.valid_to, reopened.superseded_by), (None, None));
+    let held = db.store.get_fact(&c, claim).await?;
+    assert_eq!(
+        (held.status, held.trust),
+        (FactStatus::Quarantined, Trust::User)
+    );
+    assert_eq!(held.pending_supersede_of, Some(truth));
+    assert_eq!(current_ids(&db, &c, &scope, subject).await?, vec![truth]);
+    let detail: serde_json::Value =
+        sqlx::query_scalar("SELECT detail FROM audit_events WHERE action = 'episode.purge'")
+            .fetch_one(&db.admin)
+            .await?;
+    assert_eq!(detail["facts_requarantined"], json!(1));
+
+    db.store.approve_fact(&c, claim).await?;
+    assert_eq!(current_ids(&db, &c, &scope, subject).await?, vec![claim]);
+    let closed = db.store.get_fact(&c, truth).await?;
+    assert_eq!(closed.superseded_by, Some(claim));
+    assert_eq!(closed.valid_to, Some(date(2021, 1)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn purge_keeps_a_fact_active_when_what_it_closed_does_not_outrank_it() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = user("u1");
+    let subject = entity(&db, &c, &scope, "ada").await?;
+
+    // The closed fact was already at the trust the closer falls to.
+    let (_, old) = add_fact(&db, &c, new_fact(&scope, subject, "old", date(2020, 1))).await?;
+    let (source, claim) = supersede_from_episode(
+        &db,
+        &c,
+        old,
+        with_trust(
+            new_fact(&scope, subject, "claim", date(2021, 1)),
+            Trust::System,
+        ),
+    )
+    .await?;
+    corroborate(&db, &c, &scope, Trust::User, claim).await?;
+    db.store.purge_episode(&c, source).await?;
+    let left = db.store.get_fact(&c, claim).await?;
+    assert_eq!((left.status, left.trust), (FactStatus::Active, Trust::User));
+    assert_eq!(db.store.get_fact(&c, old).await?.superseded_by, Some(claim));
+
+    // Both fall together, so the closed fact does not outrank the closer afterwards.
+    let subject = entity(&db, &c, &scope, "grace").await?;
+    let system = |text, from| with_trust(new_fact(&scope, subject, text, from), Trust::System);
+    let (first_own, first) = add_fact(&db, &c, system("first", date(2020, 1))).await?;
+    let (second_own, second) =
+        supersede_from_episode(&db, &c, first, system("second", date(2021, 1))).await?;
+    let shared = new_episode(&db, &c, &scope, Trust::System).await?;
+    db.store
+        .apply_extraction(
+            &c,
+            shared,
+            vec![
+                FactOp::Corroborate { fact_id: first },
+                FactOp::Corroborate { fact_id: second },
+            ],
+        )
+        .await?;
+    corroborate(&db, &c, &scope, Trust::User, first).await?;
+    corroborate(&db, &c, &scope, Trust::User, second).await?;
+    db.store.purge_episode(&c, first_own).await?;
+    db.store.purge_episode(&c, second_own).await?;
+    db.store.purge_episode(&c, shared).await?;
+    let left = db.store.get_fact(&c, second).await?;
+    assert_eq!((left.status, left.trust), (FactStatus::Active, Trust::User));
+    assert_eq!(
+        db.store.get_fact(&c, first).await?.superseded_by,
+        Some(second)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn purge_applies_the_contradiction_rule_across_a_deleted_middle_fact() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = user("u1");
+    let subject = entity(&db, &c, &scope, "ada").await?;
+    let system = |text, from| with_trust(new_fact(&scope, subject, text, from), Trust::System);
+    let (_, truth) = add_fact(&db, &c, system("truth", date(2020, 1))).await?;
+    let (middle_own, middle) =
+        supersede_from_episode(&db, &c, truth, system("middle", date(2021, 1))).await?;
+    let (claim_own, claim) =
+        supersede_from_episode(&db, &c, middle, system("claim", date(2022, 1))).await?;
+    let shared = new_episode(&db, &c, &scope, Trust::System).await?;
+    db.store
+        .apply_extraction(
+            &c,
+            shared,
+            vec![
+                FactOp::Corroborate { fact_id: middle },
+                FactOp::Corroborate { fact_id: claim },
+            ],
+        )
+        .await?;
+    corroborate(&db, &c, &scope, Trust::User, claim).await?;
+    db.store.purge_episode(&c, middle_own).await?;
+    db.store.purge_episode(&c, claim_own).await?;
+
+    // Deletes the middle fact, leaving the claim, now user trust, as the closer of the system fact.
+    db.store.purge_episode(&c, shared).await?;
+    assert!(is_not_found(db.store.get_fact(&c, middle).await));
+    let held = db.store.get_fact(&c, claim).await?;
+    assert_eq!(
+        (held.status, held.trust),
+        (FactStatus::Quarantined, Trust::User)
+    );
+    assert_eq!(held.pending_supersede_of, Some(truth));
+    assert_eq!(current_ids(&db, &c, &scope, subject).await?, vec![truth]);
+
+    db.store.approve_fact(&c, claim).await?;
+    assert_eq!(current_ids(&db, &c, &scope, subject).await?, vec![claim]);
+    Ok(())
+}
+
 // ---- Trust at the head of a chain ------------------------------------------------------------
 
 /// `old` closed by a system fact, so a writer that only saw `old` reaches a higher-trust head.
