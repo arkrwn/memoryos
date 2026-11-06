@@ -165,7 +165,14 @@ impl Services {
         id: Uuid,
         reason: &str,
     ) -> ApiResult<Fact> {
-        self.get_fact(caller, id).await?;
+        let fact = self.get_fact(caller, id).await?;
+        if fact.trust > caller.key.max_trust {
+            return Err(ApiError::forbidden(format!(
+                "fact trust {} is above this key's maximum of {}",
+                fact.trust.as_str(),
+                caller.key.max_trust.as_str()
+            )));
+        }
         Ok(self.store.invalidate_fact(&caller.ctx, id, reason).await?)
     }
 

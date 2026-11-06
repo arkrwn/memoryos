@@ -15,7 +15,7 @@ paths:
         "200": { description: Process is up }
   /readyz:
     get:
-      summary: Readiness, checks the database
+      summary: Readiness, checks the database and that the local model has loaded
       security: []
       responses:
         "200": { description: Ready }
@@ -420,7 +420,7 @@ paths:
         default: { $ref: "#/components/responses/Error" }
   /mcp:
     post:
-      summary: MCP Streamable HTTP endpoint. Tools remember, recall, block_read, block_replace, graph_neighbors
+      summary: MCP Streamable HTTP endpoint. Tools recall_candidates, commit_facts, recall, block_read, block_replace, graph_neighbors, plus remember in worker mode
       responses:
         "200": { description: JSON-RPC response }
 components:

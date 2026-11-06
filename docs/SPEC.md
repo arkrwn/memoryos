@@ -182,10 +182,18 @@ AND (invalidated_at IS NULL OR invalidated_at > K)
 | `Storage`, `Internal` | 500 | `internal` (details logged, never returned) |
 | No or bad token | 401 | `unauthorized` |
 | Rate limited | 429 | `rate_limited` |
+| Body over the limit | 413 | `payload_too_large` |
+| Wrong method | 405 | `method_not_allowed` |
+| Request timed out | 504 | `timeout` |
 
 Limits: request body 1 MiB, episode content 100000 chars, 50 scopes per request, 100 requests per
-second per key by default. `POST /mcp` exposes MCP tools `remember`, `recall`, `block_read`,
-`block_replace` and `graph_neighbors` under the same authorization.
+second per key by default. `POST /mcp` exposes the MCP tools in section 14 under the same
+authorization, plus `remember` in worker mode, which always writes at most `agent` trust. It supports
+clients on MCP revision 2026-07-28 and earlier, and rejects any `Origin` that is not localhost or in
+`MEMORYOS_MCP_ALLOWED_ORIGINS`.
+
+Other rules: `POST /v1/facts/{id}/invalidate` requires `fact.trust <= key.max_trust`. A key with
+`external` max trust gets 403 on session turns. A block update that omits `max_chars` keeps its limit.
 
 ## 10. Configuration
 
@@ -202,6 +210,12 @@ second per key by default. `POST /mcp` exposes MCP tools `remember`, `recall`, `
 | `MEMORYOS_RATE_LIMIT_RPS` | `100` | Per key |
 | `MEMORYOS_WORKER_CONCURRENCY` | `4` | |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Traces are exported only when set |
+| `MEMORYOS_REQUEST_TIMEOUT_SECS` | `30` | |
+| `MEMORYOS_TURN_TIMEOUT_SECS` | `300` | Agent turns |
+| `MEMORYOS_MCP_ALLOWED_ORIGINS` | unset | Comma-separated, in addition to localhost |
+| `MEMORYOS_MODE` | `host` | `host` or `worker`, section 14 |
+| `MEMORYOS_EMBEDDER` | by mode | `local` or `openai`, section 14 |
+| `MEMORYOS_MODEL_CACHE` | user cache dir | Local model. Leave `HF_HOME` unset, since it overrides this |
 
 ## 11. Testing rules
 
@@ -290,6 +304,10 @@ CLI, using `MEMORYOS_URL` and `MEMORYOS_API_KEY` (any agent without MCP can use 
   search covers those cases when embeddings are available.
 - Embedding width is fixed at 384. Changing model needs re-embedding.
 - The rate limiter is in-process, so the limit applies per server instance.
+- A standalone `memoryos worker` serves no HTTP, so its job counts do not reach `/metrics`. Only the
+  worker embedded in `serve` reports them.
+- Provider errors log only the text before the first colon, because the rest can quote content. This
+  makes provider failures harder to diagnose from logs.
 - `known_at` is not fully bitemporal: `valid_to` and `status` are not versioned, so a later close or
   approval shows up in reads at an earlier `known_at`.
 - Thinking blocks are not kept between agent tool calls, so the model loses that reasoning.

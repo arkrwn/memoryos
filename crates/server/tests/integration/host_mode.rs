@@ -363,6 +363,26 @@ async fn invalidated_facts_leave_recall() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_key_cannot_invalidate_a_fact_above_its_max_trust() {
+    let server = Server::host().await;
+    let tenant = crate::common::unique("invalidate-trust");
+    let root = server.root(&tenant).await;
+    let (id, _, _) = server
+        .commit_one(&root, "agent:a1", "Ada sails boats")
+        .await;
+
+    let low = server
+        .key(&tenant, &["agent:*"], memoryos_core::Trust::External, false)
+        .await;
+    assert!(server.sdk(&low).invalidate_fact(id, "bad").await.is_err());
+    let fact = server.fact_json(&root, id).await;
+    assert!(fact["invalidated_at"].is_null());
+
+    let invalidated = server.sdk(&root).invalidate_fact(id, "wrong").await;
+    assert!(invalidated.expect("root may").invalidated_at.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn episodes_and_sessions_return_400_directing_to_commits() {
     let server = Server::host().await;
     let root = server.root("modes").await;

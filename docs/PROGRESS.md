@@ -14,10 +14,10 @@ actually run. States: `todo`, `doing`, `done`, `blocked`.
 | T6 Agent runtime | done | Lead run on merged `develop`: 24 unit and 30 integration tests pass. Not run against live providers |
 | T11 Local embedder | done | Lead run: 54 llm unit tests pass. Real-model test (6 pass) reported by the agent, not re-run by lead. Needs at least 1 GiB memory and glibc 2.38+ |
 | T13 Hardening after Wave 2 | done | Lead run on merged `develop`: 387 tests pass, fmt and clippy clean |
-| T14 Purge fixes | merged | Agent reports 3 unit and 73 integration store tests pass, 35 unit and 44 integration ingest tests pass. Lead re-run pending at T7 merge |
-| T7 Server, MCP, SDK, both modes | todo | |
-| T12 CLI commands and hooks | todo | |
-| T8 Deploy, CI, docs | todo | |
+| T14 Purge fixes | merged | Agent reports 3 unit and 73 integration store tests pass, 35 unit and 44 integration ingest tests pass. Lead workspace run at T7 merge passes |
+| T7 Server, MCP, SDK, both modes | done | Lead workspace run on `develop`: 506 tests pass, fmt and clippy clean. MCP checked against spec text and tests, not a real host. No live providers |
+| T12 CLI commands and hooks | doing | |
+| T8 Deploy, CI, docs | doing | |
 | T9 Integration and gates | todo | |
 | T10 Independent review | todo | |
 
