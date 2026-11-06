@@ -2,9 +2,7 @@
 
 use std::str::FromStr;
 
-use memoryos_core::{
-    ApiKey, Block, BlockVersion, Entity, Episode, Error, Fact, Job, Result, Session, SessionMessage,
-};
+use memoryos_core::{ApiKey, Block, BlockVersion, Entity, Episode, Error, Fact, Result};
 use sqlx::postgres::PgRow;
 use sqlx::{Decode, Postgres, Row, Type};
 
@@ -12,8 +10,6 @@ pub(crate) const EPISODE_COLS: &str =
     "id, scope, source, trust, content, metadata, occurred_at, created_at, processed_at";
 pub(crate) const ENTITY_COLS: &str = "id, scope, kind, name, aliases";
 pub(crate) const BLOCK_COLS: &str = "id, agent_id, label, content, max_chars, version, updated_at";
-pub(crate) const SESSION_COLS: &str = "id, agent_id, scope, created_at";
-pub(crate) const MESSAGE_COLS: &str = "seq, role, content, created_at";
 pub(crate) const API_KEY_COLS: &str = "id, tenant, name, scopes, max_trust, is_admin";
 /// Requires the table alias `f`. The embedding is left out on purpose: it is never returned.
 pub(crate) const FACT_COLS: &str = "f.id, f.scope, f.subject_id, f.predicate, f.object_id, \
@@ -109,34 +105,6 @@ pub(crate) fn block_version(row: &PgRow) -> Result<BlockVersion> {
         content: get(row, "content")?,
         edited_by: get(row, "edited_by")?,
         edited_at: get(row, "edited_at")?,
-    })
-}
-
-pub(crate) fn session(row: &PgRow) -> Result<Session> {
-    Ok(Session {
-        id: get(row, "id")?,
-        agent_id: get(row, "agent_id")?,
-        scope: parsed(row, "scope")?,
-        created_at: get(row, "created_at")?,
-    })
-}
-
-pub(crate) fn message(row: &PgRow) -> Result<SessionMessage> {
-    Ok(SessionMessage {
-        seq: get(row, "seq")?,
-        role: get(row, "role")?,
-        content: get(row, "content")?,
-        created_at: get(row, "created_at")?,
-    })
-}
-
-pub(crate) fn job(row: &PgRow) -> Result<Job> {
-    Ok(Job {
-        id: get(row, "id")?,
-        tenant: get(row, "tenant")?,
-        kind: get(row, "kind")?,
-        payload: get(row, "payload")?,
-        attempts: get(row, "attempts")?,
     })
 }
 

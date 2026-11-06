@@ -1,21 +1,21 @@
 # MemoryOS progress
 
 Only the lead edits this file. A task is `done` only with proof from a command or test that was
-actually run. States: `todo`, `doing`, `done`, `blocked`.
+actually run. States: `todo`, `doing`, `done`, `blocked`, `removed`.
 
 | Task | State | Proof |
 |---|---|---|
 | T0 Spec, core, schema, OpenAPI | done | clippy clean, 2 core tests pass, migration applied on pgvector:pg17, psql check: no tenant sees 0 rows, cross-tenant insert rejected by RLS, app role denied on `jobs` |
 | T1 Postgres store | done | Lead run on `develop`: 4 unit and 51 integration tests pass against real Postgres. Open risk: common-word text search in a 1M-fact scope is estimated at about 450 ms, over the latency gate; T9 must measure it |
-| T2 LLM and embedding clients | done | Lead run on `develop`: 36 unit and 29 WireMock tests pass. Not run against live provider APIs |
+| T2 LLM and embedding clients | removed | Removed by T15, except `LocalEmbedder` (T11). In git history |
 | T3 Eval harness | done | Lead run on `develop`: 51 unit and 6 WireMock tests pass. Not yet run against a real server |
-| T4 Ingest and worker | done | Lead run on merged `develop`: 37 unit and 35 integration tests pass |
+| T4 Ingest and worker | removed | Worker and extraction removed by T15. `HostCommitter`, the trust gate and entity resolution stay |
 | T5 Hybrid retrieval | done | Lead run on merged `develop`: 18 unit and 22 integration tests pass |
-| T6 Agent runtime | done | Lead run on merged `develop`: 24 unit and 30 integration tests pass. Not run against live providers |
+| T6 Agent runtime | removed | Removed by T15. In git history |
 | T11 Local embedder | done | Lead run: 54 llm unit tests pass. Real-model test (6 pass) reported by the agent, not re-run by lead. Needs at least 1 GiB memory and glibc 2.38+ |
 | T13 Hardening after Wave 2 | done | Lead run on merged `develop`: 387 tests pass, fmt and clippy clean |
 | T14 Purge fixes | merged | Agent reports 3 unit and 73 integration store tests pass, 35 unit and 44 integration ingest tests pass. Lead workspace run at T7 merge passes |
-| T7 Server, MCP, SDK, both modes | done | Lead workspace run on `develop`: 506 tests pass, fmt and clippy clean. MCP checked against spec text and tests, not a real host. No live providers |
+| T7 Server, MCP, SDK | done | Lead workspace run on `develop`: 506 tests pass, fmt and clippy clean. MCP checked against spec text and tests, not a real host. No live providers |
 | T12 CLI commands and hooks | doing | |
 | T8 Deploy, CI, docs | doing | |
 | T9 Integration and gates | todo | |
@@ -30,11 +30,26 @@ actually run. States: `todo`, `doing`, `done`, `blocked`.
 | Staleness | todo | |
 | Poisoning | todo | |
 | Isolation | todo | |
-| Recovery | todo | |
 | Restore | todo | |
 | Ready to use | todo | |
 
 ## Contract changes
+
+Host mode only, by the user's decision (T15):
+
+- MemoryOS never calls an LLM. Removed: `crates/agent`, the LLM clients, `Llm` and its types, `Job`,
+  sessions, the worker, `POST /v1/episodes`, `/v1/sessions/*`, `POST /v1/agents/{id}/sessions`, MCP
+  `remember`, `memoryos worker`, `--no-worker`, and the mode, provider and embedder settings.
+- `memoryos-llm` is now `memoryos-embed`. `apply_extraction` is `apply_commit`, and
+  `claim_unqueued_episode` is `claim_episode`, the only way to store an episode. `RecallResponse` has
+  only `facts`, and `/readyz` no longer reports `not_required`.
+- Approving now also requires `max_trust` to reach the trust of the `pending_supersede_of` target.
+- `entity_alias_sources` moved into `0001_init.sql`, the only migration.
+- The migration lost `jobs`, `sessions`, `session_messages`, `enqueue_job`,
+  `search_pending_episode_ids`, `episodes.content_tsv` and the episode search indexes. `episodes` is
+  back to `FORCE ROW LEVEL SECURITY`. `episodes.processed_at` stays: it makes a replayed commit a no-op.
+- The Recovery gate is gone, because no job exists to recover. Entries below describe the removed
+  design where they mention jobs, workers or Anthropic.
 
 After Wave 1, from agent findings:
 

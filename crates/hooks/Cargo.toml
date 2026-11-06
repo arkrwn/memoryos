@@ -7,7 +7,7 @@ license.workspace = true
 
 [features]
 # Enables tests/integration.rs, which builds the real binary and needs Docker with
-# pgvector/pgvector:pg17 and wiremock/wiremock:3.3.1.
+# pgvector/pgvector:pg17.
 integration = []
 
 [dependencies]

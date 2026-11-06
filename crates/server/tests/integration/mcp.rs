@@ -4,7 +4,7 @@ use memoryos_core::Trust;
 use reqwest::StatusCode;
 use serde_json::{json, Map, Value};
 
-use crate::common::{assert_error, eventually, random_uuid, statement, uuid_at, Key, Server};
+use crate::common::{assert_error, random_uuid, statement, uuid_at, Key, Server};
 
 const MODERN: &str = "2026-07-28";
 
@@ -85,7 +85,7 @@ async fn read(request: reqwest::RequestBuilder) -> (StatusCode, Value) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_legacy_client_can_initialize_and_ping() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let key = server.root("m1").await;
     let (status, reply) = post(
         &server,
@@ -137,7 +137,7 @@ async fn a_legacy_client_can_initialize_and_ping() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_modern_client_uses_discover_and_per_request_metadata() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let key = server.root("m2").await;
 
     let (status, reply) = read(modern_request(&server, &key, "server/discover", Map::new())).await;
@@ -205,7 +205,7 @@ async fn a_modern_client_uses_discover_and_per_request_metadata() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn tools_list_differs_by_mode() {
-    let host = Server::host().await;
+    let host = Server::start().await;
     let key = host.root("m3").await;
     let (_, reply) = post(&host, &key, rpc(1, "tools/list", json!({}))).await;
     let mut names = tool_names(&reply);
@@ -238,18 +238,11 @@ async fn tools_list_differs_by_mode() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(reply["error"]["code"], -32602, "{reply}");
-
-    let worker = Server::worker_without_loop().await;
-    let key = worker.root("m3").await;
-    let (_, reply) = post(&worker, &key, rpc(1, "tools/list", json!({}))).await;
-    let names = tool_names(&reply);
-    assert_eq!(names.len(), 7);
-    assert!(names.contains(&"remember".to_owned()));
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn each_host_tool_works_end_to_end() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let key = server.root("m4").await;
 
     // commit_facts then recall_candidates, recall, and graph_neighbors over the same data.
@@ -337,56 +330,11 @@ async fn each_host_tool_works_end_to_end() {
     .await;
     assert!(is_error);
     assert_eq!(conflict["error"]["code"], "version_conflict");
-
-    assert_eq!(server.mock.llm_calls().await, 0);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn remember_stores_at_most_agent_trust_and_the_worker_quarantines_it() {
-    let server = Server::worker().await;
-    let key = server.root("m5").await;
-    server
-        .mock
-        .stub_extraction("mcp note", json!([statement("Ada plays go", "Ada")]))
-        .await;
-    let (is_error, episode) = call_tool(
-        &server,
-        &key,
-        "remember",
-        json!({"scope": "user:u", "content": "mcp note"}),
-    )
-    .await;
-    assert!(!is_error, "{episode}");
-    assert_eq!(episode["trust"], "agent", "a system key must not raise it");
-    assert_eq!(episode["source"], "mcp");
-    let id = uuid_at(&episode, "/id");
-
-    let path = format!("/v1/episodes/{id}");
-    eventually("the episode to be processed", || async {
-        let (_, read) = server.call("GET", &path, Some(&key), None).await;
-        read["processed_at"].is_string()
-    })
-    .await;
-    let (_, listed) = server
-        .call("GET", "/v1/quarantine?scopes=user:u", Some(&key), None)
-        .await;
-    assert_eq!(listed["facts"].as_array().expect("facts").len(), 1);
-
-    // Unknown fields are refused, so `trust` cannot be smuggled in.
-    let (is_error, reply) = call_tool(
-        &server,
-        &key,
-        "remember",
-        json!({"scope": "user:u", "content": "c", "trust": "system"}),
-    )
-    .await;
-    assert!(is_error);
-    assert_eq!(reply["error"]["code"], "invalid_input");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_same_authorization_applies_as_on_rest() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let root = server.root("m6").await;
     let narrow = server.key("m6", &["user:a"], Trust::Agent, false).await;
     let other_tenant = server.root("m6_other").await;
@@ -474,7 +422,7 @@ async fn the_same_authorization_applies_as_on_rest() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn tools_refuse_what_their_schemas_and_the_key_do_not_allow() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let external = server.key("schema", &["*"], Trust::External, false).await;
     let root = server.root("schema").await;
 
@@ -498,7 +446,7 @@ async fn tools_refuse_what_their_schemas_and_the_key_do_not_allow() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn errors_take_the_documented_shapes() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let key = server.root("m7").await;
 
     // A malformed argument is a tool error, so the model can correct it.

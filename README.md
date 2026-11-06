@@ -15,8 +15,8 @@
 
 > [!NOTE]
 > **Pre-release.** The server, REST API, MCP endpoint and Rust SDK run, and the Docker stack below is
-> tested end to end in host mode. Not done yet: integration gates, a load test and independent review.
-> It has not run against a live LLM provider or a real agent host. Track the work in
+> tested end to end. Not done yet: integration gates, a load test and independent review. It has not
+> run through a real agent host's model. Track the work in
 > [`docs/PROGRESS.md`](docs/PROGRESS.md).
 
 ## ✨ Why MemoryOS
@@ -77,19 +77,20 @@ curl -sS http://localhost:8080/mcp -H "Authorization: Bearer $TOKEN" \
   -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}'
 ```
 
-Backups, upgrades, key rotation, worker mode and incidents are in the
+Backups, upgrades, key rotation and incidents are in the
 [runbook](docs/runbook.md).
 
 ## 🔍 Example
 
-This uses the Rust SDK against a server in worker mode, where MemoryOS extracts facts itself. The user
-says *"I moved to Bandung"* after previously living in Jakarta:
+This uses the Rust SDK. The user says *"I moved to Bandung"* after previously living in Jakarta, and the
+agent's own model decides that this is a fact to save:
 
 ```rust
 let mem = MemoryOs::connect(url, api_key).await?;
 let user = Scope::user("u_123");
 
-mem.remember(user.clone(), Episode::message("I moved to Bandung")).await?;
+let fact = CommitFact::new("Ada moved to Bandung", EntityRef::new("Ada", "person"), "lives_in");
+mem.commit(&Commit::new(user.clone(), "chat", "I moved to Bandung", vec![fact])).await?;
 
 // Current answer: Bandung
 let now = mem.recall(user.clone(), "where does the user live?").await?;
@@ -105,11 +106,8 @@ let then = mem.recall(user, "where does the user live?")
 ```mermaid
 flowchart TD
     A[Agents and apps] -->|REST or MCP| S[memoryos-server<br/>auth, scopes, limits, telemetry]
-    S -->|host mode: commit| G[Trust gate]
-    S -->|worker mode: episode| E[Episode + job<br/>one transaction]
+    S -->|commit| G[Trust gate]
     S -->|read| R[Hybrid retrieval<br/>vector + text + graph]
-    E --> W[Worker<br/>extract, resolve entities, reconcile]
-    W --> G
     G --> DB[(Postgres + pgvector)]
     R --> DB
 ```
@@ -121,16 +119,6 @@ disagree:
 - **Entities:** the people, places and things that facts connect.
 - **Facts:** statements with two timelines, when they were true and when we learned them.
 - **Blocks:** versioned working notes that an agent edits directly.
-
-### Two ways to run
-
-| | 🖥️ Host mode (default) | ☁️ Worker mode |
-|---|---|---|
-| **Who extracts facts** | The coding agent's own model | A background worker calling an LLM API |
-| **API key needed** | None | OpenAI, or Anthropic plus OpenAI |
-| **Embeddings** | Local model, downloaded on first use | OpenAI, or the local model |
-| **Runs when the agent is closed** | No | Yes |
-| **Best for** | Claude Code, OpenCode and similar agents | Servers and multi-user apps |
 
 ## 🛡️ Security
 
@@ -152,7 +140,7 @@ Research shows a poisoned memory survives across sessions, unlike ordinary promp
 
 ## 🪝 Agent hooks
 
-In host mode, the agent reads and saves memories through MCP tools. Hooks are optional. They only
+The agent reads and saves memories through MCP tools. Hooks are optional. They only
 load memories and remind the agent to save, and they cannot bypass validation or quarantine.
 
 ```mermaid
@@ -246,8 +234,8 @@ OpenCode session. References:
 ## 🗺️ Roadmap
 
 - [x] **Wave 0:** specification, core contracts, database schema, API contract
-- [x] **Wave 1:** Postgres store, LLM and embedding clients, eval harness
-- [x] **Wave 2:** ingest and worker, hybrid retrieval, agent runtime
+- [x] **Wave 1:** Postgres store, embedding client, eval harness
+- [x] **Wave 2:** ingest, hybrid retrieval
 - [ ] **Wave 3:** server, MCP, SDK, deployment
 - [ ] **Wave 4:** integration, load test, restore drill, independent review
 
@@ -257,11 +245,10 @@ These are goals, not measured results:
 
 | Gate | Target |
 |---|---|
-| ⚡ Recall latency | p95 under 200 ms at 1M facts, excluding embedding and LLM calls |
+| ⚡ Recall latency | p95 under 200 ms at 1M facts, excluding embedding |
 | 🕰️ Staleness | At least 95% of replaced facts absent from current recall |
 | 🛡️ Poisoning | 0 poisoned facts in recall without approval |
 | 🔒 Isolation | 0 cross-tenant reads |
-| ♻️ Recovery | Jobs from a killed worker complete after the lease expires |
 
 ## 📚 Documentation
 
@@ -276,14 +263,14 @@ These are goals, not measured results:
 
 ## 🧪 Development
 
-Requires Rust 1.92+ and Docker. Integration tests start real Postgres and WireMock containers. Do not
+Requires Rust 1.92+ and Docker. Integration tests start real Postgres containers. Do not
 use `cargo test --all-features`, which downloads the embedding model. The test feature list is in
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --features memoryos-store/integration,memoryos-llm/integration,memoryos-ingest/integration,memoryos-retrieve/integration,memoryos-agent/integration,memoryos-eval/integration,memoryos-server/integration
+cargo test --workspace --features memoryos-store/integration,memoryos-ingest/integration,memoryos-retrieve/integration,memoryos-eval/integration,memoryos-server/integration,memoryos-hooks/integration
 cargo deny check
 ```
 

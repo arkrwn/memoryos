@@ -1,4 +1,4 @@
-//! Entity resolution (SPEC section 3b), shared by both write modes.
+//! Entity resolution (SPEC section 3).
 
 use std::collections::HashMap;
 
@@ -101,9 +101,9 @@ pub(crate) async fn embed_and_resolve(
     })
 }
 
-/// Runs after `apply_extraction`, because only then is each fact's status final. An alias changes
+/// Runs after `apply_commit`, because only then is each fact's status final. An alias changes
 /// how a shared entity resolves for everyone, so a name is kept only when this episode created an
-/// active fact on that entity: `created` is what `apply_extraction` returned, which leaves out
+/// active fact on that entity: `created` is what `apply_commit` returned, which leaves out
 /// facts the episode only corroborated. A source whose facts are all quarantined earns none. A
 /// failure here costs an alias and not the commit, which has already happened, so it is logged.
 pub(crate) async fn add_earned_aliases(

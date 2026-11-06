@@ -17,7 +17,6 @@ use serde_json::{json, Map, Value};
 
 use crate::app::AppState;
 use crate::auth::Caller;
-use crate::config::Mode;
 use crate::routes::read_body;
 
 const MODERN_VERSION: &str = "2026-07-28";
@@ -319,12 +318,11 @@ async fn call_method(
     params: &Map<String, Value>,
     era: Era,
 ) -> Result<Value, Failure> {
-    let mode = state.services.mode;
     match method {
         "initialize" => Ok(initialize(params)),
         "server/discover" => Ok(discover(era)),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(tools_list(mode, era)),
+        "tools/list" => Ok(tools_list(era)),
         "tools/call" => tools_call(state, caller, params).await,
         _ => Err(Failure::MethodNotFound),
     }
@@ -354,8 +352,8 @@ fn discover(era: Era) -> Value {
     result
 }
 
-fn tools_list(mode: Mode, era: Era) -> Value {
-    let mut result = json!({"tools": tools::definitions(mode)});
+fn tools_list(era: Era) -> Value {
+    let mut result = json!({"tools": tools::definitions()});
     add_cache_hints(&mut result, era);
     result
 }
@@ -377,7 +375,7 @@ async fn tools_call(
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| Failure::InvalidParams("params.name is required".into()))?;
-    if !tools::exists(name, state.services.mode) {
+    if !tools::exists(name) {
         return Err(Failure::InvalidParams(format!("Unknown tool: {name}")));
     }
     let arguments = params

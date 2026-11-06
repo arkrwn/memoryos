@@ -7,8 +7,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use futures::future::join_all;
 use memoryos_core::{
-    Embedder, Error, Fact, FactFilter, MemoryStore, RequestContext, Result, Scope, ScoredEpisode,
-    ScoredFact,
+    Embedder, Error, Fact, FactFilter, MemoryStore, RequestContext, Result, Scope, ScoredFact,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -26,7 +25,7 @@ const GRAPH_DEPTH: i32 = 1;
 const GRAPH_EDGES_PER_SUBJECT: i64 = 50;
 /// Bounds how many edges reach fusion, however many a subject has.
 const MAX_GRAPH_CANDIDATES: usize = 50;
-/// A slow provider must not hold up recall, since text search can answer without it.
+/// A slow embedder must not hold up recall, since text search can answer without it.
 const DEFAULT_EMBED_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Deserialize)]
@@ -49,7 +48,6 @@ fn default_limit() -> i64 {
 #[derive(Debug, Clone, Serialize)]
 pub struct RecallResponse {
     pub facts: Vec<ScoredFact>,
-    pub pending_episodes: Vec<ScoredEpisode>,
 }
 
 pub struct Retriever {
@@ -73,33 +71,20 @@ impl Retriever {
         self
     }
 
-    /// Ranked facts, plus episodes still being processed when the read is about the present.
+    /// Ranked facts at the time the request asks about.
     pub async fn recall(&self, ctx: &RequestContext, req: RecallRequest) -> Result<RecallResponse> {
         let limit = validate(&req.scopes, &req.query, req.limit)?;
         let filter = FactFilter {
             as_of: req.as_of,
             known_at: req.known_at,
         };
-        let read_is_current = req.as_of.is_none() && req.known_at.is_none();
-        let (facts, pending_episodes) = tokio::try_join!(
-            self.ranked_facts(ctx, &req.scopes, &req.query, &filter, limit),
-            async {
-                if read_is_current {
-                    self.store
-                        .search_pending_episodes(ctx, &req.scopes, &req.query, req.limit)
-                        .await
-                } else {
-                    Ok(Vec::new())
-                }
-            },
-        )?;
-        Ok(RecallResponse {
-            facts,
-            pending_episodes,
-        })
+        let facts = self
+            .ranked_facts(ctx, &req.scopes, &req.query, &filter, limit)
+            .await?;
+        Ok(RecallResponse { facts })
     }
 
-    /// Related current facts for a statement the host may commit: recall without pending episodes.
+    /// Related current facts for a statement the host may commit.
     pub async fn candidates(
         &self,
         ctx: &RequestContext,
@@ -313,14 +298,8 @@ mod tests {
 
     #[test]
     fn response_serializes_the_openapi_fields() {
-        let response = RecallResponse {
-            facts: vec![],
-            pending_episodes: vec![],
-        };
+        let response = RecallResponse { facts: vec![] };
         let json = serde_json::to_value(&response).expect("serializes");
-        assert_eq!(
-            json,
-            serde_json::json!({"facts": [], "pending_episodes": []})
-        );
+        assert_eq!(json, serde_json::json!({"facts": []}));
     }
 }

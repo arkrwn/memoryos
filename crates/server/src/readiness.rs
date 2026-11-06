@@ -6,12 +6,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use memoryos_core::Embedder;
-use memoryos_ingest::CancellationToken;
+use tokio_util::sync::CancellationToken;
 
-const NOT_REQUIRED: u8 = 0;
-const LOADING: u8 = 1;
-const READY: u8 = 2;
-const FAILED: u8 = 3;
+const LOADING: u8 = 0;
+const READY: u8 = 1;
+const FAILED: u8 = 2;
 
 const WARM_UP_INPUT: &str = "warm up";
 
@@ -21,20 +20,15 @@ pub struct EmbedderReadiness(AtomicU8);
 
 impl EmbedderReadiness {
     pub fn is_ready(&self) -> bool {
-        matches!(self.0.load(Ordering::Acquire), NOT_REQUIRED | READY)
+        self.0.load(Ordering::Acquire) == READY
     }
 
     pub fn label(&self) -> &'static str {
         match self.0.load(Ordering::Acquire) {
-            NOT_REQUIRED => "not_required",
             LOADING => "loading",
             READY => "ready",
             _ => "failed",
         }
-    }
-
-    pub fn start_loading(&self) {
-        self.0.store(LOADING, Ordering::Release);
     }
 
     fn set(&self, state: u8) {
@@ -158,11 +152,8 @@ mod tests {
     }
 
     #[test]
-    fn a_server_without_a_local_model_is_ready() {
+    fn a_new_server_is_loading_and_not_ready() {
         let readiness = EmbedderReadiness::default();
-        assert!(readiness.is_ready());
-        assert_eq!(readiness.label(), "not_required");
-        readiness.start_loading();
         assert!(!readiness.is_ready());
         assert_eq!(readiness.label(), "loading");
     }
@@ -170,7 +161,6 @@ mod tests {
     #[tokio::test]
     async fn ready_after_one_successful_call() {
         let readiness = Arc::new(EmbedderReadiness::default());
-        readiness.start_loading();
         let embedder = fake(0, false);
         warm_up(
             embedder.clone(),
@@ -186,7 +176,6 @@ mod tests {
     #[tokio::test]
     async fn a_failure_is_retried_until_it_succeeds() {
         let readiness = Arc::new(EmbedderReadiness::default());
-        readiness.start_loading();
         let embedder = fake(3, false);
         warm_up(
             embedder.clone(),
@@ -202,7 +191,6 @@ mod tests {
     #[tokio::test]
     async fn a_stalled_load_stays_not_ready_and_stops_on_shutdown() {
         let readiness = Arc::new(EmbedderReadiness::default());
-        readiness.start_loading();
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(warm_up(
             fake(0, true),

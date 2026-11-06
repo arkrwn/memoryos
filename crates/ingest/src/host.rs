@@ -1,5 +1,4 @@
-//! Host-mode commits (SPEC section 14): the host decides the facts, and MemoryOS validates and
-//! gates them with the same code as the worker.
+//! Commits (SPEC section 3): the host decides the facts, and MemoryOS validates and gates them.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -98,7 +97,7 @@ impl HostCommitter {
         // references are checked: the original commit may have closed the fact it superseded.
         let (episode, created) = self
             .store
-            .claim_unqueued_episode(
+            .claim_episode(
                 ctx,
                 NewEpisode {
                     scope: req.scope.clone(),
@@ -129,7 +128,7 @@ impl HostCommitter {
         };
         // A no-op if a concurrent request with the same key won the episode lock. The response
         // below then reports that request's facts, the same as any other replay.
-        let inserted = self.store.apply_extraction(ctx, episode.id, ops).await?;
+        let inserted = self.store.apply_commit(ctx, episode.id, ops).await?;
         add_earned_aliases(self.store.as_ref(), ctx, &episode, merges, &inserted).await;
         self.response(ctx, &episode, &req).await
     }
@@ -229,10 +228,9 @@ impl HostCommitter {
         }
     }
 
-    /// A commit refused before `apply_extraction` must leave no source behind. The episode holds no
-    /// facts, since `apply_extraction` is what links them, and if a replay has processed it since,
-    /// the store leaves it alone. If this fails, what remains is an unprocessed `agent` or
-    /// `external` episode, which pending search never returns.
+    /// A commit refused before `apply_commit` must leave no source behind. The episode holds no
+    /// facts, since `apply_commit` is what links them, and if a replay has processed it since, the
+    /// store leaves it alone. If this fails, what remains is an unprocessed episode that nothing reads.
     async fn discard(&self, ctx: &RequestContext, episode_id: Uuid) {
         if let Err(err) = self
             .store

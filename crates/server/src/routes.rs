@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put, MethodRouter};
 use axum::{Extension, Json, Router};
 use chrono::{DateTime, Utc};
-use memoryos_core::{NewEpisode, Scope};
+use memoryos_core::Scope;
 use memoryos_ingest::CommitRequest;
 use memoryos_retrieve::RecallRequest;
 use serde::de::DeserializeOwned;
@@ -25,9 +25,6 @@ use crate::auth::Caller;
 use crate::error::{ApiError, ApiResult};
 use crate::mcp;
 use crate::service::{CandidatesRequest, PutBlockRequest};
-
-/// The one route with a longer timeout, because a turn makes several model calls.
-pub const TURN_ROUTE: &str = "/v1/sessions/{id}/messages";
 
 const READY_DATABASE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -62,7 +59,6 @@ pub fn route_table() -> Vec<Route> {
         public("GET", "/healthz", get(healthz)),
         public("GET", "/readyz", get(readyz)),
         public("GET", "/metrics", get(metrics)),
-        bearer("POST", "/v1/episodes", post(create_episode)),
         bearer("GET", "/v1/episodes/{id}", get(get_episode)),
         bearer("POST", "/v1/episodes/{id}/purge", post(purge_episode)),
         bearer("POST", "/v1/recall", post(recall)),
@@ -92,13 +88,6 @@ pub fn route_table() -> Vec<Route> {
             "/v1/agents/{agent_id}/blocks/{label}/versions",
             get(block_versions),
         ),
-        bearer(
-            "POST",
-            "/v1/agents/{agent_id}/sessions",
-            post(create_session),
-        ),
-        bearer("GET", TURN_ROUTE, get(session_messages)),
-        bearer("POST", TURN_ROUTE, post(send_message)),
         bearer("DELETE", "/v1/users/{user_id}/memory", delete(delete_user)),
         bearer("POST", "/mcp", post(mcp::handle)),
     ]
@@ -265,15 +254,6 @@ async fn metrics(State(state): State<AppState>) -> Response {
             ApiError::internal().into_response()
         }
     }
-}
-
-async fn create_episode(
-    State(state): State<AppState>,
-    Extension(caller): Extension<Caller>,
-    ApiJson(new): ApiJson<NewEpisode>,
-) -> ApiResult<impl IntoResponse> {
-    let episode = state.services.create_episode(&caller, new).await?;
-    Ok((StatusCode::ACCEPTED, Json(episode)))
 }
 
 async fn get_episode(
@@ -461,49 +441,6 @@ async fn block_versions(
         .block_versions(&caller, &agent_id, &label)
         .await?;
     Ok(Json(json!({"versions": versions})))
-}
-
-#[derive(Deserialize)]
-struct CreateSessionBody {
-    scope: Scope,
-}
-
-async fn create_session(
-    State(state): State<AppState>,
-    Extension(caller): Extension<Caller>,
-    ApiPath(agent_id): ApiPath<String>,
-    ApiJson(body): ApiJson<CreateSessionBody>,
-) -> ApiResult<impl IntoResponse> {
-    let session = state
-        .services
-        .create_session(&caller, &agent_id, &body.scope)
-        .await?;
-    Ok((StatusCode::CREATED, Json(session)))
-}
-
-async fn session_messages(
-    State(state): State<AppState>,
-    Extension(caller): Extension<Caller>,
-    ApiPath(id): ApiPath<Uuid>,
-) -> ApiResult<impl IntoResponse> {
-    let messages = state.services.session_messages(&caller, id).await?;
-    Ok(Json(json!({"messages": messages})))
-}
-
-#[derive(Deserialize)]
-struct SendMessageBody {
-    text: String,
-}
-
-async fn send_message(
-    State(state): State<AppState>,
-    Extension(caller): Extension<Caller>,
-    ApiPath(id): ApiPath<Uuid>,
-    ApiJson(body): ApiJson<SendMessageBody>,
-) -> ApiResult<impl IntoResponse> {
-    Ok(Json(
-        state.services.send_message(&caller, id, body.text).await?,
-    ))
 }
 
 async fn delete_user(
