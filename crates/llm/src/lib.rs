@@ -1,10 +1,14 @@
 //! Provider clients behind the `Llm` and `Embedder` traits from `memoryos-core`.
 
 mod anthropic;
+#[cfg(feature = "local")]
+mod local;
 mod openai;
 mod transport;
 
 pub use anthropic::AnthropicClient;
+#[cfg(feature = "local")]
+pub use local::LocalEmbedder;
 pub use openai::{OpenAiClient, OpenAiEmbedder};
 
 use memoryos_core::{ContentBlock, Error, Result, ToolChoice};

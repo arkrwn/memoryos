@@ -2,15 +2,21 @@
 name = "memoryos-llm"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# ort 2.0.0-rc.15, pulled in by fastembed, declares 1.92.
+rust-version = "1.92"
 license.workspace = true
 
 [features]
+default = ["local"]
+local = ["dep:dirs", "dep:fastembed"]
 integration = []
+integration-local = ["local"]
 
 [dependencies]
 memoryos-core.workspace = true
 async-trait.workspace = true
+dirs = { version = "6", optional = true }
+fastembed = { version = "7.6", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"], optional = true }
 fastrand = "2"
 httpdate = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
