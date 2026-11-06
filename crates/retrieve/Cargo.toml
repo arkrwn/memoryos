@@ -5,8 +5,27 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Enables tests/recall.rs, which needs Docker and the pgvector/pgvector:pg17 and
+# wiremock/wiremock:3.3.1 images.
+integration = []
+
 [dependencies]
 memoryos-core.workspace = true
+chrono.workspace = true
+futures = "0.3"
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+memoryos-llm.workspace = true
+memoryos-store.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json.workspace = true
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "uuid"] }
+testcontainers = "0.25"
 
 [lints]
 workspace = true
