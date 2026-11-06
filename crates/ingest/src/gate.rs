@@ -1,5 +1,4 @@
-//! The trust gate of SPEC section 5, and the only place that builds a `FactOp`. The worker and host
-//! mode both come through `build_op`.
+//! The trust gate of SPEC section 5, and the only place that builds a `FactOp`.
 
 use chrono::{DateTime, Utc};
 use memoryos_core::{source_requires_quarantine, FactOp, FactStatus, NewFact, Scope, Trust};
