@@ -234,12 +234,17 @@ Other rules: `POST /v1/facts/{id}/invalidate` requires `fact.trust <= key.max_tr
 |---|---|---|
 | Static checks | No warnings | Commands in section 11 |
 | Recall latency | p95 under 200 ms at 1M facts, excluding embedding and LLM calls | Load test output |
-| Staleness | At least 95% of superseded facts absent from current recall | `memoryos-eval` report |
-| Poisoning | 0 poisoned facts in recall without approval | `memoryos-eval` report |
+| Staleness | At least 95% of superseded facts absent from current recall | `memoryos-eval --mode host` report |
+| Poisoning | 0 poisoned facts in recall without approval | `memoryos-eval --mode host` report |
 | Isolation | 0 cross-tenant reads | Integration tests |
 | Recovery | A job held by a killed worker completes after lease expiry | Integration test |
 | Restore | Backup restored into an empty database and recall still works | Drill log |
 | Ready to use | README quickstart works from a clean checkout | Recorded run |
+
+The eval gates run in host mode with scripted commits and no LLM, at zero cost, by the user's decision
+not to spend money on provider APIs. They prove what the server enforces: supersession, time filters,
+trust and quarantine. They do not prove how well a host model decides what to save. Worker mode has
+not been evaluated against any real model, so its extraction quality is unproven.
 
 ## 14. Host mode (default)
 

@@ -49,6 +49,11 @@ After Wave 1, from agent findings:
   the live API because no Anthropic key is available.
 - Work merges to `develop`, not `main`.
 
+No paid provider calls, by the user's decision:
+
+- Staleness and poisoning gates run through `memoryos-eval --mode host`, with no LLM.
+- Worker mode stays available but is unproven against real models.
+
 Host mode, chosen by the user:
 
 - Host mode is the default (ADR 0005, SPEC section 14). `insert_unqueued_episode` added.
