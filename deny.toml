@@ -8,8 +8,8 @@ all-features = true
 ignore = [
     # testcontainers 0.25 requires astral-tokio-tar 0.5. Test-only: it is a dev-dependency, is not
     # in the memoryos binary, and handles archives only from containers the tests start themselves.
-    # testcontainers 0.28 moves to astral-tokio-tar 0.6.1, which fixes 0066, 0112 and 0113 but not
-    # 0145 (0.6.2 or newer). Upgrading means editing the dev-dependency in each crate.
+    # testcontainers 0.28 requires astral-tokio-tar ^0.6.1, so a lockfile on 0.6.2 or newer fixes
+    # all four. Upgrading means editing the dev-dependency in each crate.
     { id = "RUSTSEC-2026-0066", reason = "test-only via testcontainers 0.25; not in the shipped binary; fix needs a testcontainers upgrade" },
     { id = "RUSTSEC-2026-0112", reason = "test-only via testcontainers 0.25; not in the shipped binary; fix needs a testcontainers upgrade" },
     { id = "RUSTSEC-2026-0113", reason = "test-only via testcontainers 0.25; not in the shipped binary; fix needs a testcontainers upgrade" },
