@@ -5,7 +5,7 @@ use std::fmt;
 use async_trait::async_trait;
 use memoryos_core::{
     CompletionRequest, CompletionResponse, ContentBlock, Error, Llm, Message, Result, Role,
-    ToolChoice,
+    StopReason, ToolChoice,
 };
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Deserialize;
@@ -218,9 +218,19 @@ fn parse_response(
 
     Ok(CompletionResponse {
         content,
+        stop_reason: map_stop_reason(response.stop_reason.as_deref()),
         input_tokens: response.usage.input_tokens,
         output_tokens: response.usage.output_tokens,
     })
+}
+
+fn map_stop_reason(stop_reason: Option<&str>) -> StopReason {
+    match stop_reason {
+        Some("end_turn" | "stop_sequence") => StopReason::EndTurn,
+        Some("tool_use") => StopReason::ToolUse,
+        Some("max_tokens") => StopReason::MaxTokens,
+        _ => StopReason::Other,
+    }
 }
 
 #[cfg(test)]
@@ -415,14 +425,30 @@ mod tests {
     }
 
     #[test]
-    fn truncated_text_is_returned() {
+    fn truncated_text_is_returned_with_max_tokens() {
         let parsed = parse_response(
             wire(json!({"content": [{"type": "text", "text": "par"}],
                         "stop_reason": "max_tokens",
                         "usage": {"input_tokens": 1, "output_tokens": 1}})),
             &ToolChoice::Auto,
-        );
-        assert!(parsed.is_ok());
+        )
+        .expect("parsed");
+        assert_eq!(parsed.stop_reason, StopReason::MaxTokens);
+    }
+
+    #[test]
+    fn maps_stop_reasons() {
+        let cases = [
+            (Some("end_turn"), StopReason::EndTurn),
+            (Some("stop_sequence"), StopReason::EndTurn),
+            (Some("tool_use"), StopReason::ToolUse),
+            (Some("max_tokens"), StopReason::MaxTokens),
+            (Some("pause_turn"), StopReason::Other),
+            (None, StopReason::Other),
+        ];
+        for (wire, expected) in cases {
+            assert_eq!(map_stop_reason(wire), expected, "{wire:?}");
+        }
     }
 
     #[test]

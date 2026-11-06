@@ -5,7 +5,7 @@ use std::fmt;
 use async_trait::async_trait;
 use memoryos_core::{
     CompletionRequest, CompletionResponse, ContentBlock, Embedder, Error, Llm, Message, Result,
-    Role, ToolChoice, EMBEDDING_DIMS,
+    Role, StopReason, ToolChoice, EMBEDDING_DIMS,
 };
 use reqwest::header::HeaderMap;
 use serde::Deserialize;
@@ -246,9 +246,19 @@ fn parse_chat_response(
 
     Ok(CompletionResponse {
         content,
+        stop_reason: map_finish_reason(choice.finish_reason.as_deref()),
         input_tokens: response.usage.prompt_tokens,
         output_tokens: response.usage.completion_tokens,
     })
+}
+
+fn map_finish_reason(finish_reason: Option<&str>) -> StopReason {
+    match finish_reason {
+        Some("stop") => StopReason::EndTurn,
+        Some("tool_calls") => StopReason::ToolUse,
+        Some("length") => StopReason::MaxTokens,
+        _ => StopReason::Other,
+    }
 }
 
 /// The arguments are model output and may hold user data, so errors do not quote them.
@@ -568,6 +578,30 @@ mod tests {
             ]
         );
         assert_eq!((response.input_tokens, response.output_tokens), (3, 5));
+    }
+
+    #[test]
+    fn maps_finish_reasons() {
+        let cases = [
+            (Some("stop"), StopReason::EndTurn),
+            (Some("tool_calls"), StopReason::ToolUse),
+            (Some("length"), StopReason::MaxTokens),
+            (Some("content_filter"), StopReason::Other),
+            (None, StopReason::Other),
+        ];
+        for (wire, expected) in cases {
+            assert_eq!(map_finish_reason(wire), expected, "{wire:?}");
+        }
+    }
+
+    #[test]
+    fn truncated_text_is_returned_with_max_tokens() {
+        let parsed = parse_chat_response(
+            reply(json!({"content": "par"}), "length"),
+            &ToolChoice::Auto,
+        )
+        .expect("parsed");
+        assert_eq!(parsed.stop_reason, StopReason::MaxTokens);
     }
 
     #[test]

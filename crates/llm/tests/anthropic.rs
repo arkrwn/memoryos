@@ -5,7 +5,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::*;
-use memoryos_core::{ContentBlock, Llm};
+use memoryos_core::{ContentBlock, Llm, StopReason};
 use memoryos_llm::AnthropicClient;
 use serde_json::{json, Value};
 
@@ -87,6 +87,7 @@ async fn text_reply_maps_response_and_sends_required_headers() {
             text: "hello".into()
         }]
     );
+    assert_eq!(response.stop_reason, StopReason::EndTurn);
     assert_eq!((response.input_tokens, response.output_tokens), (11, 7));
 }
 
@@ -108,6 +109,7 @@ async fn forced_tool_call_sends_tool_choice_and_returns_tool_use() {
             input: json!({"facts": ["a"]}),
         }]
     );
+    assert_eq!(response.stop_reason, StopReason::ToolUse);
     let expected = json!({
         "tool_choice": {"type": "tool", "name": "extract"},
         "tools": [{
@@ -120,7 +122,7 @@ async fn forced_tool_call_sends_tool_choice_and_returns_tool_use() {
 }
 
 #[tokio::test]
-async fn forced_tool_on_default_model_uses_auto_with_one_tool() {
+async fn forced_tool_on_rejecting_model_uses_auto_with_one_tool() {
     let wiremock = WireMock::start().await;
     wiremock.stub_post(URL, 200, tool_reply()).await;
 
@@ -155,7 +157,7 @@ async fn forced_tool_on_default_model_uses_auto_with_one_tool() {
 }
 
 #[tokio::test]
-async fn forced_tool_on_default_model_fails_when_no_call_is_made() {
+async fn forced_tool_on_rejecting_model_fails_when_no_call_is_made() {
     let wiremock = WireMock::start().await;
     wiremock.stub_post(URL, 200, text_reply()).await;
 
@@ -192,6 +194,57 @@ async fn tool_result_round_trips_in_the_request_body() {
         "tool_choice": {"type": "auto"},
     });
     assert_eq!(wiremock.count_posts_with_body(URL, expected).await, 1);
+}
+
+#[tokio::test]
+async fn truncated_text_returns_ok_with_max_tokens() {
+    let wiremock = WireMock::start().await;
+    wiremock
+        .stub_post(
+            URL,
+            200,
+            json!({
+                "content": [{"type": "text", "text": "partial"}],
+                "stop_reason": "max_tokens",
+                "usage": {"input_tokens": 4, "output_tokens": 100},
+            }),
+        )
+        .await;
+
+    let response = client(&wiremock, MODEL)
+        .complete(text_request("hi"))
+        .await
+        .expect("truncated text is not an error");
+
+    assert_eq!(response.stop_reason, StopReason::MaxTokens);
+    assert_eq!(
+        response.content,
+        vec![ContentBlock::Text {
+            text: "partial".into()
+        }]
+    );
+    assert_eq!(wiremock.count_posts(URL).await, 1);
+}
+
+#[tokio::test]
+async fn truncated_tool_call_is_a_provider_error() {
+    let wiremock = WireMock::start().await;
+    wiremock
+        .stub_post(
+            URL,
+            200,
+            json!({
+                "content": [{"type": "tool_use", "id": "toolu_1", "name": "extract", "input": {}}],
+                "stop_reason": "max_tokens",
+                "usage": {"input_tokens": 4, "output_tokens": 100},
+            }),
+        )
+        .await;
+
+    let message = provider_error(client(&wiremock, MODEL).complete(forced_request()).await);
+
+    assert!(message.contains("truncated"), "{message}");
+    assert_eq!(wiremock.count_posts(URL).await, 1);
 }
 
 #[tokio::test]
