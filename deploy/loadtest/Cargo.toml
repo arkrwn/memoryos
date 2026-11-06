@@ -1,0 +1,31 @@
+# The recall load test tool. Its own workspace, so no test or build of the main workspace depends
+# on it. See docs/loadtest-results.md.
+[package]
+name = "memoryos-loadtest"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+memoryos-core = { path = "../../crates/core" }
+memoryos-retrieve = { path = "../../crates/retrieve" }
+memoryos-store = { path = "../../crates/store" }
+async-trait = "0.1"
+chrono = "0.4"
+rand = { version = "0.8", features = ["small_rng"] }
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "uuid"] }
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v7"] }
+
+# Default release settings, except stripping: on macOS 27 `strip` writes proc-macro libraries that
+# fail to load with "mis-aligned LINKEDIT string pool".
+[profile.release]
+strip = "none"
+
+[profile.release.build-override]
+strip = "none"
