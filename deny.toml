@@ -6,18 +6,9 @@ all-features = true
 [advisories]
 # Every entry says why it is accepted. Remove it as soon as the reason stops being true.
 ignore = [
-    # testcontainers 0.25 requires astral-tokio-tar 0.5. Test-only: it is a dev-dependency, is not
-    # in the memoryos binary, and handles archives only from containers the tests start themselves.
-    # testcontainers 0.28 requires astral-tokio-tar ^0.6.1, so a lockfile on 0.6.2 or newer fixes
-    # all four. Upgrading means editing the dev-dependency in each crate.
-    { id = "RUSTSEC-2026-0066", reason = "test-only via testcontainers 0.25; not in the shipped binary; fix needs a testcontainers upgrade" },
-    { id = "RUSTSEC-2026-0112", reason = "test-only via testcontainers 0.25; not in the shipped binary; fix needs a testcontainers upgrade" },
-    { id = "RUSTSEC-2026-0113", reason = "test-only via testcontainers 0.25; not in the shipped binary; fix needs a testcontainers upgrade" },
-    { id = "RUSTSEC-2026-0145", reason = "test-only via testcontainers 0.25; not in the shipped binary; fix needs a testcontainers upgrade" },
-    # Unmaintained, no patched version. Test-only for the same reason.
+    # Unmaintained, no patched version. Test-only: testcontainers is a dev-dependency, is not in the
+    # memoryos binary, and handles archives only from containers the tests start themselves.
     { id = "RUSTSEC-2026-0440", reason = "astral-tokio-tar unmaintained; test-only via testcontainers" },
-    # Unmaintained, no patched version. Reached only through bollard, under testcontainers.
-    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; test-only via bollard and testcontainers" },
     # Unmaintained, no patched version. Reached only through serde_yaml_ng, a dev-dependency of the
     # server that parses our own docs/openapi.yaml in a contract test.
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml unmaintained; test-only, parses our own OpenAPI file" },
