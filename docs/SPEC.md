@@ -108,6 +108,13 @@ AND (invalidated_at IS NULL OR invalidated_at > K)
 - A fact's trust equals its episode's trust. Corroboration never raises it.
 - A `FactOp::Supersede` whose new fact is quarantined leaves the old fact open and sets
   `pending_supersede_of`. `approve_fact` activates the fact and then performs the close.
+- Superseding rechecks trust at the chain head when it commits. If the head has higher trust than the
+  new fact, the new fact is quarantined and pending on that head, which closes a race with the gate.
+- `approve_fact` on a chain that moved to a higher-trust head the admin has not reviewed does not close
+  it: it re-points `pending_supersede_of` at that head, writes `fact.approve_held`, and returns
+  `InvalidInput`. A second approval closes it. The server tells the caller to review again.
+- Purging a source recomputes a fact's trust as the highest trust among remaining sources, never above
+  its current trust, and re-quarantines the fact if a source rule in the table above now applies.
 - `reject_fact` sets `rejected`. Rejected and quarantined facts never appear in recall or graph.
 - Extraction and reconciliation prompts wrap content as untrusted data, and they expose only the
   forced output tool. Episode text can never reach a memory-writing tool.

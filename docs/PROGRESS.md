@@ -52,3 +52,10 @@ Host mode, chosen by the user:
 
 - Host mode is the default (ADR 0005, SPEC section 14). `insert_unqueued_episode` added.
 - Embedding width changed from 1536 to 384 (ADR 0003).
+
+After Wave 2, from T13:
+
+- `MemoryStore` gains `find_entity`, `facts_for_episode`, `release_job`, and `neighbors` gains
+  `edge_limit`. Core exports `normalize_name` and `source_requires_quarantine`.
+- Migration gains `entities.alias_keys`, `facts_subject_recent_idx` and `facts_object_recent_idx`.
+- Test Postgres runs on tmpfs, because each run was leaking an anonymous Docker volume.
