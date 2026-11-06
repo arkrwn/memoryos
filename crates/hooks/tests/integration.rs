@@ -1,5 +1,5 @@
-//! The real `memoryos` binary as a child process, against a real server in host mode on real
-//! Postgres, with WireMock for embeddings. Every command runs with a cleared environment and a
+//! The real `memoryos` binary as a child process, against a real server on real Postgres, with the
+//! test embedder. Every command runs with a cleared environment and a
 //! temporary `HOME`, so no test can read or change the user's real configuration.
 
 #![cfg(feature = "integration")]
@@ -17,7 +17,6 @@ use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
-const EMBEDDING_DIMS: usize = 384;
 const STOP_JSON: &str = r#"{
   "decision": "block",
   "reason": "Before stopping, call commit_facts for durable facts learned in this session. If there are none, stop."
@@ -53,6 +52,7 @@ fn binary() -> &'static Path {
         let output = Command::new(cargo)
             .current_dir(env!("CARGO_MANIFEST_DIR"))
             .args(["build", "-p", "memoryos-server", "--bin", "memoryos"])
+            .args(["--features", "test-embedder"])
             .arg("--target-dir")
             .arg(target)
             .output()
@@ -70,7 +70,6 @@ fn binary() -> &'static Path {
 
 struct World {
     database_url: String,
-    openai_base: String,
     server_url: String,
 }
 
@@ -78,14 +77,14 @@ fn world() -> &'static World {
     static WORLD: OnceLock<World> = OnceLock::new();
     WORLD.get_or_init(|| {
         binary();
-        let (database_url, openai_base) = std::thread::spawn(|| {
+        let database_url = std::thread::spawn(|| {
             tokio::runtime::Runtime::new()
                 .expect("runtime")
-                .block_on(async { tokio::join!(start_postgres(), start_wiremock()) })
+                .block_on(start_postgres())
         })
         .join()
         .expect("container thread");
-        let migrate = server_command(&database_url, &openai_base, None)
+        let migrate = server_command(&database_url, None)
             .arg("migrate")
             .output()
             .expect("migrate");
@@ -94,13 +93,12 @@ fn world() -> &'static World {
             "{}",
             String::from_utf8_lossy(&migrate.stderr)
         );
-        let (child, server_url) = start_server(&database_url, &openai_base);
+        let (child, server_url) = start_server(&database_url);
         reap_on_exit(&format!("kill {}", child.id()));
         // It lives as long as this test binary, and the reaper stops it after that.
         std::mem::forget(child);
         World {
             database_url,
-            openai_base,
             server_url,
         }
     })
@@ -125,47 +123,6 @@ async fn start_postgres() -> String {
     format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres")
 }
 
-async fn start_wiremock() -> String {
-    let container = GenericImage::new("wiremock/wiremock", "3.3.1")
-        .with_exposed_port(8080.tcp())
-        .with_wait_for(WaitFor::message_on_stdout("port:"))
-        .with_cmd(["--global-response-templating"])
-        .start()
-        .await
-        .expect("start wiremock container");
-    let port = container.get_host_port_ipv4(8080).await.expect("port");
-    reap_on_exit(&format!("docker rm -f {}", container.id()));
-    std::mem::forget(container);
-
-    let url = format!("http://127.0.0.1:{port}");
-    let parts = vec!["{{randomDecimal lower=-1.0 upper=1.0}}"; EMBEDDING_DIMS];
-    let body = format!(
-        "{{\"data\":[{{{{#each (jsonPath request.body '$.input') as |item|}}}}\
-         {{{{#unless @first}}}},{{{{/unless}}}}\
-         {{\"index\":{{{{@index}}}},\"embedding\":[{}]}}\
-         {{{{/each}}}}]}}",
-        parts.join(",")
-    );
-    let mapping = json!({
-        "request": {"method": "POST", "url": "/v1/embeddings"},
-        "response": {"status": 200, "headers": {"Content-Type": "application/json"}, "body": body},
-    });
-    let http = reqwest::Client::new();
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        let sent = http
-            .post(format!("{url}/__admin/mappings"))
-            .json(&mapping)
-            .send()
-            .await;
-        if sent.is_ok_and(|response| response.status().as_u16() == 201) {
-            return format!("{url}/v1");
-        }
-        assert!(Instant::now() < deadline, "wiremock did not become ready");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
 /// Runs `action` when this test binary exits, however it exits.
 #[allow(clippy::zombie_processes)] // The child must outlive this process, so it is never waited on.
 fn reap_on_exit(action: &str) {
@@ -182,15 +139,12 @@ fn reap_on_exit(action: &str) {
         .expect("spawn reaper");
 }
 
-fn server_command(database_url: &str, openai_base: &str, bind: Option<&str>) -> Command {
+fn server_command(database_url: &str, bind: Option<&str>) -> Command {
     let mut command = Command::new(binary());
     command
         .env_clear()
         .env("DATABASE_URL", database_url)
-        .env("MEMORYOS_MODE", "host")
-        .env("MEMORYOS_EMBEDDER", "openai")
-        .env("OPENAI_API_KEY", "test-openai-key")
-        .env("OPENAI_BASE_URL", openai_base)
+        .env("MEMORYOS_TEST_EMBEDDER", "0")
         .env("MEMORYOS_DB_MAX_CONNECTIONS", "8")
         .stdin(Stdio::null());
     if let Some(bind) = bind {
@@ -204,18 +158,14 @@ fn free_port() -> u16 {
     listener.local_addr().expect("address").port()
 }
 
-fn start_server(database_url: &str, openai_base: &str) -> (Child, String) {
+fn start_server(database_url: &str) -> (Child, String) {
     let port = free_port();
-    let child = server_command(
-        database_url,
-        openai_base,
-        Some(&format!("127.0.0.1:{port}")),
-    )
-    .arg("serve")
-    .stdout(Stdio::null())
-    .stderr(Stdio::null())
-    .spawn()
-    .expect("start the server");
+    let child = server_command(database_url, Some(&format!("127.0.0.1:{port}")))
+        .arg("serve")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the server");
     let url = format!("http://127.0.0.1:{port}");
     wait_healthy(&url);
     (child, url)
@@ -240,7 +190,7 @@ fn wait_healthy(url: &str) {
 fn create_key(admin: bool) -> String {
     let world = world();
     let tenant = unique("tenant");
-    let mut command = server_command(&world.database_url, &world.openai_base, None);
+    let mut command = server_command(&world.database_url, None);
     command.args([
         "key",
         "create",
@@ -438,7 +388,6 @@ fn commit_recall_and_candidates_work_in_both_output_forms() {
     let body = sandbox.json(&["recall", &word, "--scope", "agent:a1", "--json"], "");
     assert_eq!(recalled_statements(&body), std::slice::from_ref(&statement));
     assert_eq!(body["facts"][0]["fact"]["id"], id.as_str());
-    assert!(body["pending_episodes"].is_array());
 
     let text = sandbox.ok(&["recall", &word, "--scope", "agent:a1"], "");
     assert!(text.contains(&statement), "{text}");
@@ -713,7 +662,7 @@ fn session_start_is_silent_on_every_failure() {
 #[test]
 fn a_stopped_server_exits_zero_with_empty_stdout() {
     let world = world();
-    let (mut child, url) = start_server(&world.database_url, &world.openai_base);
+    let (mut child, url) = start_server(&world.database_url);
     let sandbox = Sandbox::new(&url, &create_key(true));
     let run = sandbox.run(&["hook", "session-start"], "");
     assert!(

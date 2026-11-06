@@ -19,7 +19,7 @@ fn concrete(path: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn no_token_and_bad_tokens_get_401_on_every_protected_route() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let bad = Key {
         id: random_uuid(),
         token: "mos_notARealTokenAtAllButTheRightLengthForOne1234".to_owned(),
@@ -51,7 +51,7 @@ async fn no_token_and_bad_tokens_get_401_on_every_protected_route() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_revoked_key_stops_working_on_the_next_request() {
     use memoryos_core::MemoryStore;
-    let server = Server::host().await;
+    let server = Server::start().await;
     let key = server.root("revoke").await;
     let (status, _) = server
         .call("GET", "/v1/agents/a1/blocks", Some(&key), None)
@@ -89,7 +89,7 @@ async fn seed_user_b(server: &Server) -> Seeded {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn named_scopes_outside_the_key_get_403() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let s = seed_user_b(&server).await;
     let cases = [
         ("/v1/recall", json!({"scopes": ["user:b"], "query": "boat"})),
@@ -126,7 +126,7 @@ async fn named_scopes_outside_the_key_get_403() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn rows_read_by_id_across_scopes_get_404_with_the_same_body_as_absent_rows() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let s = seed_user_b(&server).await;
     let reads = [
         ("GET", format!("/v1/facts/{}", s.fact), None),
@@ -171,7 +171,7 @@ async fn rows_read_by_id_across_scopes_get_404_with_the_same_body_as_absent_rows
 
 #[tokio::test(flavor = "multi_thread")]
 async fn blocks_require_the_agent_scope() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let root = server.root("blocks").await;
     let narrow = server
         .key("blocks", &["agent:mine", "user:*"], Trust::Agent, false)
@@ -214,7 +214,7 @@ async fn blocks_require_the_agent_scope() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn non_admins_are_blocked_from_admin_routes() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let root = server.root("admin").await;
     let plain = server.key("admin", &["*"], Trust::System, false).await;
     let (fact, status_text, episode) = server.commit_one(&root, "user:u", "Ada sails").await;
@@ -240,7 +240,7 @@ async fn non_admins_are_blocked_from_admin_routes() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_keys_still_respect_scope_patterns() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let root = server.root("admin2").await;
     let admin_a = server.key("admin2", &["user:a"], Trust::System, true).await;
     let (fact, _, episode) = server.commit_one(&root, "user:b", "Ada sails").await;
@@ -281,7 +281,7 @@ async fn quarantine_ids(server: &Server, key: &Key, scopes: &str) -> Vec<Uuid> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_quarantine_wildcard_returns_only_scopes_the_key_may_read() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let root = server.root("wild").await;
     let (in_a, status_text, _) = server.commit_one(&root, "user:a", "Ada sails").await;
     assert_eq!(status_text, "quarantined");
@@ -334,7 +334,7 @@ async fn a_quarantine_wildcard_returns_only_scopes_the_key_may_read() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn one_tenant_sees_nothing_of_another() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let alice = server.root("tenant_a").await;
     let bob = server.root("tenant_b").await;
     let (quarantined, _, episode) = server.commit_one(&alice, "user:u", "Ada sails boats").await;
@@ -422,33 +422,8 @@ async fn one_tenant_sees_nothing_of_another() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn episode_trust_above_the_key_maximum_gets_403() {
-    let server = Server::worker_without_loop().await;
-    let key = server.key("trust", &["*"], Trust::Agent, false).await;
-    let new = |trust: &str| json!({"scope": "agent:a1", "source": "t", "trust": trust, "content": "text"});
-    for trust in ["user", "system"] {
-        let (status, reply) = server
-            .call("POST", "/v1/episodes", Some(&key), Some(new(trust)))
-            .await;
-        assert_error(status, &reply, 403, "forbidden");
-    }
-    for trust in ["external", "agent"] {
-        let (status, reply) = server
-            .call("POST", "/v1/episodes", Some(&key), Some(new(trust)))
-            .await;
-        assert_eq!(status, StatusCode::ACCEPTED, "{reply}");
-    }
-    // A scope outside the key is refused the same way.
-    let narrow = server.key("trust", &["user:a"], Trust::System, false).await;
-    let (status, reply) = server
-        .call("POST", "/v1/episodes", Some(&narrow), Some(new("agent")))
-        .await;
-    assert_error(status, &reply, 403, "forbidden");
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn commit_trust_follows_the_key_and_a_request_cannot_raise_it() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let system = server.key("trust2", &["*"], Trust::System, false).await;
     let external = server.key("trust2", &["*"], Trust::External, false).await;
 
@@ -476,111 +451,42 @@ async fn commit_trust_follows_the_key_and_a_request_cannot_raise_it() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_idempotency_replay_in_another_scope_gets_400_and_reveals_nothing() {
-    let server = Server::worker_without_loop().await;
+    let server = Server::start().await;
     let root = server.root("replay").await;
     let secret = "private text about user b";
-    let new = |scope: &str| {
-        json!({"scope": scope, "source": "t", "trust": "agent", "content": secret,
-               "idempotency_key": "shared-key"})
+    let commit = |scope: &str| {
+        json!({"scope": scope, "source": "t", "content": secret,
+               "idempotency_key": "shared-key", "facts": [statement("x", "Ada")]})
     };
     let (status, original) = server
-        .call("POST", "/v1/episodes", Some(&root), Some(new("user:b")))
+        .call("POST", "/v1/commits", Some(&root), Some(commit("user:b")))
         .await;
-    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(status, StatusCode::OK, "{original}");
 
     let narrow = server.key("replay", &["user:a"], Trust::Agent, false).await;
     let (status, reply) = server
-        .call("POST", "/v1/episodes", Some(&narrow), Some(new("user:a")))
+        .call("POST", "/v1/commits", Some(&narrow), Some(commit("user:a")))
         .await;
     assert_error(status, &reply, 400, "invalid_input");
     let text = reply.to_string();
     assert!(!text.contains(secret), "{text}");
     assert!(!text.contains("user:b"), "{text}");
     assert!(
-        !text.contains(original["id"].as_str().expect("id")),
+        !text.contains(original["episode_id"].as_str().expect("id")),
         "{text}"
     );
 
     // In its own scope a replay returns the first episode.
     let (status, replay) = server
-        .call("POST", "/v1/episodes", Some(&root), Some(new("user:b")))
+        .call("POST", "/v1/commits", Some(&root), Some(commit("user:b")))
         .await;
-    assert_eq!(status, StatusCode::ACCEPTED);
-    assert_eq!(replay["id"], original["id"]);
-
-    // The same rule through a commit, where the key reaches another scope's episode.
-    let commit = |scope: &str| {
-        json!({"scope": scope, "source": "t", "content": secret,
-               "idempotency_key": "shared-key", "facts": [statement("x", "Ada")]})
-    };
-    let (status, reply) = server
-        .call("POST", "/v1/commits", Some(&narrow), Some(commit("user:a")))
-        .await;
-    assert_error(status, &reply, 400, "invalid_input");
-    assert!(!reply.to_string().contains(secret));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn sessions_need_both_the_agent_scope_and_the_memory_scope() {
-    let server = Server::worker_without_loop().await;
-    let agent_only = server
-        .key("sessions", &["agent:a1"], Trust::Agent, false)
-        .await;
-    let memory_only = server
-        .key("sessions", &["user:u"], Trust::Agent, false)
-        .await;
-    let both = server
-        .key("sessions", &["agent:a1", "user:u"], Trust::Agent, false)
-        .await;
-    let body = json!({"scope": "user:u"});
-    for key in [&agent_only, &memory_only] {
-        let (status, reply) = server
-            .call(
-                "POST",
-                "/v1/agents/a1/sessions",
-                Some(key),
-                Some(body.clone()),
-            )
-            .await;
-        assert_error(status, &reply, 403, "forbidden");
-    }
-    let (status, session) = server
-        .call("POST", "/v1/agents/a1/sessions", Some(&both), Some(body))
-        .await;
-    assert_eq!(status, StatusCode::CREATED, "{session}");
-    let id = uuid_at(&session, "/id");
-
-    let messages = format!("/v1/sessions/{id}/messages");
-    for key in [&agent_only, &memory_only] {
-        let (status, reply) = server.call("GET", &messages, Some(key), None).await;
-        assert_error(status, &reply, 404, "not_found");
-        let (status, reply) = server
-            .call("POST", &messages, Some(key), Some(json!({"text": "hi"})))
-            .await;
-        assert_error(status, &reply, 404, "not_found");
-    }
-    let (status, _) = server.call("GET", &messages, Some(&both), None).await;
     assert_eq!(status, StatusCode::OK);
-
-    // A turn writes agent trust, so a key limited to external cannot run one.
-    let external = server
-        .key("sessions", &["agent:a1", "user:u"], Trust::External, false)
-        .await;
-    let (status, reply) = server
-        .call(
-            "POST",
-            &messages,
-            Some(&external),
-            Some(json!({"text": "hi"})),
-        )
-        .await;
-    assert_error(status, &reply, 403, "forbidden");
-    assert_eq!(server.mock.llm_calls().await, 0);
+    assert_eq!(replay["episode_id"], original["episode_id"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sdk_errors_are_typed() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let narrow = server.key("sdk", &["user:a"], Trust::Agent, false).await;
     let mem: MemoryOs = server.sdk(&narrow);
 

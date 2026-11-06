@@ -1,5 +1,5 @@
-//! `Retriever` against real Postgres and a real `OpenAiEmbedder` talking to WireMock. One pair of
-//! containers per test binary; each test clones a migrated template into its own database.
+//! `Retriever` against real Postgres, with the test embedder scripted per query. One container per
+//! test binary; each test clones a migrated template into its own database.
 //!
 //! Vector search returns the nearest 50 facts however far they are, so "found only by" tests seed
 //! 50 closer fillers and confirm the precondition by calling the store directly.
@@ -14,13 +14,13 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeZone, Utc};
 use memoryos_core::{
-    Embedder, Error, FactFilter, FactOp, FactStatus, MemoryStore, NewEntity, NewEpisode, NewFact,
+    Error, FactFilter, FactOp, FactStatus, MemoryStore, NewEntity, NewEpisode, NewFact,
     RequestContext, Scope, ScoredFact, Trust, EMBEDDING_DIMS,
 };
-use memoryos_llm::OpenAiEmbedder;
+use memoryos_embed::TestEmbedder;
 use memoryos_retrieve::{RecallRequest, RecallResponse, Retriever};
 use memoryos_store::PgStore;
-use serde_json::{json, Value};
+use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
@@ -29,41 +29,28 @@ use testcontainers::{GenericImage, ImageExt};
 use uuid::Uuid;
 
 const TEMPLATE_DB: &str = "memoryos_template";
-const EMBEDDINGS_URL: &str = "/v1/embeddings";
 
 /// Embeds to the query direction, angle 0.
 const QUERY: &str = "zebra";
-/// WireMock answers 500 for this input.
+/// The embedder fails for this input.
 const FAILING_QUERY: &str = "failing";
-/// WireMock answers with the zero vector, which the store's vector search refuses.
+/// The embedder answers with the zero vector, which the store's vector search refuses.
 const ZERO_QUERY: &str = "zeroed";
-/// WireMock answers correctly, after `SLOW_REPLY_MS`.
+/// The embedder answers correctly, after `SLOW_REPLY`.
 const SLOW_QUERY: &str = "slowed";
-const SLOW_REPLY_MS: u64 = 3000;
+const SLOW_REPLY: Duration = Duration::from_secs(3);
 /// Far from the query direction, behind every filler.
 const FAR: f32 = 170.0;
 
 // ---- Containers ------------------------------------------------------------------------------
 
-struct Servers {
-    postgres_url: String,
-    wiremock_url: String,
-}
-
-fn servers() -> &'static Servers {
-    static SERVERS: OnceLock<Servers> = OnceLock::new();
-    SERVERS.get_or_init(|| {
+fn postgres_url() -> &'static str {
+    static URL: OnceLock<String> = OnceLock::new();
+    URL.get_or_init(|| {
         std::thread::spawn(|| {
             tokio::runtime::Runtime::new()
                 .expect("runtime")
-                .block_on(async {
-                    let (postgres_url, wiremock_url) =
-                        tokio::join!(start_postgres(), start_wiremock());
-                    Servers {
-                        postgres_url,
-                        wiremock_url,
-                    }
-                })
+                .block_on(start_postgres())
         })
         .join()
         .expect("container thread")
@@ -122,122 +109,6 @@ async fn start_postgres() -> String {
     url
 }
 
-async fn start_wiremock() -> String {
-    let container = GenericImage::new("wiremock/wiremock", "3.3.1")
-        .with_exposed_port(8080.tcp())
-        .with_wait_for(WaitFor::message_on_stdout("port:"))
-        .start()
-        .await
-        .expect("start wiremock container");
-    let port = container.get_host_port_ipv4(8080).await.expect("port");
-    reap_on_exit(container.id());
-    std::mem::forget(container);
-
-    let url = format!("http://127.0.0.1:{port}");
-    let http = reqwest::Client::new();
-    wait_until_ready(&http, &url).await;
-    stub_input(&http, &url, QUERY, 200, embeddings_reply(&at_angle(0.0))).await;
-    stub_input(
-        &http,
-        &url,
-        ZERO_QUERY,
-        200,
-        embeddings_reply(&vec![0.0; EMBEDDING_DIMS]),
-    )
-    .await;
-    stub_input(
-        &http,
-        &url,
-        FAILING_QUERY,
-        500,
-        json!({"error": {"message": "down"}}),
-    )
-    .await;
-    let slow = json!({
-        "request": {
-            "method": "POST",
-            "url": EMBEDDINGS_URL,
-            "bodyPatterns": [{
-                "equalToJson": {"input": [SLOW_QUERY]},
-                "ignoreExtraElements": true,
-            }],
-        },
-        "response": {
-            "status": 200,
-            "fixedDelayMilliseconds": SLOW_REPLY_MS,
-            "jsonBody": embeddings_reply(&at_angle(0.0)),
-        },
-    });
-    let response = http
-        .post(format!("{url}/__admin/mappings"))
-        .json(&slow)
-        .send()
-        .await
-        .expect("register slow stub");
-    assert_eq!(response.status().as_u16(), 201, "stub rejected");
-    url
-}
-
-/// The startup banner can come before the admin API accepts connections.
-async fn wait_until_ready(http: &reqwest::Client, url: &str) {
-    for _ in 0..300 {
-        if let Ok(response) = http.get(format!("{url}/__admin/mappings")).send().await {
-            if response.status().is_success() {
-                return;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("wiremock admin API did not become ready");
-}
-
-async fn stub_input(http: &reqwest::Client, url: &str, input: &str, status: u16, body: Value) {
-    let mapping = json!({
-        "request": {
-            "method": "POST",
-            "url": EMBEDDINGS_URL,
-            "bodyPatterns": [{
-                "equalToJson": {"input": [input]},
-                "ignoreExtraElements": true,
-            }],
-        },
-        "response": {"status": status, "jsonBody": body},
-    });
-    let response = http
-        .post(format!("{url}/__admin/mappings"))
-        .json(&mapping)
-        .send()
-        .await
-        .expect("register stub");
-    assert_eq!(response.status().as_u16(), 201, "stub rejected");
-}
-
-fn embeddings_reply(vector: &[f32]) -> Value {
-    json!({
-        "object": "list",
-        "model": "test",
-        "data": [{"object": "embedding", "index": 0, "embedding": vector}],
-    })
-}
-
-async fn embedding_requests(input: &str) -> u64 {
-    let pattern = json!({
-        "method": "POST",
-        "url": EMBEDDINGS_URL,
-        "bodyPatterns": [{"equalToJson": {"input": [input]}, "ignoreExtraElements": true}],
-    });
-    let reply: Value = reqwest::Client::new()
-        .post(format!("{}/__admin/requests/count", servers().wiremock_url))
-        .json(&pattern)
-        .send()
-        .await
-        .expect("count requests")
-        .json()
-        .await
-        .expect("count body");
-    reply["count"].as_u64().expect("count field")
-}
-
 /// Removes the container when this test binary exits, however it exits.
 #[allow(clippy::zombie_processes)] // The child must outlive this process, so it is never waited on.
 fn reap_on_exit(container_id: &str) {
@@ -268,6 +139,7 @@ async fn connect_with_retry(url: &str) -> PgPool {
 
 struct Fixture {
     store: Arc<PgStore>,
+    embedder: Arc<TestEmbedder>,
     /// Superuser, for injecting faults the store API refuses to create.
     admin: PgPool,
     retriever: Retriever,
@@ -277,25 +149,22 @@ struct Fixture {
 
 async fn fixture() -> Fixture {
     static NEXT_DB: AtomicUsize = AtomicUsize::new(0);
-    let servers = servers();
+    let server = postgres_url();
     let name = format!("recall_{}", NEXT_DB.fetch_add(1, Ordering::Relaxed));
-    let admin = connect_with_retry(&format!("{}/postgres", servers.postgres_url)).await;
+    let admin = connect_with_retry(&format!("{}/postgres", server)).await;
     sqlx::query(&format!("CREATE DATABASE {name} TEMPLATE {TEMPLATE_DB}"))
         .execute(&admin)
         .await
         .expect("clone template");
     admin.close().await;
 
-    let url = format!("{}/{name}", servers.postgres_url);
+    let url = format!("{}/{name}", server);
     let store = Arc::new(PgStore::connect(&url, 16).await.expect("connect store"));
-    let embedder: Arc<dyn Embedder> = Arc::new(OpenAiEmbedder::new(
-        "test-key-not-a-real-secret".into(),
-        "test".into(),
-        Some(format!("{}/v1", servers.wiremock_url)),
-    ));
+    let embedder = Arc::new(scripted_embedder());
     Fixture {
-        retriever: Retriever::new(store.clone(), embedder),
+        retriever: Retriever::new(store.clone(), embedder.clone()),
         store,
+        embedder,
         admin: connect_with_retry(&url).await,
         ctx: tenant("tenant-a"),
         scope: Scope::user("ada"),
@@ -307,6 +176,15 @@ fn tenant(name: &str) -> RequestContext {
         tenant: name.into(),
         actor: "test".into(),
     }
+}
+
+fn scripted_embedder() -> TestEmbedder {
+    let embedder = TestEmbedder::new();
+    embedder.set_vector(QUERY, at_angle(0.0));
+    embedder.set_vector(ZERO_QUERY, vec![0.0; EMBEDDING_DIMS]);
+    embedder.set_failure(FAILING_QUERY);
+    embedder.set_slow(SLOW_QUERY, SLOW_REPLY, at_angle(0.0));
+    embedder
 }
 
 /// Unit vector `degrees` away from the query direction, so cosine similarity is its cosine.
@@ -380,11 +258,11 @@ impl Fixture {
     ) -> Vec<Uuid> {
         let source = self
             .store
-            .insert_unqueued_episode(ctx, episode(scope, trust, "source"))
+            .insert_episode(ctx, episode(scope, trust, "source"))
             .await
             .expect("insert episode");
         self.store
-            .apply_extraction(ctx, source.id, ops)
+            .apply_commit(ctx, source.id, ops)
             .await
             .expect("apply extraction")
     }
@@ -720,14 +598,9 @@ async fn other_tenant_is_absent() {
     let theirs = f
         .apply_in(&other, &f.scope, Trust::User, vec![FactOp::Add(fact)])
         .await[0];
-    f.store
-        .insert_episode(&other, episode(&f.scope, Trust::User, "a zebra is pending"))
-        .await
-        .expect("insert episode");
 
     let response = f.recall(QUERY).await;
     assert_eq!(ids(&response.facts), BTreeSet::from([mine]));
-    assert!(response.pending_episodes.is_empty());
 
     let response = f
         .retriever
@@ -735,7 +608,6 @@ async fn other_tenant_is_absent() {
         .await
         .expect("recall");
     assert_eq!(ids(&response.facts), BTreeSet::from([theirs]));
-    assert_eq!(response.pending_episodes.len(), 1);
 }
 
 #[tokio::test]
@@ -748,23 +620,14 @@ async fn other_scope_is_absent_unless_requested() {
     let theirs = f
         .apply_in(&f.ctx, &elsewhere, Trust::User, vec![FactOp::Add(fact)])
         .await[0];
-    f.store
-        .insert_episode(
-            &f.ctx,
-            episode(&elsewhere, Trust::User, "a zebra is pending"),
-        )
-        .await
-        .expect("insert episode");
 
     let response = f.recall(QUERY).await;
     assert_eq!(ids(&response.facts), BTreeSet::from([mine]));
-    assert!(response.pending_episodes.is_empty());
 
     let mut both = f.request(QUERY);
     both.scopes.push(elsewhere);
     let response = f.retriever.recall(&f.ctx, both).await.expect("recall");
     assert_eq!(ids(&response.facts), BTreeSet::from([mine, theirs]));
-    assert_eq!(response.pending_episodes.len(), 1);
 }
 
 // ---- Failure handling ------------------------------------------------------------------------
@@ -774,16 +637,11 @@ async fn slow_embedding_times_out_and_still_returns_text_results() {
     let f = fixture().await;
     let (a, b) = (f.entity("a").await, f.entity("b").await);
     let text_hit = f.add(a, "the slowed report", 170.0).await;
-    // Near the stubbed vector, so it would appear if the embedding were waited for.
+    // Near the scripted vector, so it would appear if the embedding were waited for.
     f.add(b, "no shared words", 0.0).await;
 
-    let embedder: Arc<dyn Embedder> = Arc::new(OpenAiEmbedder::new(
-        "test-key-not-a-real-secret".into(),
-        "test".into(),
-        Some(format!("{}/v1", servers().wiremock_url)),
-    ));
-    let short =
-        Retriever::new(f.store.clone(), embedder).with_embed_timeout(Duration::from_millis(200));
+    let short = Retriever::new(f.store.clone(), f.embedder.clone())
+        .with_embed_timeout(Duration::from_millis(200));
     let started = Instant::now();
     let response = short
         .recall(&f.ctx, f.request(SLOW_QUERY))
@@ -802,10 +660,7 @@ async fn slow_embedding_times_out_and_still_returns_text_results() {
         .expect("recall");
     let elapsed = started.elapsed();
     assert!(elapsed >= Duration::from_millis(1900), "{elapsed:?}");
-    assert!(
-        elapsed < Duration::from_millis(SLOW_REPLY_MS),
-        "{elapsed:?}"
-    );
+    assert!(elapsed < SLOW_REPLY, "{elapsed:?}");
     assert_eq!(ids(&response.facts), BTreeSet::from([text_hit]));
 }
 
@@ -844,9 +699,8 @@ async fn embedding_failure_still_returns_text_results() {
     let text_hit = f.add(a, "the failing report", 170.0).await;
     let vector_only = f.add(b, "no shared words", 0.0).await;
 
-    let before = embedding_requests(FAILING_QUERY).await;
     let facts = f.recall(FAILING_QUERY).await.facts;
-    assert!(embedding_requests(FAILING_QUERY).await > before);
+    assert_eq!(f.embedder.batches(), [[FAILING_QUERY]]);
 
     let found = ids(&facts);
     assert!(found.contains(&text_hit));
@@ -928,56 +782,6 @@ async fn neighbors_failure_on_one_subject_keeps_the_rest() {
     assert!(!found.contains(&broken_sibling));
 }
 
-// ---- Pending episodes ------------------------------------------------------------------------
-
-#[tokio::test]
-async fn pending_episodes_follow_trust_and_time() {
-    let f = fixture().await;
-    let insert = |trust, content: &'static str| {
-        f.store
-            .insert_episode(&f.ctx, episode(&f.scope, trust, content))
-    };
-    let user = insert(Trust::User, "user zebra").await.expect("insert");
-    let system = insert(Trust::System, "system zebra").await.expect("insert");
-    insert(Trust::Agent, "agent zebra").await.expect("insert");
-    insert(Trust::External, "external zebra")
-        .await
-        .expect("insert");
-    let unrelated = insert(Trust::User, "other words").await.expect("insert");
-    let processed = insert(Trust::User, "done zebra").await.expect("insert");
-    f.store
-        .apply_extraction(&f.ctx, processed.id, vec![])
-        .await
-        .expect("mark processed");
-
-    let response = f.recall(QUERY).await;
-    let pending: BTreeSet<Uuid> = response
-        .pending_episodes
-        .iter()
-        .map(|scored| scored.episode.id)
-        .collect();
-    assert_eq!(pending, BTreeSet::from([user.id, system.id]));
-    assert!(!pending.contains(&unrelated.id));
-
-    let mut with_as_of = f.request(QUERY);
-    with_as_of.as_of = Some(Utc::now());
-    let response = f
-        .retriever
-        .recall(&f.ctx, with_as_of)
-        .await
-        .expect("recall");
-    assert!(response.pending_episodes.is_empty());
-
-    let mut with_known_at = f.request(QUERY);
-    with_known_at.known_at = Some(Utc::now());
-    let response = f
-        .retriever
-        .recall(&f.ctx, with_known_at)
-        .await
-        .expect("recall");
-    assert!(response.pending_episodes.is_empty());
-}
-
 // ---- Candidates ------------------------------------------------------------------------------
 
 #[tokio::test]
@@ -992,10 +796,6 @@ async fn candidates_match_recall_facts_and_stay_current() {
         new: replacement,
     };
     let new = f.apply_in(&f.ctx, &f.scope, Trust::User, vec![op]).await[0];
-    f.store
-        .insert_episode(&f.ctx, episode(&f.scope, Trust::User, "a zebra is pending"))
-        .await
-        .expect("insert episode");
 
     let scopes = [f.scope.clone()];
     let candidates = f
@@ -1076,19 +876,4 @@ async fn limit_defaults_to_10_and_truncates() {
             .expect("candidates");
         assert_eq!(found.len(), expected, "limit {limit}");
     }
-}
-
-#[tokio::test]
-async fn pending_episodes_respect_the_limit() {
-    let f = fixture().await;
-    for _ in 0..3 {
-        f.store
-            .insert_episode(&f.ctx, episode(&f.scope, Trust::User, "a zebra is pending"))
-            .await
-            .expect("insert episode");
-    }
-    let mut request = f.request(QUERY);
-    request.limit = 2;
-    let response = f.retriever.recall(&f.ctx, request).await.expect("recall");
-    assert_eq!(response.pending_episodes.len(), 2);
 }

@@ -1,6 +1,6 @@
 //! Request limits, error shapes and operational endpoints.
 
-use memoryos_core::Trust;
+use memoryos_core::{Scope, Trust};
 use reqwest::header::{CONTENT_TYPE, RETRY_AFTER};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
@@ -11,7 +11,7 @@ const ONE_MIB: usize = 1024 * 1024;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_key_over_its_rate_gets_429_with_retry_after_and_others_do_not() {
-    let server = Server::host_with(&[("MEMORYOS_RATE_LIMIT_RPS", "3")]).await;
+    let server = Server::start_with(&[("MEMORYOS_RATE_LIMIT_RPS", "3")]).await;
     let busy = server.root("rate").await;
     let quiet = server.root("rate").await;
 
@@ -55,7 +55,7 @@ async fn a_key_over_its_rate_gets_429_with_retry_after_and_others_do_not() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn bodies_over_1_mib_are_refused_and_at_1_mib_are_read() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let key = server.root("size").await;
 
     let oversized = "x".repeat(ONE_MIB + 1);
@@ -99,15 +99,15 @@ async fn bodies_over_1_mib_are_refused_and_at_1_mib_are_read() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn content_and_scope_counts_are_limited() {
-    let server = Server::worker_without_loop().await;
+    let server = Server::start().await;
     let key = server.root("content").await;
-    let episode = |content: String| json!({"scope": "agent:a", "source": "s", "trust": "agent", "content": content});
+    let commit = |content: String| json!({"scope": "agent:a", "source": "s", "content": content, "facts": []});
     let (status, reply) = server
         .call(
             "POST",
-            "/v1/episodes",
+            "/v1/commits",
             Some(&key),
-            Some(episode("x".repeat(100_001))),
+            Some(commit("x".repeat(100_001))),
         )
         .await;
     assert_error(status, &reply, 400, "invalid_input");
@@ -115,12 +115,12 @@ async fn content_and_scope_counts_are_limited() {
     let (status, reply) = server
         .call(
             "POST",
-            "/v1/episodes",
+            "/v1/commits",
             Some(&key),
-            Some(episode("\u{e9}".repeat(100_000))),
+            Some(commit("\u{e9}".repeat(100_000))),
         )
         .await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{reply}");
+    assert_eq!(status, StatusCode::OK, "{reply}");
 
     let scopes =
         |count: usize| -> Vec<String> { (0..count).map(|i| format!("user:u{i}")).collect() };
@@ -187,7 +187,7 @@ async fn content_and_scope_counts_are_limited() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn malformed_input_is_a_400_in_the_error_shape() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let key = server.root("bad").await;
 
     for path in ["/v1/recall", "/v1/candidates", "/v1/commits"] {
@@ -211,7 +211,6 @@ async fn malformed_input_is_a_400_in_the_error_shape() {
         "/v1/facts/123/history",
         "/v1/entities/not-a-uuid",
         "/v1/entities/not-a-uuid/neighbors?scopes=user:a",
-        "/v1/sessions/not-a-uuid/messages",
     ] {
         let (status, body) = server.call("GET", path, Some(&key), None).await;
         assert_error(status, &body, 400, "invalid_input");
@@ -250,7 +249,7 @@ async fn malformed_input_is_a_400_in_the_error_shape() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn unknown_routes_and_methods_use_the_error_shape() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let key = server.root("routes").await;
     let (status, body) = server.call("GET", "/v1/nope", Some(&key), None).await;
     assert_error(status, &body, 404, "not_found");
@@ -260,7 +259,7 @@ async fn unknown_routes_and_methods_use_the_error_shape() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn health_ready_and_metrics_are_public_and_carry_no_tenant_labels() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let (status, body) = server.call("GET", "/healthz", None, None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ok");
@@ -336,7 +335,7 @@ async fn health_ready_and_metrics_are_public_and_carry_no_tenant_labels() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn responses_carry_a_request_id_and_keep_a_clean_one() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let (_, headers, _) = server.call_full("GET", "/healthz", None, None).await;
     assert!(!headers["x-request-id"].is_empty());
 
@@ -360,7 +359,7 @@ async fn responses_carry_a_request_id_and_keep_a_clean_one() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn readyz_fails_and_errors_stay_generic_when_the_database_is_gone() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let key = server.root("down").await;
     drop_database(&server.database_url).await;
 
@@ -384,9 +383,12 @@ async fn readyz_fails_and_errors_stay_generic_when_the_database_is_gone() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_request_over_its_time_limit_gets_a_timeout_error() {
-    let server = Server::host_with(&[("MEMORYOS_REQUEST_TIMEOUT_SECS", "1")]).await;
+    let server = Server::start_with(&[
+        ("MEMORYOS_REQUEST_TIMEOUT_SECS", "1"),
+        ("MEMORYOS_TEST_EMBEDDER", "5000"),
+    ])
+    .await;
     let key = server.root("slow").await;
-    server.mock.delay_embeddings(5_000).await;
     let (status, body) = server
         .call(
             "POST",
@@ -403,10 +405,17 @@ async fn a_request_over_its_time_limit_gets_a_timeout_error() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn recall_falls_back_to_text_search_when_embeddings_are_slow() {
-    let server = Server::host().await;
+    let server = Server::start_with(&[("MEMORYOS_TEST_EMBEDDER", "10000")]).await;
     let key = server.root("fallback").await;
-    let (_, _, _) = server.commit_one(&key, "agent:a", "Ada sails boats").await;
-    server.mock.delay_embeddings(10_000).await;
+    server
+        .seed_fact(
+            "fallback",
+            &Scope::agent("a"),
+            Trust::User,
+            "Ada sails boats",
+            None,
+        )
+        .await;
     let started = std::time::Instant::now();
     let found = server.recall_statements(&key, "agent:a", "sails").await;
     assert_eq!(found, ["Ada sails boats"]);
@@ -415,9 +424,8 @@ async fn recall_falls_back_to_text_search_when_embeddings_are_slow() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_completes_an_in_flight_request() {
-    let server = Server::host().await;
+    let server = Server::start_with(&[("MEMORYOS_TEST_EMBEDDER", "1500")]).await;
     let key = server.root("drain").await;
-    server.mock.delay_embeddings(1_500).await;
     let url = format!("{}/v1/commits", server.url);
     let client = server.raw_client().clone();
     let token = key.token.clone();

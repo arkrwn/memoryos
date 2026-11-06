@@ -1,17 +1,16 @@
-//! One Postgres and one WireMock container per test binary. Each test gets its own database, cloned
-//! from a migrated template, and its own URL prefix on WireMock, so tests run in parallel without
-//! sharing jobs, rows or stubs. The router is real and listens on a real socket.
+//! One Postgres container per test binary. Each test gets its own database, cloned from a migrated
+//! template, so tests run in parallel without sharing rows. The router is real and listens on a real
+//! socket. Embeddings come from the test embedder, selected by `MEMORYOS_TEST_EMBEDDER`.
 
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use memoryos_core::{
     FactOp, FactStatus, MemoryStore, NewEntity, NewEpisode, NewFact, RequestContext, Scope, Trust,
     EMBEDDING_DIMS,
 };
-use memoryos_ingest::CancellationToken;
 use memoryos_sdk::{MemoryOs, Options};
 use memoryos_server::app;
 use memoryos_server::auth::{generate_token, hash_token};
@@ -24,8 +23,10 @@ use sqlx::PgPool;
 use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const TEMPLATE_DB: &str = "memoryos_template";
@@ -44,7 +45,6 @@ pub fn unique(prefix: &str) -> String {
 
 struct Containers {
     postgres_url: String,
-    wiremock_url: String,
 }
 
 fn containers() -> &'static Containers {
@@ -54,11 +54,8 @@ fn containers() -> &'static Containers {
             tokio::runtime::Runtime::new()
                 .expect("runtime")
                 .block_on(async {
-                    let (postgres_url, wiremock_url) =
-                        tokio::join!(start_postgres(), start_wiremock());
                     Containers {
-                        postgres_url,
-                        wiremock_url,
+                        postgres_url: start_postgres().await,
                     }
                 })
         })
@@ -133,32 +130,6 @@ async fn connect_admin(url: &str) -> PgPool {
     panic!("postgres did not accept connections");
 }
 
-async fn start_wiremock() -> String {
-    let container = GenericImage::new("wiremock/wiremock", "3.3.1")
-        .with_exposed_port(8080.tcp())
-        .with_wait_for(WaitFor::message_on_stdout("port:"))
-        .with_cmd(["--global-response-templating"])
-        .start()
-        .await
-        .expect("start wiremock container");
-    let port = container.get_host_port_ipv4(8080).await.expect("port");
-    reap_on_exit(container.id());
-    std::mem::forget(container);
-
-    let url = format!("http://127.0.0.1:{port}");
-    let http = reqwest::Client::new();
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while Instant::now() < deadline {
-        if let Ok(response) = http.get(format!("{url}/__admin/mappings")).send().await {
-            if response.status().is_success() {
-                return url;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("wiremock admin API did not become ready");
-}
-
 /// Removes the container when this test binary exits, however it exits.
 #[allow(clippy::zombie_processes)] // The child must outlive this process, so it is never waited on.
 fn reap_on_exit(container_id: &str) {
@@ -212,168 +183,80 @@ pub async fn drop_database(url: &str) {
     admin.close().await;
 }
 
-// ---- WireMock --------------------------------------------------------------------------------
+// ---- A plain HTTP endpoint ---------------------------------------------------------------------
 
-/// This test's corner of WireMock. Every path it stubs starts with `prefix`.
-pub struct Mock {
-    pub prefix: String,
-    http: reqwest::Client,
+/// Records the path of every request it reads. It answers each with 200, or with `stalled` never
+/// answers at all, which is what a model host that hangs looks like.
+pub struct HttpEndpoint {
+    pub url: String,
+    paths: Arc<Mutex<Vec<String>>>,
 }
 
-impl Mock {
-    pub async fn new() -> Self {
-        let mock = Self {
-            prefix: unique("t"),
-            http: reqwest::Client::new(),
-        };
-        mock.stub_embeddings().await;
-        mock
+impl HttpEndpoint {
+    pub async fn answering() -> Self {
+        Self::start(true).await
     }
 
-    fn admin(&self, path: &str) -> String {
-        format!("{}/__admin/{path}", containers().wiremock_url)
+    pub async fn stalled() -> Self {
+        Self::start(false).await
     }
 
-    /// With `/v1`, the form `OPENAI_BASE_URL` takes.
-    pub fn openai_base(&self) -> String {
-        format!("{}/{}/v1", containers().wiremock_url, self.prefix)
+    async fn start(answer: bool) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let recorded = paths.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(serve_requests(stream, recorded.clone(), answer));
+            }
+        });
+        Self {
+            url: format!("http://{address}"),
+            paths,
+        }
     }
 
-    /// Without `/v1`, the form `ANTHROPIC_BASE_URL` takes.
-    pub fn base(&self) -> String {
-        format!("{}/{}", containers().wiremock_url, self.prefix)
+    pub fn requests(&self) -> Vec<String> {
+        self.paths.lock().expect("paths").clone()
     }
+}
 
-    pub fn messages_path(&self) -> String {
-        format!("/{}/v1/messages", self.prefix)
-    }
-
-    pub fn embeddings_path(&self) -> String {
-        format!("/{}/v1/embeddings", self.prefix)
-    }
-
-    pub async fn stub(&self, mapping: Value) {
-        let response = self
-            .http
-            .post(self.admin("mappings"))
-            .json(&mapping)
-            .send()
-            .await
-            .expect("register stub");
-        assert_eq!(response.status().as_u16(), 201, "stub rejected");
-    }
-
-    /// One vector per input, whatever the batch size. Random, so they are all far apart and no two
-    /// entity names merge by similarity. Tests that need a result to be found rely on text search.
-    async fn stub_embeddings(&self) {
-        let parts: Vec<&str> = (0..EMBEDDING_DIMS)
-            .map(|_| "{{randomDecimal lower=-1.0 upper=1.0}}")
-            .collect();
-        let vector = parts.join(",");
-        let body = format!(
-            "{{\"data\":[{{{{#each (jsonPath request.body '$.input') as |item|}}}}\
-             {{{{#unless @first}}}},{{{{/unless}}}}\
-             {{\"index\":{{{{@index}}}},\"embedding\":[{vector}]}}\
-             {{{{/each}}}}]}}"
-        );
-        self.stub(json!({
-            "priority": 9,
-            "request": {"method": "POST", "url": self.embeddings_path()},
-            "response": {
-                "status": 200,
-                "headers": {"Content-Type": "application/json"},
-                "body": body,
-            },
-        }))
-        .await;
-    }
-
-    /// Answers every embedding call after `millis`.
-    pub async fn delay_embeddings(&self, millis: u64) {
-        let parts = vec!["0.5"; EMBEDDING_DIMS];
-        let body = format!(
-            "{{\"data\":[{{{{#each (jsonPath request.body '$.input') as |item|}}}}\
-             {{{{#unless @first}}}},{{{{/unless}}}}\
-             {{\"index\":{{{{@index}}}},\"embedding\":[{}]}}\
-             {{{{/each}}}}]}}",
-            parts.join(",")
-        );
-        self.stub(json!({
-            "priority": 1,
-            "request": {"method": "POST", "url": self.embeddings_path()},
-            "response": {
-                "status": 200,
-                "fixedDelayMilliseconds": millis,
-                "headers": {"Content-Type": "application/json"},
-                "body": body,
-            },
-        }))
-        .await;
-    }
-
-    /// Requests received under this test's prefix whose path matches `pattern`.
-    pub async fn count(&self, pattern: &str) -> u64 {
-        let found: Value = self
-            .http
-            .post(self.admin("requests/count"))
-            .json(&json!({"method": "ANY", "urlPathPattern": format!("/{}{pattern}", self.prefix)}))
-            .send()
-            .await
-            .expect("count requests")
-            .json()
-            .await
-            .expect("count body");
-        found["count"].as_u64().expect("count")
-    }
-
-    /// Any model call, to either provider.
-    pub async fn llm_calls(&self) -> u64 {
-        self.count("/v1/(messages|chat/completions)").await
-    }
-
-    /// A forced call to `tool` whose request contains `text`.
-    pub async fn stub_forced(&self, tool: &str, text: &str, input: Value) {
-        self.stub(json!({
-            "request": {
-                "method": "POST",
-                "url": self.messages_path(),
-                "bodyPatterns": [
-                    {"equalToJson": {"tool_choice": {"type": "tool", "name": tool}},
-                     "ignoreExtraElements": true},
-                    {"contains": text},
-                ],
-            },
-            "response": tool_use_reply(tool, input),
-        }))
-        .await;
-    }
-
-    pub async fn stub_extraction(&self, text: &str, statements: Value) {
-        self.stub_forced("record_extraction", text, json!({"statements": statements}))
-            .await;
-    }
-
-    /// Replies to model calls in order, for requests whose body contains `marker`.
-    pub async fn script(&self, marker: &str, steps: Vec<Value>) {
-        let scenario = unique("scenario");
-        for (index, step) in steps.into_iter().enumerate() {
-            let state = if index == 0 {
-                "Started".to_owned()
-            } else {
-                format!("step-{index}")
-            };
-            self.stub(json!({
-                "scenarioName": scenario,
-                "requiredScenarioState": state,
-                "newScenarioState": format!("step-{}", index + 1),
-                "request": {
-                    "method": "POST",
-                    "url": self.messages_path(),
-                    "bodyPatterns": [{"contains": marker}],
-                },
-                "response": step,
-            }))
-            .await;
+async fn serve_requests(mut stream: TcpStream, paths: Arc<Mutex<Vec<String>>>, answer: bool) {
+    let mut buffer = Vec::new();
+    let mut chunk = [0; 4096];
+    loop {
+        // One complete request is in the buffer once the head has ended and the body has arrived.
+        let head_end = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+        if let Some(head_end) = head_end {
+            let head = String::from_utf8_lossy(&buffer[..head_end]).into_owned();
+            let body_length = head
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if buffer.len() >= head_end + 4 + body_length {
+                let path = head
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_owned();
+                paths.lock().expect("paths").push(path);
+                if !answer {
+                    std::future::pending::<()>().await;
+                }
+                let reply = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
+                if stream.write_all(reply.as_bytes()).await.is_err() {
+                    return;
+                }
+                buffer.drain(..head_end + 4 + body_length);
+                continue;
+            }
+        }
+        match stream.read(&mut chunk).await {
+            Ok(read) if read > 0 => buffer.extend_from_slice(&chunk[..read]),
+            _ => return,
         }
     }
 }
@@ -386,27 +269,32 @@ pub fn statement(text: &str, subject: &str) -> Value {
     })
 }
 
-pub fn tool_use_reply(tool: &str, input: Value) -> Value {
-    json!({
-        "status": 200,
-        "transformers": [],
-        "jsonBody": {
-            "content": [{"type": "tool_use", "id": "toolu_1", "name": tool, "input": input}],
-            "stop_reason": "tool_use",
-            "usage": {"input_tokens": 1, "output_tokens": 1},
-        },
-    })
+pub struct Key {
+    pub id: Uuid,
+    pub token: String,
 }
 
-pub fn text_reply(text: &str) -> Value {
-    json!({
-        "status": 200,
-        "jsonBody": {
-            "content": [{"type": "text", "text": text}],
-            "stop_reason": "end_turn",
-            "usage": {"input_tokens": 3, "output_tokens": 2},
-        },
-    })
+/// What the binary needs to run here, with the test embedder and no model.
+pub fn test_env(database_url: &str) -> Vec<(String, String)> {
+    pairs(&[
+        ("DATABASE_URL", database_url),
+        ("MEMORYOS_TEST_EMBEDDER", "0"),
+        ("MEMORYOS_DB_MAX_CONNECTIONS", "8"),
+    ])
+}
+
+/// The same, with every embedding call taking `millis`.
+pub fn slow_env(database_url: &str, millis: &str) -> Vec<(String, String)> {
+    let mut env = test_env(database_url);
+    env.push(("MEMORYOS_TEST_EMBEDDER".to_owned(), millis.to_owned()));
+    env
+}
+
+pub fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
+    items
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect()
 }
 
 // ---- Server ----------------------------------------------------------------------------------
@@ -414,75 +302,20 @@ pub fn text_reply(text: &str) -> Value {
 pub struct Server {
     pub url: String,
     pub database_url: String,
-    pub mock: Mock,
     pub store: Arc<PgStore>,
     http: reqwest::Client,
     shutdown: CancellationToken,
     task: JoinHandle<Result<(), String>>,
 }
 
-#[derive(Clone)]
-pub struct Key {
-    pub id: Uuid,
-    pub token: String,
-}
-
-pub fn env_for_host(mock: &Mock, database_url: &str) -> Vec<(String, String)> {
-    pairs(&[
-        ("DATABASE_URL", database_url),
-        ("MEMORYOS_MODE", "host"),
-        ("MEMORYOS_EMBEDDER", "openai"),
-        ("OPENAI_API_KEY", "test-openai-key"),
-        ("OPENAI_BASE_URL", &mock.openai_base()),
-        ("MEMORYOS_DB_MAX_CONNECTIONS", "8"),
-    ])
-}
-
-pub fn env_for_worker(mock: &Mock, database_url: &str) -> Vec<(String, String)> {
-    pairs(&[
-        ("DATABASE_URL", database_url),
-        ("MEMORYOS_MODE", "worker"),
-        ("MEMORYOS_EMBEDDER", "openai"),
-        ("OPENAI_API_KEY", "test-openai-key"),
-        ("OPENAI_BASE_URL", &mock.openai_base()),
-        ("ANTHROPIC_API_KEY", "test-anthropic-key"),
-        ("ANTHROPIC_BASE_URL", &mock.base()),
-        ("MEMORYOS_DB_MAX_CONNECTIONS", "8"),
-    ])
-}
-
-fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
-    items
-        .iter()
-        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-        .collect()
-}
-
 impl Server {
-    pub async fn host() -> Self {
-        Self::start(true, &[], false).await
+    pub async fn start() -> Self {
+        Self::start_with(&[]).await
     }
 
-    pub async fn worker() -> Self {
-        Self::start(false, &[], true).await
-    }
-
-    pub async fn host_with(extra: &[(&str, &str)]) -> Self {
-        Self::start(true, extra, false).await
-    }
-
-    pub async fn worker_without_loop() -> Self {
-        Self::start(false, &[], false).await
-    }
-
-    async fn start(host: bool, extra: &[(&str, &str)], run_worker: bool) -> Self {
-        let mock = Mock::new().await;
+    pub async fn start_with(extra: &[(&str, &str)]) -> Self {
         let database_url = fresh_database().await;
-        let mut env = if host {
-            env_for_host(&mock, &database_url)
-        } else {
-            env_for_worker(&mock, &database_url)
-        };
+        let mut env = test_env(&database_url);
         env.extend(pairs(extra));
         let config = Config::from_lookup(|name| {
             env.iter()
@@ -495,14 +328,13 @@ impl Server {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("address");
         let shutdown = CancellationToken::new();
-        let task = tokio::spawn(app::serve(config, listener, run_worker, shutdown.clone()));
+        let task = tokio::spawn(app::serve(config, listener, shutdown.clone()));
         let store = PgStore::connect(&database_url, 3)
             .await
             .expect("test store");
         let server = Self {
             url: format!("http://{address}"),
             database_url,
-            mock,
             store: Arc::new(store),
             http: reqwest::Client::new(),
             shutdown,
@@ -647,7 +479,7 @@ impl Server {
         statements_in(&body)
     }
 
-    /// Writes a fact directly, for trust levels the API cannot reach in the mode under test.
+    /// Writes a fact directly, for trust levels commits cannot reach.
     pub async fn seed_fact(
         &self,
         tenant: &str,
@@ -673,7 +505,7 @@ pub async fn seed_fact(
         actor: "test".to_owned(),
     };
     let episode = store
-        .insert_unqueued_episode(
+        .insert_episode(
             &ctx,
             NewEpisode {
                 scope: scope.clone(),
@@ -719,7 +551,7 @@ pub async fn seed_fact(
         None => FactOp::Add(new),
     };
     let ids = store
-        .apply_extraction(&ctx, episode.id, vec![op])
+        .apply_commit(&ctx, episode.id, vec![op])
         .await
         .expect("seed fact");
     ids[0]
@@ -763,22 +595,6 @@ pub fn assert_error(status: StatusCode, body: &Value, expected: u16, code: &str)
         Some(2),
         "{body}"
     );
-}
-
-/// Waits for a condition the worker makes true.
-pub async fn eventually<F, Fut>(what: &str, mut check: F)
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
-        if check().await {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("timed out waiting for {what}");
 }
 
 pub fn random_uuid() -> Uuid {

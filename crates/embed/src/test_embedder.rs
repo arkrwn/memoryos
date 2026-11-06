@@ -122,7 +122,10 @@ mod tests {
     #[tokio::test]
     async fn the_same_text_gets_the_same_vector_of_the_fixed_width() {
         let embedder = TestEmbedder::new();
-        let vectors = embedder.embed(&inputs(&["a", "b", "a"])).await.expect("embed");
+        let vectors = embedder
+            .embed(&inputs(&["a", "b", "a"]))
+            .await
+            .expect("embed");
         assert_eq!(vectors.len(), 3);
         assert_eq!(vectors[0].len(), EMBEDDING_DIMS);
         assert_eq!(vectors[0], vectors[2]);
@@ -151,12 +154,12 @@ mod tests {
         assert!(embedder.embed(&inputs(&["b"])).await.is_ok());
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn delays_wait_before_answering() {
-        let embedder = TestEmbedder::new().with_delay(Duration::from_secs(5));
-        embedder.set_slow("a", Duration::from_secs(5), vec![1.0]);
-        let started = tokio::time::Instant::now();
+        let embedder = TestEmbedder::new().with_delay(Duration::from_millis(20));
+        embedder.set_slow("a", Duration::from_millis(20), vec![1.0]);
+        let started = std::time::Instant::now();
         embedder.embed(&inputs(&["a"])).await.expect("embed");
-        assert_eq!(started.elapsed().as_secs(), 10);
+        assert!(started.elapsed() >= Duration::from_millis(40));
     }
 }
