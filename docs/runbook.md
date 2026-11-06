@@ -295,7 +295,7 @@ docker volume ls --filter dangling=true
 
 | Source | Note |
 |---|---|
-| Build cache | Largest. A clean image build used about 4 GB here |
+| Build cache | Largest. A clean image build used about 3 GB here |
 | Old images | Each `--build` leaves the previous `memoryos:local` untagged |
 | `pgdata` | Normal growth. Closed facts are kept on purpose, so this does not shrink by itself |
 | `model-cache` | Fixed at 465 MiB |

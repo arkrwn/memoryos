@@ -35,7 +35,7 @@ jobs:
       # Integration tests start pgvector/pgvector:pg17 and wiremock/wiremock:3.3.1 through Docker.
       - name: Test
         run: >-
-          cargo test --workspace --locked
+          cargo test --workspace --locked --no-fail-fast
           --features memoryos-store/integration,memoryos-llm/integration,memoryos-ingest/integration,memoryos-retrieve/integration,memoryos-agent/integration,memoryos-eval/integration,memoryos-server/integration
 
   deny:
