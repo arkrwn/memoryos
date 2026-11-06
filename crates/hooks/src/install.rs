@@ -18,12 +18,26 @@ const SESSION_START_EVENT: &str = "SessionStart";
 const STOP_EVENT: &str = "Stop";
 const SESSION_START_COMMAND: &str = "memoryos hook session-start";
 const STOP_COMMAND: &str = "memoryos hook stop";
-const SESSION_START_MATCHER: &str = "startup|resume|compact";
+const SESSION_START_MATCHER: &str = "startup|resume|clear|compact";
+/// Every matcher an install has written, so uninstall also removes what older installs left.
+const SESSION_START_MATCHERS: &[&str] = &[SESSION_START_MATCHER, "startup|resume|compact"];
 const CLAUDE_AUTHORIZATION: &str = "Bearer ${MEMORYOS_API_KEY}";
 const OPENCODE_AUTHORIZATION: &str = "Bearer {env:MEMORYOS_API_KEY}";
 
 /// From `README.md`, "OpenCode setup".
+///
+/// `.nothrow()` stops Bun Shell raising on a non-zero exit, so a missing `memoryos` cannot fail the
+/// compaction hook: Bun 1.3 returns empty text for a command that does not exist.
 const OPENCODE_PLUGIN: &str = r#"export const MemoryOS = async ({ $ }) => ({
+  "experimental.session.compacting": async (_input, output) => {
+    const memories = await $`memoryos hook session-start`.nothrow().text();
+    if (memories.trim()) output.context.push(memories);
+  },
+});
+"#;
+
+/// What older installs wrote, so uninstall still recognizes it.
+const OLD_OPENCODE_PLUGIN: &str = r#"export const MemoryOS = async ({ $ }) => ({
   "experimental.session.compacting": async (_input, output) => {
     const memories = await $`memoryos hook session-start`.text();
     output.context.push(memories);
@@ -414,11 +428,11 @@ fn uninstall_claude_hooks(existing: Option<&str>) -> Result<Outcome, String> {
         changed |= remove_hook(
             hooks,
             SESSION_START_EVENT,
-            Some(SESSION_START_MATCHER),
+            SESSION_START_MATCHERS,
             SESSION_START_COMMAND,
             &mut notes,
         );
-        changed |= remove_hook(hooks, STOP_EVENT, None, STOP_COMMAND, &mut notes);
+        changed |= remove_hook(hooks, STOP_EVENT, &[], STOP_COMMAND, &mut notes);
         if changed && hooks.is_empty_container() {
             root.remove_key("hooks");
         }
@@ -426,12 +440,13 @@ fn uninstall_claude_hooks(existing: Option<&str>) -> Result<Outcome, String> {
     Ok(finish(&root, changed, true, notes))
 }
 
-/// Removes only the handler `install` writes, from a group with the matcher `install` writes. A
-/// handler the user changed, for example by adding a timeout, is theirs now and is reported.
+/// Removes only the handler `install` writes, from a group with a matcher `install` writes, where
+/// an empty list means no matcher. A handler the user changed, for example by adding a timeout, is
+/// theirs now and is reported.
 fn remove_hook(
     hooks: &mut Doc,
     event: &str,
-    matcher: Option<&str>,
+    matchers: &[&str],
     command: &str,
     notes: &mut Vec<String>,
 ) -> bool {
@@ -442,7 +457,7 @@ fn remove_hook(
     let mut removed = false;
     let mut left = false;
     groups.retain_mut(|group| {
-        let same_matcher = has_matcher(group, matcher);
+        let same_matcher = has_matcher(group, matchers);
         let only_known_keys = match group {
             Doc::Obj(entries) => entries.iter().all(|(k, _)| k == "matcher" || k == "hooks"),
             _ => false,
@@ -473,12 +488,14 @@ fn remove_hook(
     removed
 }
 
-fn has_matcher(group: &Doc, matcher: Option<&str>) -> bool {
+fn has_matcher(group: &Doc, matchers: &[&str]) -> bool {
     let actual = group.get("matcher").map(Doc::to_value);
-    match matcher {
-        Some(matcher) => actual == Some(json!(matcher)),
-        None => actual.is_none() || actual == Some(json!("")),
+    if matchers.is_empty() {
+        return actual.is_none() || actual == Some(json!(""));
     }
+    matchers
+        .iter()
+        .any(|matcher| actual == Some(json!(matcher)))
 }
 
 fn unchanged() -> Outcome {
@@ -665,7 +682,7 @@ fn install_plugin(existing: Option<&str>) -> Outcome {
 fn uninstall_plugin(existing: Option<&str>) -> Outcome {
     match existing {
         None => unchanged(),
-        Some(OPENCODE_PLUGIN) => Outcome {
+        Some(OPENCODE_PLUGIN | OLD_OPENCODE_PLUGIN) => Outcome {
             after: After::Remove,
             notes: vec!["removed the MemoryOS plugin".to_owned()],
         },
@@ -695,7 +712,7 @@ mod tests {
 
     fn start_group() -> Value {
         json!({
-            "matcher": "startup|resume|compact",
+            "matcher": "startup|resume|clear|compact",
             "hooks": [{"type": "command", "command": "memoryos hook session-start"}],
         })
     }
@@ -858,6 +875,28 @@ mod tests {
         .to_string();
         let outcome = uninstall_claude_hooks(Some(&shape)).expect("ok");
         assert_eq!(outcome.after, After::Unchanged);
+    }
+
+    #[test]
+    fn session_start_runs_after_clear() {
+        let text = written(install_claude_hooks(None).expect("install"));
+        let matcher = value(&text)["hooks"]["SessionStart"][0]["matcher"]
+            .as_str()
+            .expect("matcher")
+            .to_owned();
+        let events: Vec<_> = matcher.split('|').collect();
+        assert_eq!(events, ["startup", "resume", "clear", "compact"]);
+    }
+
+    #[test]
+    fn uninstall_removes_the_matcher_an_older_install_wrote() {
+        let shape =
+            json!({"hooks": {"SessionStart": [{"matcher": "startup|resume|compact", "hooks": [
+                {"type": "command", "command": "memoryos hook session-start"},
+            ]}]}})
+            .to_string();
+        let outcome = uninstall_claude_hooks(Some(&shape)).expect("ok");
+        assert_eq!(outcome.after, After::Remove);
     }
 
     #[test]
@@ -1038,6 +1077,20 @@ mod tests {
         assert_eq!(uninstall_plugin(Some(OPENCODE_PLUGIN)).after, After::Remove);
         assert_eq!(uninstall_plugin(Some("mine")).after, After::Unchanged);
         assert_eq!(uninstall_plugin(None).after, After::Unchanged);
+    }
+
+    #[test]
+    fn the_plugin_cannot_raise_or_push_empty_text() {
+        assert!(OPENCODE_PLUGIN.contains("`memoryos hook session-start`.nothrow().text()"));
+        assert!(OPENCODE_PLUGIN.contains("if (memories.trim()) output.context.push(memories);"));
+    }
+
+    #[test]
+    fn uninstall_removes_the_plugin_an_older_install_wrote() {
+        assert_eq!(
+            uninstall_plugin(Some(OLD_OPENCODE_PLUGIN)).after,
+            After::Remove
+        );
     }
 
     // ---- Plans and files ----

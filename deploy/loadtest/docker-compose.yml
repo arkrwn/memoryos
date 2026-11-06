@@ -1,0 +1,27 @@
+# Postgres for the recall load test. Keeps data on a named Docker volume, with an exact name so it
+# can be removed by that name. Choose settings with --env-file load.env, serve.env or shipped.env.
+name: memoryos-loadtest
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: memoryos-loadtest-postgres
+    environment:
+      POSTGRES_PASSWORD: loadtest
+    ports:
+      - 127.0.0.1:55432:5432
+    # Parallel HNSW builds keep the graph in shared memory.
+    shm_size: ${LT_SHM_SIZE:-256m}
+    command: postgres ${LT_PG_FLAGS:-}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    stop_grace_period: 120s
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U postgres]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+volumes:
+  pgdata:
+    name: memoryos-loadtest-pgdata

@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use memoryos_core::{Error, RequestContext, Result};
+use memoryos_core::{Error, Fact, RequestContext, Result, Scope};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Postgres, Transaction};
 
@@ -10,6 +10,8 @@ mod facts;
 mod rows;
 mod store_impl;
 mod validate;
+
+use rows::FACT_COLS;
 
 /// Postgres-backed store. Cheap to clone: it only holds the connection pool.
 #[derive(Debug, Clone)]
@@ -31,6 +33,39 @@ impl PgStore {
             .await
             .map_err(db)?;
         Ok(PgStore { pool })
+    }
+
+    /// `list_quarantined` for exact scopes plus scope prefixes. An empty prefix matches every scope
+    /// of the tenant, so the caller must already have reduced prefixes to what its key may read.
+    /// `starts_with` and not `LIKE`, because `_` is legal in a scope and would be a wildcard.
+    pub async fn list_quarantined_matching(
+        &self,
+        ctx: &RequestContext,
+        exact: &[Scope],
+        prefixes: &[String],
+        limit: i64,
+    ) -> Result<Vec<Fact>> {
+        let limit = validate::limit(limit)?;
+        if exact.is_empty() && prefixes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut tx = self.tenant_tx(ctx).await?;
+        let sql = format!(
+            "SELECT {FACT_COLS} FROM facts f \
+             WHERE f.status = 'quarantined' AND (f.scope = ANY($1) OR EXISTS ( \
+                 SELECT 1 FROM unnest($2::text[]) AS p(prefix) WHERE starts_with(f.scope, p.prefix))) \
+             ORDER BY f.recorded_at, f.id LIMIT $3"
+        );
+        let found = sqlx::query(&sql)
+            .bind(validate::scope_strings(exact))
+            .bind(prefixes)
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db)?;
+        let result = found.iter().map(rows::fact).collect::<Result<_>>()?;
+        tx.commit().await.map_err(db)?;
+        Ok(result)
     }
 
     pub async fn migrate(&self) -> Result<()> {

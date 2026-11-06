@@ -44,6 +44,7 @@ pub struct AppState {
 /// The parts `serve` and `worker` share.
 struct Providers {
     store: Arc<dyn MemoryStore>,
+    pg: PgStore,
     embedder: Arc<dyn Embedder>,
     llm: Option<Arc<dyn Llm>>,
 }
@@ -53,7 +54,8 @@ async fn providers(config: &Config) -> Result<Providers, String> {
         .await
         .map_err(|e| format!("cannot connect to the database: {e}"))?;
     Ok(Providers {
-        store: Arc::new(store),
+        store: Arc::new(store.clone()),
+        pg: store,
         embedder: build_embedder(config)?,
         llm: config.llm.as_ref().map(build_llm),
     })
@@ -138,6 +140,7 @@ pub async fn serve(
     });
     let services = Services {
         store: providers.store.clone(),
+        pg: providers.pg.clone(),
         retriever,
         committer: HostCommitter::new(providers.store.clone(), providers.embedder.clone()),
         runtime,
