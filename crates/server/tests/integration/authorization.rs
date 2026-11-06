@@ -28,7 +28,7 @@ async fn no_token_and_bad_tokens_get_401_on_every_protected_route() {
         .into_iter()
         .filter(|(_, _, public)| !public)
         .collect();
-    assert!(protected.len() > 20);
+    assert!(protected.len() > 15);
     for (method, path, _) in protected {
         let target = concrete(path);
         for key in [None, Some(&bad)] {

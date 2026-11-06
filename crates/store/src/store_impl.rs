@@ -185,7 +185,7 @@ impl MemoryStore for PgStore {
         ops: Vec<FactOp>,
     ) -> Result<Vec<Uuid>> {
         let mut tx = self.tenant_tx(ctx).await?;
-        // The row lock serializes concurrent or retried jobs for one episode. The loser waits
+        // The row lock serializes concurrent commits of one episode. The loser waits
         // here, then reads the winner's processed_at and does nothing.
         let row = sqlx::query(
             "SELECT scope, trust, processed_at IS NOT NULL AS processed \
