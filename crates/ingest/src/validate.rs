@@ -1,0 +1,42 @@
+//! Text checks and normalization shared by both write modes.
+
+/// Maximum episode content, in characters (SPEC section 9).
+pub(crate) const MAX_CONTENT_CHARS: usize = 100_000;
+
+/// A value the store would refuse: blank, or holding a NUL, which PostgreSQL cannot store.
+pub(crate) fn is_blank_or_unstorable(value: &str) -> bool {
+    value.trim().is_empty() || value.contains('\0')
+}
+
+/// Must match `normalize_name` in `memoryos-store`, which is private to that crate and keys
+/// `upsert_entity`: case-insensitive, with whitespace runs collapsed.
+pub(crate) fn normalize_name(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// `Person` and `person` are one kind. The store compares kinds exactly.
+pub(crate) fn normalize_kind(kind: &str) -> String {
+    kind.trim().to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blank_and_nul_are_refused() {
+        for bad in ["", "   ", "\t\n", "a\0b"] {
+            assert!(is_blank_or_unstorable(bad), "{bad:?}");
+        }
+        assert!(!is_blank_or_unstorable(" a "));
+    }
+
+    #[test]
+    fn normalization_collapses_case_and_whitespace() {
+        assert_eq!(normalize_name("  Ada \t LOVELACE "), "ada lovelace");
+        assert_eq!(normalize_kind(" Person "), "person");
+    }
+}
