@@ -14,28 +14,6 @@ x-image: &image
 # `:?` stops Compose with this message when the password is unset. No password lives in this file.
 x-database-url: &database-url postgres://memoryos:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env, see deploy/.env.example}@postgres:5432/memoryos
 
-x-server: &server
-  <<: *image
-  restart: unless-stopped
-  depends_on:
-    postgres:
-      condition: service_healthy
-    migrate:
-      condition: service_completed_successfully
-  mem_limit: ${MEMORYOS_MEM_LIMIT:-1536m}
-  stop_grace_period: 30s
-  read_only: true
-  tmpfs:
-    - /tmp
-  cap_drop:
-    - ALL
-  security_opt:
-    - no-new-privileges:true
-  ports:
-    - ${MEMORYOS_PUBLISH:-127.0.0.1:8080}:8080
-  volumes:
-    - model-cache:/var/lib/memoryos/models
-
 services:
   postgres:
     image: pgvector/pgvector:pg17
@@ -71,8 +49,27 @@ services:
 
   # No LLM key. The agent's own model extracts facts and sends them to /v1/commits.
   memoryos:
-    <<: *server
+    <<: *image
     command: [serve]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    mem_limit: ${MEMORYOS_MEM_LIMIT:-1536m}
+    stop_grace_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - ${MEMORYOS_PUBLISH:-127.0.0.1:8080}:8080
+    volumes:
+      - model-cache:/var/lib/memoryos/models
     environment:
       DATABASE_URL: *database-url
       # Spelled out because an empty RUST_LOG would silence everything below errors.
@@ -80,7 +77,6 @@ services:
       MEMORYOS_RATE_LIMIT_RPS: ${MEMORYOS_RATE_LIMIT_RPS:-}
       MEMORYOS_DB_MAX_CONNECTIONS: ${MEMORYOS_DB_MAX_CONNECTIONS:-}
       MEMORYOS_REQUEST_TIMEOUT_SECS: ${MEMORYOS_REQUEST_TIMEOUT_SECS:-}
-      MEMORYOS_MCP_ALLOWED_ORIGINS: ${MEMORYOS_MCP_ALLOWED_ORIGINS:-}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
     # /readyz fails until the model has loaded, up to 15 minutes on a first start.
     healthcheck:

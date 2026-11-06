@@ -246,19 +246,11 @@ fn scored_text(facts: &[ScoredFact], when_empty: &str) -> String {
 }
 
 fn recall_text(response: &RecallResponse) -> String {
-    let mut out = scored_text(&response.facts, "no memories found");
-    for pending in &response.pending_episodes {
-        let episode = &pending.episode;
-        out.push_str(&format!(
-            "\npending episode {}  {}  {}",
-            episode.id, episode.scope, episode.content
-        ));
-    }
-    out
+    scored_text(&response.facts, "no memories found")
 }
 
 fn recall_json(response: &RecallResponse) -> String {
-    json!({"facts": response.facts, "pending_episodes": response.pending_episodes}).to_string()
+    json!({"facts": response.facts}).to_string()
 }
 
 fn commit_text(response: &CommitResponse) -> String {
@@ -363,13 +355,10 @@ mod tests {
     #[test]
     fn empty_results_say_so() {
         assert_eq!(quarantine_text(&[]), "no quarantined facts");
-        let response = RecallResponse {
-            facts: vec![],
-            pending_episodes: vec![],
-        };
+        let response = RecallResponse { facts: vec![] };
         assert_eq!(recall_text(&response), "no memories found");
         let value: Value = serde_json::from_str(&recall_json(&response)).expect("json");
-        assert_eq!(value, json!({"facts": [], "pending_episodes": []}));
+        assert_eq!(value, json!({"facts": []}));
     }
 
     #[test]

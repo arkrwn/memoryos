@@ -1871,25 +1871,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
-name = "memoryos-agent"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "memoryos-core",
- "memoryos-llm",
- "memoryos-store",
- "reqwest",
- "serde",
- "serde_json",
- "testcontainers",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "memoryos-core"
 version = "0.1.0"
 dependencies = [
@@ -1899,6 +1880,18 @@ dependencies = [
  "serde_json",
  "thiserror",
  "uuid",
+]
+
+[[package]]
+name = "memoryos-embed"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "dirs",
+ "fastembed",
+ "memoryos-core",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1942,37 +1935,16 @@ name = "memoryos-ingest"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "fastrand",
  "memoryos-core",
- "memoryos-llm",
+ "memoryos-embed",
  "memoryos-store",
- "reqwest",
  "serde",
  "serde_json",
  "sqlx",
  "testcontainers",
  "tokio",
- "tokio-util",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "memoryos-llm"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "dirs",
- "fastembed",
- "fastrand",
- "httpdate",
- "memoryos-core",
- "reqwest",
- "serde",
- "serde_json",
- "testcontainers",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -1982,9 +1954,8 @@ dependencies = [
  "chrono",
  "futures",
  "memoryos-core",
- "memoryos-llm",
+ "memoryos-embed",
  "memoryos-store",
- "reqwest",
  "serde",
  "serde_json",
  "sqlx",
@@ -2018,11 +1989,10 @@ dependencies = [
  "chrono",
  "clap",
  "getrandom 0.3.4",
- "memoryos-agent",
  "memoryos-core",
+ "memoryos-embed",
  "memoryos-hooks",
  "memoryos-ingest",
- "memoryos-llm",
  "memoryos-retrieve",
  "memoryos-sdk",
  "memoryos-store",
@@ -2038,6 +2008,7 @@ dependencies = [
  "sqlx",
  "testcontainers",
  "tokio",
+ "tokio-util",
  "tower-http",
  "tracing",
  "tracing-opentelemetry",

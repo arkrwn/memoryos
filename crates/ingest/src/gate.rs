@@ -1,5 +1,4 @@
-//! The trust gate of SPEC section 5, and the only place that builds a `FactOp`. The worker and host
-//! mode both come through `build_op`.
+//! The trust gate of SPEC section 5, and the only place that builds a `FactOp`.
 
 use chrono::{DateTime, Utc};
 use memoryos_core::{source_requires_quarantine, FactOp, FactStatus, NewFact, Scope, Trust};
@@ -34,7 +33,8 @@ pub(crate) enum Resolution {
     },
 }
 
-/// SPEC section 5. `contradicted` is the trust of the fact the statement would supersede.
+/// SPEC section 5. `contradicted` is the trust of the fact the statement would supersede. An `Add`
+/// that declares nothing can still be held by the store, on subject and predicate.
 pub(crate) fn status_for(scope: &Scope, trust: Trust, contradicted: Option<Trust>) -> FactStatus {
     let outranked = contradicted.is_some_and(|old| old > trust);
     if source_requires_quarantine(scope, trust) || outranked {

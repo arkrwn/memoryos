@@ -12,8 +12,8 @@ use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
 
 use crate::common::{
-    empty_database, env_for_host, env_for_worker, eventually, fresh_database, seed_fact, statement,
-    unique, Mock,
+    empty_database, fresh_database, pairs, seed_fact, slow_env, statement, test_env, unique,
+    HttpEndpoint,
 };
 
 const BINARY: &str = env!("CARGO_BIN_EXE_memoryos");
@@ -135,47 +135,7 @@ impl Running {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn worker_mode_fails_fast_without_the_llm_key() {
-    let url = fresh_database().await;
-    let mock = Mock::new().await;
-    let without_anthropic: Vec<(String, String)> = env_for_worker(&mock, &url)
-        .into_iter()
-        .filter(|(name, _)| name != "ANTHROPIC_API_KEY")
-        .collect();
-    for args in [&["serve"][..], &["serve", "--no-worker"], &["worker"]] {
-        let started = Instant::now();
-        let output = run(&without_anthropic, args).await;
-        assert!(!output.success, "{args:?} should refuse to start");
-        assert!(
-            output.stderr.contains("ANTHROPIC_API_KEY"),
-            "{args:?}: {}",
-            output.stderr
-        );
-        assert!(started.elapsed() < Duration::from_secs(5), "{args:?}");
-    }
-
-    // The openai provider needs its own key, and so does the default embedder.
-    let without_openai: Vec<(String, String)> = env_for_worker(&mock, &url)
-        .into_iter()
-        .filter(|(name, _)| name != "OPENAI_API_KEY")
-        .collect();
-    let output = run(&without_openai, &["serve"]).await;
-    assert!(!output.success);
-    assert!(
-        output.stderr.contains("OPENAI_API_KEY"),
-        "{}",
-        output.stderr
-    );
-
-    // The worker command makes no sense in host mode.
-    let output = run(&env_for_host(&mock, &url), &["worker"]).await;
-    assert!(!output.success);
-    assert!(
-        output.stderr.contains("MEMORYOS_MODE=worker"),
-        "{}",
-        output.stderr
-    );
-
+async fn serve_fails_fast_without_a_database_url() {
     // Nothing runs with no database, and the message says what is missing.
     let output = run(&[], &["serve"]).await;
     assert!(!output.success);
@@ -277,10 +237,9 @@ async fn migrate_and_key_commands_work_on_a_new_database() {
 #[tokio::test(flavor = "multi_thread")]
 async fn sigterm_completes_an_in_flight_request_and_logs_stay_clean() {
     let url = fresh_database().await;
-    let mock = Mock::new().await;
     let token = create_key(&url, "signals", &[]).await;
     let secret = format!("very-private-memory-{}", unique("s"));
-    let server = Running::start(env_for_host(&mock, &url), &["serve"]).await;
+    let server = Running::start(slow_env(&url, "1500"), &["serve"]).await;
 
     // A normal request, so the log has a line for one with content in it.
     let response = server
@@ -297,7 +256,6 @@ async fn sigterm_completes_an_in_flight_request_and_logs_stay_clean() {
         .expect("commit");
     assert_eq!(response.status(), StatusCode::OK);
 
-    mock.delay_embeddings(1_500).await;
     let in_flight = tokio::spawn({
         let http = server.http.clone();
         let url = format!("{}/v1/commits", server.url);
@@ -333,105 +291,39 @@ async fn sigterm_completes_an_in_flight_request_and_logs_stay_clean() {
     assert_eq!(request_line["span"]["route"], "/v1/commits");
     assert_eq!(request_line["fields"]["status"], 200);
 
-    // Neither the bearer token, the provider key nor memory content is logged.
-    for leak in [token.as_str(), "test-openai-key", secret.as_str()] {
+    // Neither the bearer token nor memory content is logged.
+    for leak in [token.as_str(), secret.as_str()] {
         assert!(!output.stdout.contains(leak), "the log holds {leak}");
         assert!(!output.stderr.contains(leak), "stderr holds {leak}");
     }
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sigint_also_stops_the_server_and_the_embedded_worker() {
+async fn sigint_also_stops_the_server() {
     let url = fresh_database().await;
-    let mock = Mock::new().await;
-    let server = Running::start(env_for_worker(&mock, &url), &["serve"]).await;
+    let server = Running::start(test_env(&url), &["serve"]).await;
     let output = server.stop("INT").await;
     assert!(output.success, "exit status: {}", output.stderr);
     assert!(
-        output.stdout.contains("worker started"),
+        output.stdout.contains("server started"),
         "{}",
         output.stdout
     );
     assert!(
-        output.stdout.contains("worker stopped"),
+        output.stdout.contains("server stopped"),
         "{}",
         output.stdout
     );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn no_worker_leaves_jobs_for_the_worker_command() {
-    let url = fresh_database().await;
-    let mock = Mock::new().await;
-    mock.stub_extraction("the job text", json!([statement("Ada dances", "Ada")]))
-        .await;
-    let token = create_key(&url, "split", &[]).await;
-    let server = Running::start(env_for_worker(&mock, &url), &["serve", "--no-worker"]).await;
-
-    let response = server
-        .http
-        .post(format!("{}/v1/episodes", server.url))
-        .bearer_auth(&token)
-        .json(&json!({"scope": "agent:a", "source": "s", "trust": "user",
-                      "content": "the job text"}))
-        .send()
-        .await
-        .expect("episode");
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
-    let episode: Value = response.json().await.expect("json");
-    let path = format!(
-        "{}/v1/episodes/{}",
-        server.url,
-        episode["id"].as_str().expect("id")
-    );
-
-    let read = || async {
-        let response = server
-            .http
-            .get(&path)
-            .bearer_auth(&token)
-            .send()
-            .await
-            .expect("read");
-        let body: Value = response.json().await.expect("json");
-        body["processed_at"].is_string()
-    };
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    assert!(!read().await, "nothing should process it under --no-worker");
-    assert_eq!(mock.llm_calls().await, 0);
-
-    let worker = command(&env_for_worker(&mock, &url), &["worker"])
-        .spawn()
-        .expect("start the worker");
-    eventually("the worker command to process the job", read).await;
-
-    let pid = worker.id().expect("running").to_string();
-    let status = std::process::Command::new("kill")
-        .args(["-TERM", &pid])
-        .status()
-        .expect("kill");
-    assert!(status.success());
-    let output = tokio::time::timeout(SIGNAL_LIMIT, worker.wait_with_output())
-        .await
-        .expect("the worker should exit")
-        .expect("wait");
-    assert!(output.status.success());
-    server.stop("TERM").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn otlp_traces_are_exported_only_when_configured() {
     let url = fresh_database().await;
-    let mock = Mock::new().await;
-    mock.stub(json!({
-        "request": {"method": "POST", "url": format!("/{}/v1/traces", mock.prefix)},
-        "response": {"status": 200},
-    }))
-    .await;
+    let collector = HttpEndpoint::answering().await;
     let token = create_key(&url, "otlp", &[]).await;
 
     // Without the variable, nothing is sent.
-    let server = Running::start(env_for_host(&mock, &url), &["serve"]).await;
+    let server = Running::start(test_env(&url), &["serve"]).await;
     let response = server
         .http
         .get(format!("{}/v1/agents/a/blocks", server.url))
@@ -441,10 +333,13 @@ async fn otlp_traces_are_exported_only_when_configured() {
         .expect("request");
     assert_eq!(response.status(), StatusCode::OK);
     assert!(server.stop("TERM").await.success);
-    assert_eq!(mock.count("/v1/traces").await, 0);
+    assert!(collector.requests().is_empty());
 
-    let mut env = env_for_host(&mock, &url);
-    env.push(("OTEL_EXPORTER_OTLP_ENDPOINT".to_owned(), mock.base()));
+    let mut env = test_env(&url);
+    env.push((
+        "OTEL_EXPORTER_OTLP_ENDPOINT".to_owned(),
+        collector.url.clone(),
+    ));
     let server = Running::start(env, &["serve"]).await;
     let response = server
         .http
@@ -457,7 +352,7 @@ async fn otlp_traces_are_exported_only_when_configured() {
     let output = server.stop("TERM").await;
     assert!(output.success, "exit status: {}", output.stderr);
     assert!(
-        mock.count("/v1/traces").await >= 1,
+        collector.requests().iter().any(|path| path == "/v1/traces"),
         "shutdown should flush spans: {}",
         output.stderr
     );
@@ -467,12 +362,7 @@ async fn otlp_traces_are_exported_only_when_configured() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stalled_model_download_blocks_neither_health_nor_the_api_nor_shutdown() {
     let url = fresh_database().await;
-    let mock = Mock::new().await;
-    mock.stub(json!({
-        "request": {"method": "ANY", "urlPattern": format!("/{}/models/.*", mock.prefix)},
-        "response": {"status": 200, "fixedDelayMilliseconds": 120_000},
-    }))
-    .await;
+    let model_host = HttpEndpoint::stalled().await;
     let token = create_key(&url, "local", &[]).await;
 
     // Text search can answer without the model, so seed a fact directly.
@@ -488,16 +378,12 @@ async fn a_stalled_model_download_blocks_neither_health_nor_the_api_nor_shutdown
     .await;
 
     let cache = model_cache_dir();
-    let env: Vec<(String, String)> = [
+    let env = pairs(&[
         ("DATABASE_URL", url.as_str()),
-        ("MEMORYOS_MODE", "host"),
-        ("HF_ENDPOINT", &format!("{}/models", mock.base())),
+        ("HF_ENDPOINT", model_host.url.as_str()),
         ("MEMORYOS_MODEL_CACHE", cache.to_str().expect("path")),
         ("MEMORYOS_REQUEST_TIMEOUT_SECS", "4"),
-    ]
-    .iter()
-    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-    .collect();
+    ]);
 
     let started = Instant::now();
     let server = Running::start(env, &["serve"]).await;
@@ -550,7 +436,7 @@ async fn a_stalled_model_download_blocks_neither_health_nor_the_api_nor_shutdown
 
     // Proves the attempt went to the stub, so this test cannot download the real model.
     assert!(
-        mock.count("/models/.*").await >= 1,
+        !model_host.requests().is_empty(),
         "the model download should have reached the stalled host"
     );
 

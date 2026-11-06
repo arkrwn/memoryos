@@ -1,5 +1,5 @@
 [package]
-name = "memoryos-llm"
+name = "memoryos-embed"
 version.workspace = true
 edition.workspace = true
 # ort 2.0.0-rc.15, pulled in by fastembed, declares 1.92.
@@ -9,7 +9,9 @@ license.workspace = true
 [features]
 default = ["local"]
 local = ["dep:dirs", "dep:fastembed"]
-integration = []
+# A deterministic embedder for tests. The release image builds without it, see the Dockerfile.
+test-embedder = []
+# Enables tests/local.rs, which downloads the 481 MB model. Not part of the default test run.
 integration-local = ["local"]
 
 [dependencies]
@@ -17,16 +19,8 @@ memoryos-core.workspace = true
 async-trait.workspace = true
 dirs = { version = "6", optional = true }
 fastembed = { version = "7.6", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"], optional = true }
-fastrand = "2"
-httpdate = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-serde.workspace = true
-serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-
-[dev-dependencies]
-testcontainers = "0.28"
 
 [lints]
 workspace = true

@@ -1,6 +1,6 @@
 //! `memoryos setup`, the agent hooks and their installer, the stdio MCP proxy, and the commands that
 //! talk to a running server. They read `credentials.json`, with `MEMORYOS_URL` and
-//! `MEMORYOS_API_KEY` as overrides. See `docs/SPEC.md` section 14.
+//! `MEMORYOS_API_KEY` as overrides. See `docs/SPEC.md` section 3.
 //!
 //! The server binary flattens [`Command`] into its own command line and calls [`run`].
 

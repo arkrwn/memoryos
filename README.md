@@ -72,6 +72,27 @@ memoryos quarantine approve <fact-id>
 Backups, upgrades and incidents are in the [runbook](docs/runbook.md), which still describes the manual
 Compose install.
 
+## 🔍 Example
+
+This uses the Rust SDK. The user says *"I moved to Bandung"* after previously living in Jakarta, and the
+agent's own model decides that this is a fact to save:
+
+```rust
+let mem = MemoryOs::connect(url, api_key).await?;
+let user = Scope::user("u_123");
+
+let fact = CommitFact::new("Ada moved to Bandung", EntityRef::new("Ada", "person"), "lives_in");
+mem.commit(&Commit::new(user.clone(), "chat", "I moved to Bandung", vec![fact])).await?;
+
+// Current answer: Bandung
+let now = mem.recall(user.clone(), "where does the user live?").await?;
+
+// Answer as of January 2025: Jakarta
+let then = mem.recall(user, "where does the user live?")
+    .as_of(date(2025, 1, 1))
+    .await?;
+```
+
 ## ⚙️ How it works
 
 ```mermaid
@@ -211,8 +232,8 @@ References:
 ## 🗺️ Roadmap
 
 - [x] **Wave 0:** specification, core contracts, database schema, API contract
-- [x] **Wave 1:** Postgres store, LLM and embedding clients, eval harness
-- [x] **Wave 2:** ingest and worker, hybrid retrieval, agent runtime
+- [x] **Wave 1:** Postgres store, embedding client, eval harness
+- [x] **Wave 2:** ingest, hybrid retrieval
 - [ ] **Wave 3:** server, MCP, SDK, deployment
 - [ ] **Wave 4:** integration, load test, restore drill, independent review
 
@@ -222,11 +243,10 @@ These are goals, not measured results:
 
 | Gate | Target |
 |---|---|
-| ⚡ Recall latency | p95 under 200 ms at 1M facts, excluding embedding and LLM calls |
+| ⚡ Recall latency | p95 under 200 ms at 1M facts, excluding embedding |
 | 🕰️ Staleness | At least 95% of replaced facts absent from current recall |
 | 🛡️ Poisoning | 0 poisoned facts in recall without approval |
 | 🔒 Isolation | 0 cross-tenant reads |
-| ♻️ Recovery | Jobs from a killed worker complete after the lease expires |
 
 ## 📚 Documentation
 
@@ -241,14 +261,14 @@ These are goals, not measured results:
 
 ## 🧪 Development
 
-Requires Rust 1.92+ and Docker. Integration tests start real Postgres and WireMock containers. Do not
+Requires Rust 1.92+ and Docker. Integration tests start real Postgres containers. Do not
 use `cargo test --all-features`, which downloads the embedding model. The test feature list is in
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --features memoryos-store/integration,memoryos-llm/integration,memoryos-ingest/integration,memoryos-retrieve/integration,memoryos-agent/integration,memoryos-eval/integration,memoryos-server/integration
+cargo test --workspace --features memoryos-store/integration,memoryos-ingest/integration,memoryos-retrieve/integration,memoryos-eval/integration,memoryos-server/integration,memoryos-hooks/integration
 cargo deny check
 ```
 

@@ -1,4 +1,4 @@
-//! Fact write logic shared by `apply_extraction`, `approve_fact` and the purge paths.
+//! Fact write logic shared by `apply_commit`, `approve_fact` and the purge paths.
 //! Every function runs inside the caller's tenant transaction.
 
 use std::collections::{BTreeSet, HashMap};
@@ -55,7 +55,7 @@ pub(crate) async fn apply_ops(
     episode: &LockedEpisode,
     ops: &[FactOp],
 ) -> Result<Vec<Uuid>> {
-    // Taking the row locks in id order keeps two extractions touching the same facts from
+    // Taking the row locks in id order keeps two commits touching the same facts from
     // deadlocking. Missing rows are reported per op below.
     let referenced: Vec<Uuid> = ops
         .iter()
@@ -77,7 +77,15 @@ pub(crate) async fn apply_ops(
     for op in ops {
         match op {
             FactOp::Add(new) => {
-                inserted.push(insert_fact(conn, ctx, episode, new, None).await?);
+                let id = insert_fact(conn, ctx, episode, new, None).await?;
+                if new.status == FactStatus::Active && outranked_by_current(conn, new).await? {
+                    sqlx::query("UPDATE facts SET status = 'quarantined' WHERE id = $1")
+                        .bind(id)
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(db)?;
+                }
+                inserted.push(id);
             }
             FactOp::Supersede { old_fact_id, new } => {
                 require_fact_in_scope(conn, *old_fact_id, &episode.scope).await?;
@@ -109,6 +117,33 @@ pub(crate) async fn apply_ops(
         }
     }
     Ok(inserted)
+}
+
+/// SPEC section 5: a fact that does not declare a contradiction still gets reviewed when a current
+/// fact of higher trust in its scope has the same subject and predicate. Here and not in the gate
+/// because it needs the database, in the transaction that inserts the fact. Multi-valued predicates
+/// get extra review, which is the accepted cost of a rule with no model.
+async fn outranked_by_current(conn: &mut PgConnection, new: &NewFact) -> Result<bool> {
+    let higher: Vec<String> = [Trust::External, Trust::Agent, Trust::User, Trust::System]
+        .into_iter()
+        .filter(|trust| *trust > new.trust)
+        .map(|trust| trust.as_str().to_owned())
+        .collect();
+    let filter = crate::rows::visible(5, 6);
+    let sql = format!(
+        "SELECT EXISTS (SELECT 1 FROM facts f WHERE f.scope = $1 AND f.subject_id = $2 \
+         AND f.predicate = $3 AND f.trust = ANY($4) AND {filter})"
+    );
+    sqlx::query_scalar(&sql)
+        .bind(new.scope.to_string())
+        .bind(new.subject_id)
+        .bind(&new.predicate)
+        .bind(&higher)
+        .bind(None::<DateTime<Utc>>)
+        .bind(None::<DateTime<Utc>>)
+        .fetch_one(conn)
+        .await
+        .map_err(db)
 }
 
 async fn require_fact_in_scope(conn: &mut PgConnection, id: Uuid, scope: &Scope) -> Result<()> {
@@ -244,7 +279,7 @@ pub(crate) enum Settled {
 
 /// Applies SPEC section 4 between `new_id` and `old_id`.
 ///
-/// If another extraction already superseded `old_id`, the walk moves to the current head of the
+/// If another commit already superseded `old_id`, the walk moves to the current head of the
 /// chain, so a fact never gets two successors. A retracted or inactive head has nothing left to
 /// close and the new fact simply stays open. Trust is checked against the head, since the caller
 /// only saw `old_id`. `reviewed` names a fact an admin already decided this one may replace, which
@@ -291,7 +326,8 @@ pub(crate) async fn settle_supersede(
         // Out of order: the new fact is history and the head stays current. Otherwise the head
         // closes. LEAST ignores NULL, and it keeps an earlier end date the fact already carried.
         let (closed, end, successor) = if new_valid_from < head_valid_from {
-            (new_id, head_valid_from, current)
+            let later = earliest_later_in_chain(conn, current, new_id, new_valid_from).await?;
+            (new_id, later.1, later.0)
         } else {
             (current, new_valid_from, new_id)
         };
@@ -309,6 +345,39 @@ pub(crate) async fn settle_supersede(
     Err(Error::Internal(format!(
         "supersession chain from fact {old_id} exceeds {MAX_CHAIN_STEPS} steps"
     )))
+}
+
+/// The live fact in `member`'s chain that starts first after `after`. The caller knows one exists:
+/// `member` itself. A backdated fact ends there, or `as_of` would find it and a later fact together.
+async fn earliest_later_in_chain(
+    conn: &mut PgConnection,
+    member: Uuid,
+    new_id: Uuid,
+    after: DateTime<Utc>,
+) -> Result<(Uuid, DateTime<Utc>)> {
+    let row = sqlx::query(
+        "WITH RECURSIVE chain(id) AS ( \
+             SELECT $1::uuid \
+             UNION \
+             SELECT n.id FROM chain c \
+             JOIN facts cur ON cur.id = c.id \
+             JOIN facts n ON n.scope = cur.scope \
+                 AND (n.superseded_by = cur.id OR n.id = cur.superseded_by)) \
+         SELECT f.id, f.valid_from FROM facts f JOIN chain c ON c.id = f.id \
+         WHERE f.id <> $2 AND f.status = 'active' AND f.invalidated_at IS NULL \
+             AND f.valid_from > $3 \
+         ORDER BY f.valid_from, f.id LIMIT 1",
+    )
+    .bind(member)
+    .bind(new_id)
+    .bind(after)
+    .fetch_one(conn)
+    .await
+    .map_err(db)?;
+    Ok((
+        row.try_get("id").map_err(db)?,
+        row.try_get("valid_from").map_err(db)?,
+    ))
 }
 
 /// A fact leaving its supersession chain, because it is deleted or goes back to quarantine.
@@ -345,7 +414,7 @@ pub(crate) struct PurgeOutcome {
 }
 
 /// `None` when no source remains.
-fn highest_trust(trusts: Vec<String>) -> Result<Option<Trust>> {
+pub(crate) fn highest_trust(trusts: Vec<String>) -> Result<Option<Trust>> {
     let mut highest = None;
     for text in trusts {
         let trust: Trust = text
@@ -496,6 +565,8 @@ pub(crate) async fn purge_episode(conn: &mut PgConnection, id: Uuid) -> Result<P
         .map_err(db)?;
     }
 
+    remove_aliases_only_from(conn, id).await?;
+
     let facts_deleted = sqlx::query("DELETE FROM facts WHERE id = ANY($1)")
         .bind(&doomed_ids)
         .execute(&mut *conn)
@@ -518,6 +589,37 @@ pub(crate) async fn purge_episode(conn: &mut PgConnection, id: Uuid) -> Result<P
         },
         facts_requarantined: requarantined.len() as u64,
     })
+}
+
+/// Takes back the aliases this episode earned, unless another episode earned the same one.
+async fn remove_aliases_only_from(conn: &mut PgConnection, episode_id: Uuid) -> Result<()> {
+    let earned = sqlx::query(
+        "DELETE FROM entity_alias_sources WHERE episode_id = $1 \
+         RETURNING entity_id, alias_key, alias",
+    )
+    .bind(episode_id)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(db)?;
+    for row in &earned {
+        sqlx::query(
+            "UPDATE entities SET \
+                 aliases = CASE WHEN EXISTS (SELECT 1 FROM entity_alias_sources s \
+                     WHERE s.entity_id = $1 AND s.alias = $3) \
+                     THEN aliases ELSE array_remove(aliases, $3) END, \
+                 alias_keys = CASE WHEN EXISTS (SELECT 1 FROM entity_alias_sources s \
+                     WHERE s.entity_id = $1 AND s.alias_key = $2) \
+                     THEN alias_keys ELSE array_remove(alias_keys, $2) END \
+             WHERE id = $1",
+        )
+        .bind(row.try_get::<Uuid, _>("entity_id").map_err(db)?)
+        .bind(row.try_get::<String, _>("alias_key").map_err(db)?)
+        .bind(row.try_get::<String, _>("alias").map_err(db)?)
+        .execute(&mut *conn)
+        .await
+        .map_err(db)?;
+    }
+    Ok(())
 }
 
 /// A fact whose `superseded_by` is the key it is stored under in `closed_facts`.
@@ -589,7 +691,8 @@ fn closes_higher_trust(
 
 /// A fact leaving the chain must not leave its effects behind: a fact it closed takes over its end
 /// and successor. If it was current, its predecessor becomes current again. Returns, for each fact
-/// leaving, the surviving predecessor with the latest start.
+/// leaving, the surviving predecessor with the latest start. A retracted fact is no predecessor:
+/// it keeps its link for history, and reopening it would make it the target of a pending approval.
 async fn restore_predecessors(
     conn: &mut PgConnection,
     exits: &HashMap<Uuid, ChainExit>,
@@ -597,7 +700,8 @@ async fn restore_predecessors(
     let exit_ids: Vec<Uuid> = exits.keys().copied().collect();
     let predecessors = sqlx::query(
         "SELECT id, superseded_by FROM (SELECT id, superseded_by, valid_from FROM facts \
-             WHERE superseded_by = ANY($1) AND NOT id = ANY($1) ORDER BY id FOR UPDATE) locked \
+             WHERE superseded_by = ANY($1) AND NOT id = ANY($1) AND invalidated_at IS NULL \
+             ORDER BY id FOR UPDATE) locked \
          ORDER BY valid_from, id",
     )
     .bind(&exit_ids)
@@ -637,6 +741,33 @@ async fn restore_predecessors(
     Ok(reopened)
 }
 
+/// A retracted fact must not leave its effects behind, as in a purge: what it closed takes over its
+/// end and successor, and approval of a fact pending on it moves on. It keeps its own link, which
+/// history reads. A repeat finds no predecessors and changes nothing.
+pub(crate) async fn leave_chain_on_retraction(conn: &mut PgConnection, id: Uuid) -> Result<()> {
+    let row = sqlx::query("SELECT valid_from, valid_to, superseded_by FROM facts WHERE id = $1")
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db)?;
+    let exit = ChainExit {
+        valid_from: row.try_get("valid_from").map_err(db)?,
+        valid_to: row.try_get("valid_to").map_err(db)?,
+        superseded_by: row.try_get("superseded_by").map_err(db)?,
+    };
+    let exits = HashMap::from([(id, exit)]);
+    let reopened = restore_predecessors(conn, &exits).await?;
+    if let Some(target) = chain_target(&exits, &reopened, id) {
+        sqlx::query("UPDATE facts SET pending_supersede_of = $2 WHERE pending_supersede_of = $1")
+            .bind(id)
+            .bind(target)
+            .execute(conn)
+            .await
+            .map_err(db)?;
+    }
+    Ok(())
+}
+
 /// Deletes the given entities if no fact references them. The row locks make the check safe: an
 /// in-flight fact insert holds a key-share lock on its entity, so this waits for it to commit and
 /// the following statement sees that fact.
@@ -662,7 +793,7 @@ async fn delete_orphan_entities(
     Ok(deleted)
 }
 
-/// Hard-deletes a scope's facts, episodes, entities and sessions, plus an agent scope's blocks.
+/// Hard-deletes a scope's facts, episodes and entities, plus an agent scope's blocks.
 pub(crate) async fn purge_scope(conn: &mut PgConnection, scope: &Scope) -> Result<PurgeReport> {
     let scope_text = scope.to_string();
     let mut deleted = [0_u64; 3];
@@ -679,22 +810,12 @@ pub(crate) async fn purge_scope(conn: &mut PgConnection, scope: &Scope) -> Resul
             .map_err(db)?
             .rows_affected();
     }
-    sqlx::query("DELETE FROM sessions WHERE scope = $1")
-        .bind(&scope_text)
-        .execute(&mut *conn)
-        .await
-        .map_err(db)?;
     if let Scope::Agent(agent_id) = scope {
-        for sql in [
-            "DELETE FROM sessions WHERE agent_id = $1",
-            "DELETE FROM blocks WHERE agent_id = $1",
-        ] {
-            sqlx::query(sql)
-                .bind(agent_id)
-                .execute(&mut *conn)
-                .await
-                .map_err(db)?;
-        }
+        sqlx::query("DELETE FROM blocks WHERE agent_id = $1")
+            .bind(agent_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(db)?;
     }
     let [facts_deleted, episodes_deleted, entities_deleted] = deleted;
     Ok(PurgeReport {

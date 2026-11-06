@@ -32,11 +32,12 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       # Not --all-features: that enables integration-local, which downloads a 481 MB model.
-      # Integration tests start pgvector/pgvector:pg17 and wiremock/wiremock:3.3.1 through Docker.
+      # Integration tests start pgvector/pgvector:pg17 through Docker, and the eval harness starts
+      # wiremock/wiremock:3.3.1 as a fake MemoryOS server.
       - name: Test
         run: >-
           cargo test --workspace --locked --no-fail-fast
-          --features memoryos-store/integration,memoryos-llm/integration,memoryos-ingest/integration,memoryos-retrieve/integration,memoryos-agent/integration,memoryos-eval/integration,memoryos-server/integration
+          --features memoryos-store/integration,memoryos-ingest/integration,memoryos-retrieve/integration,memoryos-eval/integration,memoryos-server/integration,memoryos-hooks/integration
 
   deny:
     runs-on: ubuntu-24.04

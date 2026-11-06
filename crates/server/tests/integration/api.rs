@@ -1,4 +1,4 @@
-//! Host mode end to end, through the SDK where the SDK has the call. No model is ever contacted.
+//! The API end to end, through the SDK where the SDK has the call.
 
 use chrono::{Duration as ChronoDuration, Utc};
 use memoryos_core::{Scope, Trust};
@@ -20,13 +20,9 @@ fn statements(response: &memoryos_sdk::RecallResponse) -> Vec<&str> {
         .collect()
 }
 
-async fn assert_no_llm_traffic(server: &Server) {
-    assert_eq!(server.mock.llm_calls().await, 0, "host mode called a model");
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn candidates_commit_and_supersede_with_as_of() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let root = server.root("host").await;
     let mem: MemoryOs = server.sdk(&root);
     let scope = Scope::agent("a1");
@@ -76,7 +72,6 @@ async fn candidates_commit_and_supersede_with_as_of() {
         .await
         .expect("recall as of");
     assert_eq!(statements(&then), ["Ada lives in Jakarta"]);
-    assert!(then.pending_episodes.is_empty());
 
     let old = mem.get_fact(first.facts[0].id).await.expect("old fact");
     assert_eq!(old.superseded_by, Some(second.facts[0].id));
@@ -117,13 +112,11 @@ async fn candidates_commit_and_supersede_with_as_of() {
         .source_episode_ids
         .len();
     assert_eq!(source_count, 2);
-
-    assert_no_llm_traffic(&server).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_trust_in_user_scope_is_quarantined_until_approved() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let root = server.root("quarantine").await;
     let mem = server.sdk(&root);
     let user = Scope::user("u1");
@@ -142,10 +135,6 @@ async fn agent_trust_in_user_scope_is_quarantined_until_approved() {
 
     let recalled = mem.recall(user.clone(), "Ada debt").await.expect("recall");
     assert!(recalled.facts.is_empty(), "poison reached recall");
-    assert!(
-        recalled.pending_episodes.is_empty(),
-        "poison reached pending"
-    );
     let candidates = mem
         .candidates(std::slice::from_ref(&user), "Ada debt", None)
         .await
@@ -189,13 +178,11 @@ async fn agent_trust_in_user_scope_is_quarantined_until_approved() {
     assert_eq!(rejected.status, FactStatus::Rejected);
     let recalled = mem.recall(user, "Ada bank").await.expect("recall");
     assert!(!statements(&recalled).contains(&"Ada robbed a bank"));
-
-    assert_no_llm_traffic(&server).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn approval_held_on_a_moved_chain_asks_for_another_review() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let root = server.root("held").await;
     let mem = server.sdk(&root);
     let user = Scope::user("u1");
@@ -261,13 +248,11 @@ async fn approval_held_on_a_moved_chain_asks_for_another_review() {
         mem.get_fact(head).await.expect("head").superseded_by,
         Some(id)
     );
-
-    assert_no_llm_traffic(&server).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn purge_removes_a_source_and_restores_what_it_replaced() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let root = server.root("purge").await;
     let mem = server.sdk(&root);
     let scope = Scope::agent("a1");
@@ -316,12 +301,11 @@ async fn purge_removes_a_source_and_restores_what_it_replaced() {
         mem.purge_episode(random_uuid()).await,
         Err(Error::NotFound { .. })
     ));
-    assert_no_llm_traffic(&server).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn deleting_a_user_removes_everything_under_their_scope() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let root = server.root("delete").await;
     let mem = server.sdk(&root);
     let (fact_id, _, episode) = server.commit_one(&root, "user:gone", "Ada sails").await;
@@ -348,7 +332,7 @@ async fn deleting_a_user_removes_everything_under_their_scope() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn invalidated_facts_leave_recall() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let root = server.root("invalidate").await;
     let mem = server.sdk(&root);
     let (id, _, _) = server
@@ -364,7 +348,7 @@ async fn invalidated_facts_leave_recall() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_key_cannot_invalidate_a_fact_above_its_max_trust() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let tenant = crate::common::unique("invalidate-trust");
     let root = server.root(&tenant).await;
     let (id, _, _) = server
@@ -383,62 +367,20 @@ async fn a_key_cannot_invalidate_a_fact_above_its_max_trust() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn episodes_and_sessions_return_400_directing_to_commits() {
-    let server = Server::host().await;
-    let root = server.root("modes").await;
-    let (status, reply) = server
-        .call(
-            "POST",
-            "/v1/episodes",
-            Some(&root),
-            Some(json!({"scope": "user:u", "source": "s", "trust": "user", "content": "c"})),
-        )
-        .await;
-    assert_error(status, &reply, 400, "invalid_input");
-    assert!(
-        reply["error"]["message"]
-            .as_str()
-            .expect("message")
-            .contains("/v1/commits"),
-        "{reply}"
-    );
-
-    let session_routes = [
-        (
-            "POST",
-            "/v1/agents/a1/sessions".to_owned(),
-            Some(json!({"scope": "user:u"})),
-        ),
-        (
-            "GET",
-            format!("/v1/sessions/{}/messages", random_uuid()),
-            None,
-        ),
-        (
-            "POST",
-            format!("/v1/sessions/{}/messages", random_uuid()),
-            Some(json!({"text": "hello"})),
-        ),
-    ];
-    for (method, path, body) in session_routes {
-        let (status, reply) = server.call(method, &path, Some(&root), body).await;
-        assert_error(status, &reply, 400, "invalid_input");
-    }
-
-    // Reads of a commit's source still work.
+async fn the_source_of_a_commit_can_be_read() {
+    let server = Server::start().await;
+    let root = server.root("source").await;
     let (_, _, episode) = server.commit_one(&root, "agent:a1", "Ada sails").await;
     let (status, read) = server
         .call("GET", &format!("/v1/episodes/{episode}"), Some(&root), None)
         .await;
     assert_eq!(status, StatusCode::OK);
     assert!(read["processed_at"].is_string(), "{read}");
-
-    assert_no_llm_traffic(&server).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn blocks_are_versioned_and_keep_their_limit() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let root = server.root("blocks").await;
     let mem = server.sdk(&root);
 
@@ -496,13 +438,11 @@ async fn blocks_are_versioned_and_keep_their_limit() {
         .await
         .expect("default limit");
     assert_eq!(default.max_chars, 2000);
-
-    assert_no_llm_traffic(&server).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn neighbors_returns_the_graph_and_caps_edges_per_request() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let root = server.root("graph").await;
     let scope = Scope::agent("hub");
     let mem = server.sdk(&root);
@@ -569,7 +509,7 @@ async fn neighbors_returns_the_graph_and_caps_edges_per_request() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn commit_validates_its_limits_and_shape() {
-    let server = Server::host().await;
+    let server = Server::start().await;
     let root = server.root("commits").await;
     let many: Vec<_> = (0..51)
         .map(|i| statement(&format!("s{i}"), "Ada"))

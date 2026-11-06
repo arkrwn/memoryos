@@ -139,7 +139,6 @@ fn recall(query: &str, env: Env<'_>) -> Result<Vec<ScoredFact>, String> {
         Options {
             timeout: NETWORK_TIMEOUT,
             read_retries: 0,
-            ..Options::default()
         },
     )?;
     let runtime = tokio::runtime::Builder::new_current_thread()

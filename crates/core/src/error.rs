@@ -15,7 +15,7 @@ pub enum Error {
     VersionConflict { expected: i64, current: i64 },
     #[error("block exceeds max_chars: {len} > {max}")]
     BlockTooLarge { len: usize, max: usize },
-    #[error("upstream provider error: {0}")]
+    #[error("embedder error: {0}")]
     Provider(String),
     #[error("storage error: {0}")]
     Storage(String),

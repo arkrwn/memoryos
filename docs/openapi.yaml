@@ -26,24 +26,9 @@ paths:
       security: []
       responses:
         "200": { description: Metrics text }
-  /v1/episodes:
-    post:
-      summary: Store an episode and enqueue extraction
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/NewEpisode" }
-      responses:
-        "202":
-          description: Accepted
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Episode" }
-        default: { $ref: "#/components/responses/Error" }
   /v1/episodes/{id}:
     get:
-      summary: Read an episode. processed_at is set once extraction has finished
+      summary: Read the source of a commit. processed_at is set once its facts are applied
       parameters: [{ $ref: "#/components/parameters/Id" }]
       responses:
         "200":
@@ -65,7 +50,7 @@ paths:
         default: { $ref: "#/components/responses/Error" }
   /v1/recall:
     post:
-      summary: Hybrid search over facts, plus episodes still being processed
+      summary: Hybrid search over facts
       requestBody:
         required: true
         content:
@@ -307,7 +292,7 @@ paths:
               required: [content]
               properties:
                 content: { type: string }
-                max_chars: { type: integer, default: 2000 }
+                max_chars: { type: integer, default: 2000, maximum: 100000 }
                 expected_version:
                   type: [integer, "null"]
                   description: Omit or null to create. Otherwise the version being replaced
@@ -320,7 +305,7 @@ paths:
         default: { $ref: "#/components/responses/Error" }
   /v1/agents/{agent_id}/blocks/{label}/versions:
     get:
-      summary: Block edit history
+      summary: Block edit history, the latest 100 versions, oldest first
       parameters:
         - { $ref: "#/components/parameters/AgentId" }
         - { $ref: "#/components/parameters/Label" }
@@ -344,68 +329,6 @@ paths:
                         edited_by: { type: string }
                         edited_at: { type: string, format: date-time }
         default: { $ref: "#/components/responses/Error" }
-  /v1/agents/{agent_id}/sessions:
-    post:
-      summary: Start an agent session
-      parameters: [{ $ref: "#/components/parameters/AgentId" }]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [scope]
-              properties:
-                scope: { type: string, description: Memory scope used by this session }
-      responses:
-        "201":
-          description: Session
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Session" }
-        default: { $ref: "#/components/responses/Error" }
-  /v1/sessions/{id}/messages:
-    get:
-      summary: Messages after the compaction point
-      parameters: [{ $ref: "#/components/parameters/Id" }]
-      responses:
-        "200":
-          description: Messages
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [messages]
-                properties:
-                  messages: { type: array, items: { type: object } }
-        default: { $ref: "#/components/responses/Error" }
-    post:
-      summary: Send a user message and run one agent turn
-      parameters: [{ $ref: "#/components/parameters/Id" }]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [text]
-              properties:
-                text: { type: string }
-      responses:
-        "200":
-          description: Turn result
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [text, truncated, tool_calls, input_tokens, output_tokens]
-                properties:
-                  text: { type: string }
-                  truncated: { type: boolean, description: True if the reply is still cut off after one continuation }
-                  tool_calls: { type: integer }
-                  input_tokens: { type: integer }
-                  output_tokens: { type: integer }
-        default: { $ref: "#/components/responses/Error" }
   /v1/users/{user_id}/memory:
     delete:
       summary: Hard-delete everything under scope user:{user_id}. Admin only
@@ -423,7 +346,7 @@ paths:
         default: { $ref: "#/components/responses/Error" }
   /mcp:
     post:
-      summary: MCP Streamable HTTP endpoint. Tools recall_candidates, commit_facts, recall, block_read, block_replace, graph_neighbors, plus remember in worker mode
+      summary: MCP Streamable HTTP endpoint. Tools recall_candidates, commit_facts, recall, block_read, block_replace, graph_neighbors
       responses:
         "200": { description: JSON-RPC response }
 components:
@@ -490,17 +413,6 @@ components:
               valid_from: { type: [string, "null"], format: date-time }
               supersedes: { type: [string, "null"], format: uuid }
               corroborates: { type: [string, "null"], format: uuid }
-    NewEpisode:
-      type: object
-      required: [scope, source, trust, content]
-      properties:
-        scope: { type: string, examples: ["user:u_123"] }
-        source: { type: string, examples: ["chat"] }
-        trust: { $ref: "#/components/schemas/Trust" }
-        content: { type: string, maxLength: 100000 }
-        occurred_at: { type: [string, "null"], format: date-time }
-        metadata: { type: object }
-        idempotency_key: { type: [string, "null"] }
     Episode:
       type: object
       required: [id, scope, source, trust, content, metadata, occurred_at, created_at]
@@ -553,7 +465,7 @@ components:
         known_at: { type: [string, "null"], format: date-time }
     RecallResponse:
       type: object
-      required: [facts, pending_episodes]
+      required: [facts]
       properties:
         facts:
           type: array
@@ -562,14 +474,6 @@ components:
             required: [fact, score]
             properties:
               fact: { $ref: "#/components/schemas/Fact" }
-              score: { type: number }
-        pending_episodes:
-          type: array
-          items:
-            type: object
-            required: [episode, score]
-            properties:
-              episode: { $ref: "#/components/schemas/Episode" }
               score: { type: number }
     GraphNeighborhood:
       type: object
@@ -589,14 +493,6 @@ components:
         max_chars: { type: integer }
         version: { type: integer }
         updated_at: { type: string, format: date-time }
-    Session:
-      type: object
-      required: [id, agent_id, scope, created_at]
-      properties:
-        id: { type: string, format: uuid }
-        agent_id: { type: string }
-        scope: { type: string }
-        created_at: { type: string, format: date-time }
     PurgeReport:
       type: object
       required: [facts_deleted, episodes_deleted, entities_deleted]

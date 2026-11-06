@@ -17,7 +17,6 @@ use serde_json::{json, Map, Value};
 
 use crate::app::AppState;
 use crate::auth::Caller;
-use crate::config::Mode;
 use crate::routes::read_body;
 
 const MODERN_VERSION: &str = "2026-07-28";
@@ -79,7 +78,7 @@ pub async fn handle(
     request: Request,
 ) -> Response {
     let headers = request.headers().clone();
-    if !origin_allowed(&headers, &state.mcp_allowed_origins) {
+    if !origin_allowed(&headers) {
         return rpc_error(
             StatusCode::FORBIDDEN,
             None,
@@ -113,14 +112,14 @@ pub async fn handle(
 
 /// Rejects a page on another site reaching a local server through DNS rebinding. Such a page sends
 /// its own origin, so comparing with the `Host` header would prove nothing.
-fn origin_allowed(headers: &HeaderMap, allowed: &[String]) -> bool {
+fn origin_allowed(headers: &HeaderMap) -> bool {
     let Some(origin) = headers.get(header::ORIGIN) else {
         return true;
     };
     let Ok(origin) = origin.to_str() else {
         return false;
     };
-    allowed.iter().any(|entry| entry == origin) || is_local_origin(origin)
+    is_local_origin(origin)
 }
 
 fn is_local_origin(origin: &str) -> bool {
@@ -319,12 +318,11 @@ async fn call_method(
     params: &Map<String, Value>,
     era: Era,
 ) -> Result<Value, Failure> {
-    let mode = state.services.mode;
     match method {
         "initialize" => Ok(initialize(params)),
         "server/discover" => Ok(discover(era)),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(tools_list(mode, era)),
+        "tools/list" => Ok(tools_list(era)),
         "tools/call" => tools_call(state, caller, params).await,
         _ => Err(Failure::MethodNotFound),
     }
@@ -354,8 +352,8 @@ fn discover(era: Era) -> Value {
     result
 }
 
-fn tools_list(mode: Mode, era: Era) -> Value {
-    let mut result = json!({"tools": tools::definitions(mode)});
+fn tools_list(era: Era) -> Value {
+    let mut result = json!({"tools": tools::definitions()});
     add_cache_hints(&mut result, era);
     result
 }
@@ -377,7 +375,7 @@ async fn tools_call(
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| Failure::InvalidParams("params.name is required".into()))?;
-    if !tools::exists(name, state.services.mode) {
+    if !tools::exists(name) {
         return Err(Failure::InvalidParams(format!("Unknown tool: {name}")));
     }
     let arguments = params
@@ -447,8 +445,8 @@ mod tests {
     }
 
     #[test]
-    fn origin_is_local_or_listed() {
-        assert!(origin_allowed(&HeaderMap::new(), &[]));
+    fn origin_is_local_or_absent() {
+        assert!(origin_allowed(&HeaderMap::new()));
         for local in [
             "http://localhost",
             "http://localhost:3000",
@@ -456,19 +454,18 @@ mod tests {
             "http://[::1]:8080",
             "http://[::1]",
         ] {
-            assert!(origin_allowed(&with_origin(local), &[]), "{local}");
+            assert!(origin_allowed(&with_origin(local)), "{local}");
         }
         for foreign in [
             "http://evil.example",
             "http://localhost.evil.example",
             "http://127.0.0.1.evil.example",
             "http://[::1].evil.example",
+            "https://app.example",
             "null",
         ] {
-            assert!(!origin_allowed(&with_origin(foreign), &[]), "{foreign}");
+            assert!(!origin_allowed(&with_origin(foreign)), "{foreign}");
         }
-        let listed = ["https://app.example".to_owned()];
-        assert!(origin_allowed(&with_origin("https://app.example"), &listed));
     }
 
     #[test]
