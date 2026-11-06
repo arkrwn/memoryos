@@ -114,7 +114,9 @@ AND (invalidated_at IS NULL OR invalidated_at > K)
   it: it re-points `pending_supersede_of` at that head, writes `fact.approve_held`, and returns
   `InvalidInput`. A second approval closes it. The server tells the caller to review again.
 - Purging a source recomputes a fact's trust as the highest trust among remaining sources, never above
-  its current trust, and re-quarantines the fact if a source rule in the table above now applies.
+  its current trust. It re-quarantines the fact if a source rule in the table above now applies, or if
+  the fact closed a live fact of now-higher trust. Pending links move to the surviving successor or
+  the reopened predecessor.
 - `reject_fact` sets `rejected`. Rejected and quarantined facts never appear in recall or graph.
 - Extraction and reconciliation prompts wrap content as untrusted data, and they expose only the
   forced output tool. Episode text can never reach a memory-writing tool.
@@ -294,3 +296,9 @@ CLI, using `MEMORYOS_URL` and `MEMORYOS_API_KEY` (any agent without MCP can use 
 - The agent runtime's per-session lock is in-process. With several server instances, clients must
   not run concurrent turns on one session.
 - `LocalEmbedder` silently truncates inputs over 512 tokens and needs at least 1 GiB of memory.
+- Purge edge cases with backdated facts (T14), three confirmed by temporary tests and one from reading:
+  - Purging a head can reopen both its real predecessor and a backdated fact, leaving two current facts.
+  - A backdated higher-trust fact can cause a needless re-quarantine, resolved by approval.
+  - A pending link moved by purge onto a higher-trust fact skips the `fact.approve_held` step.
+  - The contradiction rule checks only facts whose trust was lowered, so purging a middle fact in a
+    system, user, user chain can leave the last fact active over the system fact. Not run.

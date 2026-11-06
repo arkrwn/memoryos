@@ -13,7 +13,8 @@ actually run. States: `todo`, `doing`, `done`, `blocked`.
 | T5 Hybrid retrieval | done | Lead run on merged `develop`: 18 unit and 22 integration tests pass |
 | T6 Agent runtime | done | Lead run on merged `develop`: 24 unit and 30 integration tests pass. Not run against live providers |
 | T11 Local embedder | done | Lead run: 54 llm unit tests pass. Real-model test (6 pass) reported by the agent, not re-run by lead. Needs at least 1 GiB memory and glibc 2.38+ |
-| T13 Hardening after Wave 2 | doing | |
+| T13 Hardening after Wave 2 | done | Lead run on merged `develop`: 387 tests pass, fmt and clippy clean |
+| T14 Purge fixes | merged | Agent reports 3 unit and 73 integration store tests pass, 35 unit and 44 integration ingest tests pass. Lead re-run pending at T7 merge |
 | T7 Server, MCP, SDK, both modes | todo | |
 | T12 CLI commands and hooks | todo | |
 | T8 Deploy, CI, docs | todo | |
