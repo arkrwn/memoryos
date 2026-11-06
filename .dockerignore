@@ -12,3 +12,4 @@ Dockerfile
 .dockerignore
 deploy
 !deploy/healthcheck.sh
+!deploy/docker-compose.yml

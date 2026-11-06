@@ -27,10 +27,11 @@ pub fn write_atomic(
             .write(true)
             .create_new(true)
             .open(&temp)?;
-        file.write_all(content)?;
+        // Before the content, so a private file is never readable by others.
         if let Some(permissions) = permissions {
             file.set_permissions(permissions)?;
         }
+        file.write_all(content)?;
         file.sync_all()?;
         fs::rename(&temp, path)
     })();
