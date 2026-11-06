@@ -11,10 +11,9 @@ license = "Apache-2.0"
 [workspace.dependencies]
 memoryos-core = { path = "crates/core" }
 memoryos-store = { path = "crates/store" }
-memoryos-llm = { path = "crates/llm" }
+memoryos-embed = { path = "crates/embed", default-features = false }
 memoryos-ingest = { path = "crates/ingest" }
 memoryos-retrieve = { path = "crates/retrieve" }
-memoryos-agent = { path = "crates/agent" }
 memoryos-sdk = { path = "crates/sdk" }
 memoryos-hooks = { path = "crates/hooks" }
 

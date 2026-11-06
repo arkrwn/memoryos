@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use memoryos_core::{Embedder, EMBEDDING_DIMS};
-use memoryos_llm::LocalEmbedder;
+use memoryos_embed::LocalEmbedder;
 use tokio::sync::Mutex;
 
 static SERIAL: Mutex<()> = Mutex::const_new(());
