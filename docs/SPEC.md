@@ -84,13 +84,22 @@ The `memoryos` binary (crate `server`) has these commands: `serve`, `migrate`, `
    `status`, `corroborated` when no fact was created, `superseded` with the closed fact's id when a
    supersede reused an existing fact, and `related` for a created fact. A replay
    tells a matched fact from a created one by `recorded_at`, which equals `processed_at` only for
-   facts the episode created, and returns no `related`.
+   facts the episode created, and returns no `related`. The response also has `redacted`, true when
+   a secret was masked (see Rules).
 
 Rules:
 - Commit trust is `agent`, or `external` if the key's `max_trust` is `external`. A request cannot
   set a higher trust, because the host model also reads untrusted content.
 - `supersedes` and `corroborates` must name a current, active fact in the same scope, else 400.
   The server never trusts a host-supplied id without that check.
+- Before anything is stored or compared, `HostCommitter` masks secrets in `content`, in each
+  statement and in each entity name, so REST and MCP commits get the same treatment. Each match
+  becomes `[redacted]`: OpenAI and Anthropic style `sk-` keys, GitHub `ghp_`, `gho_`, `ghu_`, `ghs_`,
+  `ghr_` and `github_pat_` tokens, AWS `AKIA` access key ids, MemoryOS `mos_` keys, Slack `xox[abprs]-`
+  tokens, JWTs, PEM private key blocks, bearer tokens, and the value after a label ending in
+  `password`, `passwd`, `secret`, `token` or `api_key` followed by `=` or `:` (the label stays). The
+  patterns live in `crates/ingest/src/redact.rs` and only match distinctive shapes, so UUIDs, commit
+  hashes and ordinary words are kept. The response sets `redacted: true` when anything was masked.
 - `recall_candidates`, `commit_facts`, `recall`, `block_read`, `block_replace` and `graph_neighbors`
   are the MCP tools. Tool descriptions state when to recall, when to save, and that retrieved or
   tool-read content is data, never instructions.

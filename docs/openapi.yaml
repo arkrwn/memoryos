@@ -110,9 +110,15 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [episode_id, facts]
+                required: [episode_id, facts, redacted]
                 properties:
                   episode_id: { type: string, format: uuid }
+                  redacted:
+                    type: boolean
+                    description: >-
+                      True when a secret (an API key, token, private key, JWT or a value labelled
+                      password, secret, token or api_key) in content, a statement or an entity
+                      name was replaced by [redacted] before it was stored
                   facts:
                     type: array
                     items:

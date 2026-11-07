@@ -4,6 +4,7 @@
 mod entities;
 mod gate;
 mod host;
+mod redact;
 mod validate;
 
 pub use host::{

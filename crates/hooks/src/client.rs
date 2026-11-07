@@ -348,6 +348,7 @@ mod tests {
                 related: Vec::new(),
                 superseded: None,
             }],
+            redacted: false,
         };
         assert!(commit_text(&response).contains("quarantined"));
         let value: Value = serde_json::from_str(&commit_json(&response)).expect("json");

@@ -121,6 +121,10 @@ impl Commit {
 pub struct CommitResponse {
     pub episode_id: Uuid,
     pub facts: Vec<CommittedFact>,
+    /// The server masked a secret in a statement, an entity name or the content before storing it.
+    /// False when absent, as from an older server.
+    #[serde(default)]
+    pub redacted: bool,
 }
 
 /// The fields after `status` default when absent, so a response from an older server still parses.

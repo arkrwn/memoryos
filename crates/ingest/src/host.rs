@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::entities::{add_earned_aliases, embed_batch, Merge};
 use crate::gate::{build_op, status_for, FactDraft, Resolution, Source};
+use crate::redact::redact;
 use crate::validate::{is_blank_or_unstorable, MAX_CONTENT_CHARS};
 
 const MAX_FACTS: usize = 50;
@@ -93,10 +94,15 @@ pub struct CommittedFact {
 /// `facts` has one entry per request fact, in order, read back from the store. Each status is the
 /// fact's status at the time of the response, so the store's last trust check is reflected, and a
 /// replayed idempotency key returns the original ids with whatever has happened to them since.
+///
+/// `redacted` is true when a secret in a statement, an entity name or `content` was masked before
+/// storage, so the caller knows the stored text differs from what it sent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitResponse {
     pub episode_id: Uuid,
     pub facts: Vec<CommittedFact>,
+    #[serde(default)]
+    pub redacted: bool,
 }
 
 pub struct HostCommitter {
@@ -141,6 +147,9 @@ impl HostCommitter {
         req: CommitRequest,
         max_trust: Trust,
     ) -> Result<CommitResponse> {
+        // Before anything is stored or compared, so a replay compares the masked text it stored.
+        let mut req = req;
+        let redacted = redact_request(&mut req);
         validate_request(&req)?;
         let trust = max_trust.min(Trust::Agent);
 
@@ -163,7 +172,9 @@ impl HostCommitter {
             .await?;
         require_same_request(&episode, &req, trust)?;
         if episode.processed_at.is_some() {
-            return self.response(ctx, &episode, &req, Vec::new()).await;
+            return self
+                .response(ctx, &episode, &req, Vec::new(), redacted)
+                .await;
         }
 
         let built = match self.build_ops(ctx, &req, &episode).await {
@@ -181,7 +192,8 @@ impl HostCommitter {
         // below then reports that request's facts, the same as any other replay.
         let inserted = self.store.apply_commit(ctx, episode.id, built.ops).await?;
         add_earned_aliases(self.store.as_ref(), ctx, &episode, built.merges, &inserted).await;
-        self.response(ctx, &episode, &req, built.related).await
+        self.response(ctx, &episode, &req, built.related, redacted)
+            .await
     }
 
     async fn response(
@@ -190,6 +202,7 @@ impl HostCommitter {
         episode: &Episode,
         req: &CommitRequest,
         related: Vec<Vec<RelatedFact>>,
+        redacted: bool,
     ) -> Result<CommitResponse> {
         // The episode was claimed before it was processed, so a fresh commit reads the time again.
         let processed_at = match episode.processed_at {
@@ -200,6 +213,7 @@ impl HostCommitter {
         Ok(CommitResponse {
             episode_id: episode.id,
             facts: in_request_order(req, facts, processed_at, related),
+            redacted,
         })
     }
 
@@ -384,6 +398,20 @@ impl HostCommitter {
             tracing::warn!(%episode_id, error = %err, "could not discard a refused commit");
         }
     }
+}
+
+/// Masks secrets in everything a commit stores as text: `content`, statements and entity names.
+/// Returns whether anything was masked.
+fn redact_request(req: &mut CommitRequest) -> bool {
+    let mut changed = redact(&mut req.content);
+    for fact in &mut req.facts {
+        changed |= redact(&mut fact.statement);
+        changed |= redact(&mut fact.subject.name);
+        if let Some(object) = &mut fact.object {
+            changed |= redact(&mut object.name);
+        }
+    }
+    changed
 }
 
 fn mentions(fact: &CommitFact) -> impl Iterator<Item = &EntityRef> {
@@ -754,6 +782,7 @@ mod tests {
 
         let response = CommitResponse {
             episode_id: id,
+            redacted: false,
             facts: vec![
                 CommittedFact {
                     id,
@@ -789,8 +818,34 @@ mod tests {
                 {"id": id, "status": "quarantined"},
                 {"id": id, "status": "active", "corroborated": true, "superseded": id},
                 {"id": id, "status": "active", "related": [{"id": id, "statement": "r", "score": 0.5}]},
-            ]})
+            ], "redacted": false})
         );
+    }
+
+    #[test]
+    fn redaction_covers_content_statements_and_entity_names() {
+        let mut one = fact();
+        one.statement = "Ada set password=hunter2".into();
+        one.subject.name = "sk-abcdefghijklmnopqrstuvwxyz".into();
+        one.object = Some(EntityRef {
+            name: "AKIAIOSFODNN7EXAMPLE".into(),
+            kind: "key".into(),
+        });
+        one.predicate = "uses_key".into();
+        let mut req = request(vec![one]);
+        req.content = "token=abc123".into();
+        assert!(redact_request(&mut req));
+        assert_eq!(req.content, "token=[redacted]");
+        assert_eq!(req.facts[0].statement, "Ada set password=[redacted]");
+        assert_eq!(req.facts[0].subject.name, "[redacted]");
+        assert_eq!(
+            req.facts[0].object.as_ref().map(|o| o.name.as_str()),
+            Some("[redacted]")
+        );
+        assert_eq!(req.facts[0].predicate, "uses_key");
+
+        let mut clean = request(vec![fact()]);
+        assert!(!redact_request(&mut clean));
     }
 
     #[test]
