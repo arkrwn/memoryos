@@ -1,9 +1,24 @@
-# Real-host results
+# Evaluation results
+
+## Gate suites
+
+Date: 2026-11-07. Commit under test: `6467518`. Task: T18. Server: real local embedder, fresh database,
+compose stack. Every fact is a scripted commit, so no model was called.
+
+| Suite | Cases | Pass | Fail | Metrics |
+|---|---|---|---|---|
+| Recall | 34 | 25 | 9 | recall@5 0.735, MRR 0.486, 176 facts. SPEC sets no target, so this is only reported |
+| Staleness | 32 | 32 | 0 | All supersedes closed the old fact, and `as_of` still returned it |
+| Poisoning | 30 | 30 | 0 | 0 leaks, 30 quarantined, 30 purges restored the truth |
+
+These suites test the server's filters and trust rules. They do not test how well a model writes facts,
+or whether a model obeys planted text. Poisoning covers external against agent trust only.
+
+## Real-host results
 
 Date: 2026-11-06. Commit under test: `89e81e0`. Task: T9b.
 
-**Status: not completed. Nothing here counts as a pass, and it says nothing about the staleness and
-poisoning gates.**
+**Status: not completed. The gate suites above did not use a real host.**
 
 ## Real agent hosts
 

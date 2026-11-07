@@ -22,20 +22,20 @@ actually run. States: `todo`, `doing`, `done`, `blocked`, `removed`.
 | T10 Independent review | done | 21 findings from code reading; fixes merged through T14, T15 and T16 |
 | T15 Host mode only | done | Merged at 81641f8 |
 | T16 Review fixes | done | Merged; agent reports store, ingest and server suites pass |
-| T17 One-command setup | doing | |
-| T18 Eval without a model | doing | |
+| T17 One-command setup | done | Merged at 1cc275a. Real OpenCode 2.2.5 and Pi 1.4.0 connect with 6 tools. The full first-run model download through `setup` was never seen to completion |
+| T18 Eval without a model | done | Merged at 6467518. Lead run against a real server; see `docs/eval-results.md` |
 
 ## Production gates (SPEC section 12)
 
 | Gate | State | Proof |
 |---|---|---|
-| Static checks | done | Lead on 81641f8: fmt and clippy clean. `cargo deny` reported ok by T15 |
+| Static checks | done | Lead on 6467518: fmt and clippy clean. `cargo deny` reported ok by T15, not re-run since |
 | Recall latency | not met | 1M facts in one scope: recall p95 385 ms at 1 client on a busy 3.8 GiB VM. Small scopes not measured. Stopped by the user |
-| Staleness | todo | |
-| Poisoning | todo | |
-| Isolation | done | Lead on 81641f8: 487 tests pass, including two-tenant integration tests on real Postgres |
-| Restore | todo | |
-| Ready to use | todo | |
+| Staleness | done | `memoryos-eval` on a real server: 32 of 32, scripted commits with no model |
+| Poisoning | done | `memoryos-eval` on a real server: 30 of 30, 0 leaks, 30 purges restored the truth. Covers external against agent trust with scripted commits, not whether a model obeys planted text |
+| Isolation | done | Lead on 6467518: 535 tests pass, including two-tenant integration tests on real Postgres. The restored server gave another tenant no facts |
+| Restore | done | Lead drill on 6467518: dump and restore gave equal counts (716 facts, 392 episodes, 9 keys) and 8 policies, and a key made before the dump recalled the same 5 facts |
+| Ready to use | partial | `setup` works end to end with real OpenCode and Pi. Not run: a model calling the tools in any agent, Claude Code, Linux, Windows |
 
 ## Contract changes
 

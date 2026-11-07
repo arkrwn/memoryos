@@ -22,6 +22,20 @@ Requirements:
 | Network at first start | Hugging Face, for the 481 MB model. Took about 2 minutes here |
 | glibc | 2.38 or newer. `debian:trixie-slim`, `ubuntu:24.04` and `gcr.io/distroless/cc-debian13` work; bookworm and alpine do not |
 
+Normal install, with Docker running:
+
+```bash
+cargo install --path crates/server
+cd your-project
+memoryos setup --agent claude-code   # or: opencode, pi
+```
+
+`setup` keeps its Compose file, `.env`, database and `credentials.json` (mode 0600) in
+`~/.config/memoryos`. `memoryos setup --uninstall` keeps the data, and `--delete-data` erases it. In
+that install, use `docker compose -f ~/.config/memoryos/docker-compose.yml` for the commands below.
+
+To run the stack by hand from the repository instead:
+
 ```bash
 cp deploy/.env.example deploy/.env
 sed -i.bak "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 32)/" deploy/.env && rm deploy/.env.bak
@@ -113,9 +127,9 @@ dc exec -T postgres psql -U memoryos -d memoryos -Atc "SELECT (SELECT count(*) F
 dc exec -T postgres psql -U memoryos -d memoryos -Atc "SELECT count(*) FROM pg_policies;"
 ```
 
-Expect 8 policies, one per tenant table. The drill ran when there were 9, because `sessions` and
-`session_messages` still existed. It gave the same counts on both sides, `recall` returned both facts
-with the pre-backup token, and a key in another tenant got no facts.
+Expect 8 policies, one per tenant table. The latest drill, on commit 6467518, gave 716 facts, 392
+episodes and 9 keys on both sides. `recall` returned the same 5 facts with a token made before the
+dump, and a key in another tenant got no facts.
 
 To restore in place instead of beside (**not run**, and it deletes the current database):
 
@@ -271,6 +285,7 @@ delete `pgdata`.
 - Changing the embedding model needs re-embedding, and there is no tool for it.
 - The compose stack is one Postgres and one server. There is no replication or scheduled backup; add
   those yourself.
-- MCP has been checked by protocol requests and tests, not by a real agent host.
+- Real OpenCode 2.2.5 and Pi 1.4.0 connect over MCP and list its 6 tools. No model has called the tools
+  in any agent, and Claude Code has not been run.
 - The image takes prebuilt ONNX Runtime from `cdn.pyke.io` at build time. `cargo deny` does not cover it.
 - The release targets in `README.md` are not yet measured.
