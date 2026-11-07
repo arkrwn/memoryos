@@ -106,6 +106,14 @@ old image. **Not run** across a real schema change, since only one migration exi
 The model cache needs no backup. It downloads again. `deploy/.env` is not in the database, so keep it
 safely. API keys are in the database as hashes, and existing tokens keep working after a restore.
 
+For a `memoryos setup` install, also keep `~/.config/memoryos/.env`, which holds the database password:
+
+```bash
+docker compose -f ~/.config/memoryos/docker-compose.yml exec -T postgres pg_dump -U memoryos -d memoryos -Fc > memoryos.dump
+```
+
+For a manual install:
+
 ```bash
 dc exec -T postgres pg_dump -U memoryos -d memoryos -Fc > memoryos.dump
 ```
