@@ -611,6 +611,7 @@ async fn poisoning_steps(
         seed_fact: only_fact(&seed)?.id,
         seed_episode: seed.episode_id,
     };
+    run.try_future_date(detail).await?;
     let Some(held) = run.plant("poison-held", detail).await? else {
         return Ok(());
     };
@@ -634,6 +635,36 @@ async fn poisoning_steps(
 }
 
 impl PoisonRun<'_> {
+    /// A sleeper first tries to enter memory dated years ahead, so it would wake unreviewed. SPEC
+    /// section 9 limits `valid_from` to 1 day ahead, so the server has to refuse it with a 400.
+    async fn try_future_date(&self, detail: &mut PoisoningDetail) -> Result<(), CaseError> {
+        let case = self.case;
+        let Some(at) = case.poison.attempted_valid_from else {
+            return Ok(());
+        };
+        let mut fact = CommitFact::new(&case.poison.fact, None);
+        fact.valid_from = Some(at);
+        let outcome = self
+            .ctx
+            .commit(
+                case.poison.trust,
+                (&case.id, "poison-dated"),
+                (self.scope, &case.poison.source, &case.poison.content),
+                vec![fact],
+            )
+            .await;
+        match outcome {
+            Err(CaseError::Status { status: 400, .. }) => Ok(()),
+            Err(other) => Err(other),
+            Ok(_) => {
+                detail
+                    .write_problems
+                    .push(format!("commit dated {at} was accepted"));
+                Ok(())
+            }
+        }
+    }
+
     /// Commits the claim with the low-trust key, through the host flow. Returns `None`, with the
     /// reason recorded, when candidates did not offer the seed, since the case cannot go on.
     async fn plant(
@@ -768,18 +799,8 @@ impl PoisonRun<'_> {
             }
         }
 
-        let starts = case.poison.fact.valid_from;
-        let dormant = starts.is_some_and(|at| at > Utc::now());
         let current = statements(&self.probe(None).await?);
-        if dormant {
-            if !covers_none(&current, &case.planted) {
-                detail
-                    .control_problems
-                    .push("approved claim is in current recall before it starts".to_owned());
-            }
-        } else {
-            self.expect_live(&current, "current recall", detail);
-        }
+        self.expect_live(&current, "current recall", detail);
         for &as_of in &case.as_of_probes {
             let past = statements(&self.probe(Some(as_of)).await?);
             self.expect_live(&past, "as_of recall", detail);

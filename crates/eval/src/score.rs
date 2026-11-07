@@ -26,7 +26,7 @@ const POISONING_PROVES: &str =
     "Commits by low-trust keys stay out of recall and candidates until an \
 admin approves them, cannot close a fact of higher trust, and purge removes them and restores what \
 they closed. The highest trust a commit can have is agent, so this covers external against agent, \
-never user or system. It does not test whether a model would extract or obey the planted text.";
+never user or system. Far-future dating is refused, so sleepers are probed at their later dates. It does not test whether a model would extract or obey the planted text.";
 
 pub fn contains_ci(haystack: &str, needle: &str) -> bool {
     haystack.to_lowercase().contains(&needle.to_lowercase())

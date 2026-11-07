@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::process::Output;
 use std::time::Duration;
 
-use chrono::Utc;
 use memoryos_eval::client::Trust;
 use memoryos_eval::dataset::{self, PoisonCase, RecallCase, ScopeKind, StalenessCase};
 use serde_json::{json, Value};
@@ -599,8 +598,17 @@ fn poison_case_stubs(case: &PoisonCase, ids: &mut Ids) -> Vec<Value> {
         ));
     }
 
-    // While approved. The seed is closed where the claim has started, and a claim dated in the
-    // future stays out of current recall, as the valid-time filter would keep it.
+    // A far-future date is refused. Without a stub the harness would see 404 and report an error.
+    if case.poison.attempted_valid_from.is_some() {
+        let mut refused = commit_stub(poison_token, &case.id, "poison-dated", Uuid::nil(), &[]);
+        refused["response"] = json_response(
+            400,
+            &json!({ "error": { "code": "invalid_input", "message": "valid_from" } }),
+        );
+        stubs.push(refused);
+    }
+
+    // While approved, the seed is closed and the claim is live.
     stubs.push(in_state(
         get_fact_stub(p.seed_fact, &closed_seed),
         &scenario,
@@ -612,14 +620,8 @@ fn poison_case_stubs(case: &PoisonCase, ids: &mut Ids) -> Vec<Value> {
     } else {
         scored(vec![live.clone(), true_fact.clone()])
     };
-    let dormant = case.poison.fact.valid_from.expect("validated") > Utc::now();
-    let current = if dormant {
-        scored(vec![true_fact.clone()])
-    } else {
-        with_claim.clone()
-    };
     stubs.push(in_state(
-        recall_stub(&case.id, DEFAULT_PRIORITY, false, &current),
+        recall_stub(&case.id, DEFAULT_PRIORITY, false, &with_claim),
         &scenario,
         APPROVED,
         None,
@@ -859,6 +861,44 @@ async fn a_poison_committed_active_is_a_leak() {
         "{failed}"
     );
     assert_eq!(poisoning["metrics"]["leaks"], json!(1));
+}
+
+#[tokio::test]
+async fn a_far_future_date_that_is_accepted_fails_the_case() {
+    let wiremock = start_wiremock().await;
+    let mut ids = Ids::default();
+    let cases = dataset::load_poisoning().expect("data");
+    let mut stubs = Vec::new();
+    for case in &cases {
+        stubs.extend(poison_case_stubs(case, &mut ids));
+    }
+    let target = cases
+        .iter()
+        .find(|c| c.poison.attempted_valid_from.is_some())
+        .expect("a sleeper case");
+    let mut accepted = commit_stub(
+        token_for(target.poison.trust),
+        &target.id,
+        "poison-dated",
+        Uuid::from_u128(u128::MAX - 2),
+        &[(Uuid::from_u128(u128::MAX - 3), "quarantined")],
+    );
+    accepted["priority"] = json!(OVERRIDE_PRIORITY);
+    stubs.push(accepted);
+    wiremock.import(stubs).await;
+
+    let run = run_harness(&wiremock.url, &["--suite", "poisoning"]).await;
+
+    assert_eq!(run.output.status.code(), Some(1), "{}", stdout(&run));
+    let failed = case(suite(&run.report, "poisoning"), &target.id);
+    assert_eq!(failed["status"], json!("failed"));
+    assert!(
+        failed["reason"]
+            .as_str()
+            .expect("reason")
+            .contains("was accepted"),
+        "{failed}"
+    );
 }
 
 #[tokio::test]

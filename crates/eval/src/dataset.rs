@@ -156,6 +156,9 @@ pub struct PoisonCommit {
     pub source: String,
     pub content: String,
     pub fact: FactSpec,
+    /// The far-future date a sleeper tries first. The server must refuse it.
+    #[serde(default)]
+    pub attempted_valid_from: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -313,8 +316,13 @@ fn check_poison_case(case: &PoisonCase) -> Result<(), String> {
     if poison_at <= seed_at {
         return Err("poison must start after the seed".to_owned());
     }
-    if case.as_of_probes.iter().any(|probe| *probe < poison_at) {
-        return Err("an as_of probe is before the poison starts".to_owned());
+    if (case.class == PoisonClass::SleeperClaim) != case.poison.attempted_valid_from.is_some() {
+        return Err("attempted_valid_from is for sleeper claims, and they all need it".to_owned());
+    }
+    if let Some(attempted) = case.poison.attempted_valid_from {
+        if case.as_of_probes.iter().any(|probe| *probe < attempted) {
+            return Err("an as_of probe is before the attempted date".to_owned());
+        }
     }
     match (case.poison.trust, case.scope_kind) {
         (Trust::External, _) => {}
@@ -463,6 +471,8 @@ mod tests {
             .filter(|c| c.class == PoisonClass::SleeperClaim)
         {
             assert!(!case.as_of_probes.is_empty(), "{}", case.id);
+            let attempted = case.poison.attempted_valid_from.expect("attempted date");
+            assert!(attempted > Utc::now(), "{} is not dated ahead", case.id);
         }
     }
 
