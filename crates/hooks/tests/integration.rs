@@ -188,14 +188,17 @@ fn wait_healthy(url: &str) {
 }
 
 fn create_key(admin: bool) -> String {
+    create_key_in(&unique("tenant"), admin)
+}
+
+fn create_key_in(tenant: &str, admin: bool) -> String {
     let world = world();
-    let tenant = unique("tenant");
     let mut command = server_command(&world.database_url, None);
     command.args([
         "key",
         "create",
         "--tenant",
-        &tenant,
+        tenant,
         "--name",
         "test",
         "--scopes",
@@ -904,9 +907,9 @@ fn claude_code_install_merges_and_is_idempotent_and_reversible() {
     assert_eq!(
         read_json(&sandbox.file(".mcp.json")),
         json!({"mcpServers": {"memoryos": {
-            "type": "http",
-            "url": "http://memory.test:9000/mcp",
-            "headers": {"Authorization": "Bearer ${MEMORYOS_API_KEY}"},
+            "type": "stdio",
+            "command": "memoryos",
+            "args": ["mcp"],
         }}})
     );
     assert_eq!(
@@ -965,45 +968,156 @@ fn the_installed_claude_code_commands_really_run() {
     assert_eq!(run.stdout, STOP_JSON);
 }
 
-#[test]
-fn the_installed_mcp_url_and_header_reach_the_real_server() {
-    let sandbox = live_sandbox();
-    let key = sandbox
-        .env
-        .iter()
-        .find(|(name, _)| name == "MEMORYOS_API_KEY")
-        .map(|(_, value)| value.clone())
-        .expect("key");
-    sandbox.ok(&["hook", "install", "--agent", "claude-code"], "");
-    let entry = &read_json(&sandbox.file(".mcp.json"))["mcpServers"]["memoryos"];
-    let url = entry["url"].as_str().expect("url").to_owned();
-    // What the host does with the reference.
-    let header = entry["headers"]["Authorization"]
-        .as_str()
-        .expect("header")
-        .replace("${MEMORYOS_API_KEY}", &key);
-
-    let runtime = tokio::runtime::Runtime::new().expect("runtime");
-    let response = runtime.block_on(async {
-        reqwest::Client::new()
-            .post(&url)
-            .header("Authorization", header)
-            .header("Accept", "application/json, text/event-stream")
-            .json(&json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {},
-                    "clientInfo": {"name": "test", "version": "1"},
-                },
-            }))
-            .send()
-            .await
-            .expect("send")
+/// A sandbox with no key or URL in its environment, only `credentials.json`.
+fn credentials_sandbox(agent_key: &str, admin_key: &str) -> Sandbox {
+    let mut sandbox = Sandbox::new(&world().server_url, "unused");
+    sandbox.unset("MEMORYOS_URL");
+    sandbox.unset("MEMORYOS_API_KEY");
+    let file = sandbox.home.join(".config/memoryos/credentials.json");
+    fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+    let stored = json!({
+        "url": world().server_url,
+        "agent_key": agent_key,
+        "admin_key": admin_key,
     });
-    assert_eq!(response.status().as_u16(), 200);
+    fs::write(&file, stored.to_string()).expect("credentials");
+    sandbox
+}
+
+/// Sends these lines to a real `memoryos mcp` and returns what it prints, one JSON value per line.
+fn run_proxy(sandbox: &Sandbox, lines: &[Value]) -> (Vec<Value>, String) {
+    let input: String = lines.iter().map(|line| format!("{line}\n")).collect();
+    let run = sandbox.run(&["mcp"], &input);
+    assert!(run.success, "{}", run.stderr);
+    let replies = run
+        .stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("one JSON value per line"))
+        .collect();
+    (replies, run.stderr)
+}
+
+#[test]
+fn the_mcp_proxy_speaks_stdio_to_the_real_server_using_only_stored_credentials() {
+    let agent = create_key(false);
+    let sandbox = credentials_sandbox(&agent, "mos_admin_must_not_be_used");
+    let word = unique("proxied");
+    let (replies, stderr) = run_proxy(
+        &sandbox,
+        &[
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "1"},
+            }}),
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+                "name": "commit_facts",
+                "arguments": {
+                    "scope": "agent:proxy",
+                    "source": "proxy test",
+                    "content": format!("{word} fact"),
+                    "facts": [{
+                        "statement": format!("{word} fact"),
+                        "subject": {"name": "the team", "kind": "group"},
+                        "predicate": "said",
+                        "object": {"name": word, "kind": "other"},
+                    }],
+                },
+            }}),
+        ],
+    );
+    assert_eq!(
+        replies.len(),
+        3,
+        "the notification gets no reply: {replies:?}"
+    );
+    assert_eq!(replies[0]["id"], 1);
+    assert_eq!(replies[0]["result"]["serverInfo"]["name"], "memoryos");
+    assert_eq!(replies[1]["id"], 2);
+    let tools = replies[1]["result"]["tools"].as_array().expect("tools");
+    assert!(tools.iter().any(|tool| tool["name"] == "commit_facts"));
+    assert_eq!(replies[2]["id"], 3);
+    assert_ne!(replies[2]["result"]["isError"], json!(true), "{replies:?}");
+    assert_eq!(stderr, "");
+
+    // It really landed, seen through the plain client with the same stored key.
+    let recalled = sandbox.json(&["recall", &word, "--scope", "agent:proxy", "--json"], "");
+    assert!(recalled_statements(&recalled)
+        .iter()
+        .any(|s| s.contains(&word)));
+}
+
+#[test]
+fn the_mcp_proxy_answers_every_request_when_the_key_is_refused_or_the_server_is_gone() {
+    let sandbox = credentials_sandbox("mos_refused", "mos_refused_too");
+    let (replies, _) = run_proxy(
+        &sandbox,
+        &[json!({"jsonrpc": "2.0", "id": 9, "method": "tools/list"})],
+    );
+    assert_eq!(replies[0]["id"], 9);
+    let message = replies[0]["error"]["message"].as_str().expect("message");
+    assert!(!message.contains("mos_refused"), "{message}");
+
+    let mut sandbox = credentials_sandbox("mos_x", "mos_y");
+    sandbox.set("MEMORYOS_URL", &format!("http://127.0.0.1:{}", free_port()));
+    let (replies, _) = run_proxy(
+        &sandbox,
+        &[json!({"jsonrpc": "2.0", "id": "a", "method": "tools/list"})],
+    );
+    assert_eq!(replies[0]["id"], "a");
+    assert!(replies[0]["error"]["message"]
+        .as_str()
+        .expect("message")
+        .contains("Is it running"));
+}
+
+#[test]
+fn the_mcp_proxy_without_credentials_fails_with_a_clear_message() {
+    let mut sandbox = Sandbox::new("http://unused.test", "unused");
+    sandbox.unset("MEMORYOS_URL");
+    sandbox.unset("MEMORYOS_API_KEY");
+    let run = sandbox.run(&["mcp"], "");
+    assert!(!run.success);
+    assert!(run.stderr.contains("memoryos setup"), "{}", run.stderr);
+    assert_eq!(run.stdout, "");
+}
+
+#[test]
+fn the_agent_key_cannot_approve_and_quarantine_uses_the_stored_admin_key() {
+    let tenant = unique("tenant");
+    let agent = create_key_in(&tenant, false);
+    let admin = create_key_in(&tenant, true);
+    let sandbox = credentials_sandbox(&agent, &admin);
+    let word = unique("reviewed");
+
+    // An agent write outside `agent:*` waits for review.
+    let body = json!({
+        "scope": "user:reviewed",
+        "source": "t",
+        "content": format!("{word} fact"),
+        "facts": [{
+            "statement": format!("{word} fact"),
+            "subject": {"name": "the user", "kind": "person"},
+            "predicate": "said",
+            "object": {"name": word, "kind": "other"},
+        }],
+    })
+    .to_string();
+    let committed = sandbox.json(&["commit", "--json"], &body);
+    let id = committed["facts"][0]["id"].as_str().expect("id").to_owned();
+    assert_eq!(committed["facts"][0]["status"], "quarantined");
+
+    // The same command with the agent key, as an injected agent would try through MCP's key.
+    let mut as_agent = credentials_sandbox(&agent, &admin);
+    as_agent.set("MEMORYOS_API_KEY", &agent);
+    let refused = as_agent.run(&["quarantine", "approve", &id], "");
+    assert!(!refused.success, "{}", refused.stdout);
+
+    // Without an override, `quarantine` picks the admin key from the file.
+    let approved = sandbox.json(&["quarantine", "approve", &id, "--json"], "");
+    assert_eq!(approved["status"], "active", "{approved}");
 }
 
 #[test]
@@ -1025,10 +1139,7 @@ fn claude_code_global_install_stays_in_the_temporary_home() {
     let merged = read_json(&claude_json);
     assert_eq!(merged["numStartups"], 7);
     assert_eq!(merged["mcpServers"]["f"]["url"], "http://f");
-    assert_eq!(
-        merged["mcpServers"]["memoryos"]["url"],
-        "http://memory.test/mcp"
-    );
+    assert_eq!(merged["mcpServers"]["memoryos"]["command"], "memoryos");
     assert!(read_json(&sandbox.home.join(".claude/settings.json"))["hooks"]["Stop"].is_array());
     assert_eq!(fs::read_dir(&sandbox.project).expect("project").count(), 0);
     assert!(!sandbox.all_file_contents().contains(CANARY_KEY));
@@ -1054,18 +1165,16 @@ fn opencode_install_writes_the_plugin_and_merges_the_server() {
     sandbox.ok(&["hook", "install", "--agent", "opencode"], "");
 
     let plugin = fs::read_to_string(sandbox.file(".opencode/plugins/memoryos.ts")).expect("plugin");
-    assert!(plugin.contains("experimental.session.compacting"));
-    assert!(plugin.contains("memoryos hook session-start"));
+    assert!(plugin.contains("export default"));
+    assert!(plugin.contains("\"hook\", \"session-start\""));
     let merged = read_json(&config);
     assert_eq!(merged["model"], "x");
     assert_eq!(
         merged["mcp"]["memoryos"],
         json!({
-            "type": "remote",
-            "url": "http://memory.test/mcp",
+            "type": "local",
+            "command": ["memoryos", "mcp"],
             "enabled": true,
-            "oauth": false,
-            "headers": {"Authorization": "Bearer {env:MEMORYOS_API_KEY}"},
         })
     );
     assert!(!sandbox.all_file_contents().contains(CANARY_KEY));
@@ -1094,11 +1203,7 @@ fn opencode_json_with_comments_stops_with_instructions_and_writes_nothing() {
 
     assert!(!run.success);
     assert!(run.stderr.contains("by hand"), "{}", run.stderr);
-    assert!(
-        run.stderr.contains("{env:MEMORYOS_API_KEY}"),
-        "{}",
-        run.stderr
-    );
+    assert!(run.stderr.contains("\"memoryos\""), "{}", run.stderr);
     assert_eq!(fs::read_to_string(&config).expect("read"), original);
     assert!(!sandbox.file(".opencode").exists());
     assert!(!sandbox.file("opencode.json.bak").exists());

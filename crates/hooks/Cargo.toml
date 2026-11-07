@@ -14,6 +14,8 @@ integration = []
 memoryos-sdk.workspace = true
 chrono.workspace = true
 clap = { version = "4", features = ["derive"] }
+getrandom = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 sha2 = "0.10"
@@ -22,7 +24,6 @@ url = "2"
 uuid.workspace = true
 
 [dev-dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tempfile = "3"
 testcontainers = "0.28"
 

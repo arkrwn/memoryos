@@ -16,20 +16,24 @@ actually run. States: `todo`, `doing`, `done`, `blocked`, `removed`.
 | T13 Hardening after Wave 2 | done | Lead run on merged `develop`: 387 tests pass, fmt and clippy clean |
 | T14 Purge fixes | merged | Agent reports 3 unit and 73 integration store tests pass, 35 unit and 44 integration ingest tests pass. Lead workspace run at T7 merge passes |
 | T7 Server, MCP, SDK | done | Lead workspace run on `develop`: 506 tests pass, fmt and clippy clean. MCP checked against spec text and tests, not a real host. No live providers |
-| T12 CLI commands and hooks | doing | |
-| T8 Deploy, CI, docs | doing | |
-| T9 Integration and gates | todo | |
-| T10 Independent review | todo | |
+| T12 CLI commands and hooks | done | Agent reports 96 unit and 25 integration tests pass. Real OpenCode connected over MCP; real Claude Code not run |
+| T8 Deploy, CI, docs | done | Agent reports clean Docker build, compose install and restore drill, run before host-only removal |
+| T9 Integration and gates | doing | Load test stopped early by the user; see `docs/loadtest-results.md` |
+| T10 Independent review | done | 21 findings from code reading; fixes merged through T14, T15 and T16 |
+| T15 Host mode only | done | Merged at 81641f8 |
+| T16 Review fixes | done | Merged; agent reports store, ingest and server suites pass |
+| T17 One-command setup | doing | |
+| T18 Eval without a model | doing | |
 
 ## Production gates (SPEC section 12)
 
 | Gate | State | Proof |
 |---|---|---|
-| Static checks | todo | |
-| Recall latency | todo | |
+| Static checks | done | Lead on 81641f8: fmt and clippy clean. `cargo deny` reported ok by T15 |
+| Recall latency | not met | 1M facts in one scope: recall p95 385 ms at 1 client on a busy 3.8 GiB VM. Small scopes not measured. Stopped by the user |
 | Staleness | todo | |
 | Poisoning | todo | |
-| Isolation | todo | |
+| Isolation | done | Lead on 81641f8: 487 tests pass, including two-tenant integration tests on real Postgres |
 | Restore | todo | |
 | Ready to use | todo | |
 

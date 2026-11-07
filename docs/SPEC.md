@@ -241,8 +241,8 @@ adds a scope rule. A block update that omits `max_chars` keeps its limit.
 |---|---|---|
 | Static checks | No warnings | Commands in section 11 |
 | Recall latency | p95 under 200 ms at 1M facts, excluding embedding | Load test output |
-| Staleness | At least 95% of superseded facts absent from current recall | `memoryos-eval --mode host` report |
-| Poisoning | 0 poisoned facts in recall without approval | `memoryos-eval --mode host` report |
+| Staleness | At least 95% of superseded facts absent from current recall | `memoryos-eval` report |
+| Poisoning | 0 poisoned facts in recall without approval | `memoryos-eval` report |
 | Isolation | 0 cross-tenant reads | Integration tests |
 | Restore | Backup restored into an empty database and recall still works | Drill log |
 | Ready to use | README quickstart works from a clean checkout | Recorded run |

@@ -14,10 +14,10 @@
 </div>
 
 > [!NOTE]
-> **Pre-release.** The server, REST API, MCP endpoint and Rust SDK run, and the Docker stack below is
-> tested end to end. Not done yet: integration gates, a load test and independent review. It has not
-> run through a real agent host's model. Track the work in
-> [`docs/PROGRESS.md`](docs/PROGRESS.md).
+> **Pre-release.** The server, REST API, MCP endpoint and Rust SDK run, and `memoryos setup` is tested
+> end to end on macOS with Docker Desktop. It has not been run on Linux or Windows. No model has yet
+> used these tools in a real agent session, so what an agent actually remembers is untested. The
+> release targets below are goals, not results. Track the work in [`docs/PROGRESS.md`](docs/PROGRESS.md).
 
 ## ✨ Why MemoryOS
 
@@ -34,51 +34,43 @@ change and sources that lie.
 
 ## 🚀 Quickstart
 
-Needs Docker, and at least 1 GiB of memory for the server container. The first image build takes a
-few minutes, and the first start downloads a 481 MB embedding model into a named volume.
+Needs Docker running, and nothing else: no API key, no `.env`, no provider account. The agent's own
+model decides what to remember, and embeddings run locally in the container.
 
 ```bash
-cp deploy/.env.example deploy/.env
-sed -i.bak "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 32)/" deploy/.env && rm deploy/.env.bak
-docker compose -f deploy/docker-compose.yml up -d --build
-
-# Ready once the model has loaded, about 2 minutes on a first start.
-until curl -sf http://localhost:8080/readyz; do sleep 5; done
-
-TOKEN=$(docker compose -f deploy/docker-compose.yml exec -T memoryos memoryos key create \
-  --tenant demo --name quickstart --scopes 'user:*,agent:*' --max-trust agent --admin)
+cargo install --path crates/server
+cd your-project
+memoryos setup --agent claude-code   # or: opencode, pi
 ```
 
-Save a fact, in the agent's own scope, then recall it:
+The first run builds the image, which takes several minutes, and downloads a 481 MB embedding model,
+about 2.5 minutes on a fast connection and much longer on a slow one. Later runs start in seconds and
+keep your data and keys.
+
+`setup` starts Postgres and the server through Compose, creates two keys, and connects the agent over
+`memoryos mcp`, a local stdio proxy. Agent configuration holds no key and no reference to one.
+
+| | |
+|---|---|
+| 📁 **Where things live** | `~/.config/memoryos`: `credentials.json` (mode 0600), the database and the generated password |
+| 🔑 **Agent key** | Used by hooks and MCP. Scopes `agent:*`, `user:*`, `shared:*`, not an admin |
+| 🛡️ **Admin key** | Used only by `memoryos quarantine` |
+| 🎯 **Scope** | The current project by default, or `--global` for Claude Code and OpenCode |
+| 🧹 **Removing it** | `memoryos setup --uninstall` keeps your data. Add `--delete-data` to erase it |
+
+> [!WARNING]
+> Both keys are in one file your user account can read. This stops an injected agent approving its own
+> facts through MCP, but an agent with shell access can read that file or run `memoryos quarantine`.
+
+Review what agents wrote outside their own scope:
 
 ```bash
-curl -sS http://localhost:8080/v1/commits -H "Authorization: Bearer $TOKEN" -d '{
-  "scope": "agent:demo",
-  "source": "quickstart",
-  "content": "The team deploys to Hetzner.",
-  "facts": [{
-    "statement": "The team deploys to Hetzner",
-    "subject": {"name": "the team", "kind": "group"},
-    "predicate": "deploys_to",
-    "object": {"name": "Hetzner", "kind": "organization"}
-  }]
-}'
-# {"episode_id":"...","facts":[{"id":"...","status":"active"}]}
-
-curl -sS http://localhost:8080/v1/recall -H "Authorization: Bearer $TOKEN" \
-  -d '{"scopes": ["agent:demo"], "query": "where does the team deploy?"}'
+memoryos quarantine list --scope user:alice
+memoryos quarantine approve <fact-id>
 ```
 
-The same write to `user:alice` comes back `"status":"quarantined"`, and recall leaves it out until an
-admin approves it. MCP clients connect to `POST /mcp` with the same token:
-
-```bash
-curl -sS http://localhost:8080/mcp -H "Authorization: Bearer $TOKEN" \
-  -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}'
-```
-
-Backups, upgrades, key rotation and incidents are in the
-[runbook](docs/runbook.md).
+Backups, upgrades and incidents are in the [runbook](docs/runbook.md), which still describes the manual
+Compose install.
 
 ## 🔍 Example
 
@@ -140,8 +132,8 @@ Research shows a poisoned memory survives across sessions, unlike ordinary promp
 
 ## 🪝 Agent hooks
 
-The agent reads and saves memories through MCP tools. Hooks are optional. They only
-load memories and remind the agent to save, and they cannot bypass validation or quarantine.
+The agent reads and saves memories through MCP tools. Hooks only load memories and remind the agent to
+save, and they cannot bypass validation or quarantine. `memoryos setup` installs them for you.
 
 ```mermaid
 flowchart LR
@@ -195,41 +187,47 @@ agent act.
 <details>
 <summary><b>OpenCode setup</b></summary>
 
-`.opencode/plugins/memoryos.ts` (v1 plugin API):
-
-```ts
-export const MemoryOS = async ({ $ }) => ({
-  "experimental.session.compacting": async (_input, output) => {
-    const memories = await $`memoryos hook session-start`.text();
-    output.context.push(memories);
-  },
-});
-```
-
-This keeps memories through compaction but does not remind the agent to save, which needs a separate
-`session.idle` handler. OpenCode v2 renames this hook to `ctx.session.hook("compaction", ...)`.
+`.opencode/plugins/memoryos.ts` and an `mcp.memoryos` entry in `opencode.json`. The plugin adds recalled
+memories to compaction. It does not remind the agent to save, which would need a separate handler.
 
 </details>
 
 <details>
-<summary><b>One-command install</b></summary>
+<summary><b>Pi setup</b></summary>
 
-Adds its entries, keeps your existing hooks, and registers the MCP server. The API key stays an
-environment variable reference, never a value in the file:
+`.pi/mcp.json` in the project, plus a short block in `AGENTS.md` that says when to recall and save. Pi
+has no hooks here. Pi reads the project file only in a trusted project, so run `/trust` in Pi once.
+Project scope only: `setup` does not touch `~/.pi/agent/mcp.json`.
+
+</details>
+
+<details>
+<summary><b>Agent configuration only</b></summary>
+
+For a server you already run. Set `MEMORYOS_URL` and `MEMORYOS_API_KEY`, which override the stored
+credentials for every command:
 
 ```bash
-memoryos hook install --agent claude-code
-memoryos hook install --agent opencode
+memoryos hook install --agent claude-code   # or: opencode, pi
+memoryos hook uninstall --agent claude-code
 ```
 
 </details>
 
-The `memoryos hook` commands read `MEMORYOS_URL` and `MEMORYOS_API_KEY`, and never fail the host: on
-an error they log to stderr and exit 0. These setups have not been tested in a real Claude Code or
-OpenCode session. References:
+The `memoryos hook` commands never fail the host: on an error they log to stderr and exit 0.
+
+| Agent | Checked against the real program, with no model turn |
+|---|---|
+| OpenCode 2.2.5 | The plugin loads, and MCP connects through `memoryos mcp` with 6 tools |
+| Pi 1.4.0 | `pi mcp list` connects through `memoryos mcp` with 6 tools, in a trusted project |
+| Claude Code | Not run. Only the written files and the proxy are tested |
+
+Untested in all three: a model actually calling the tools, the OpenCode compaction hook firing, and
+Pi following its `AGENTS.md` block.
+
+References:
 [Claude Code hooks](https://code.claude.com/docs/en/hooks),
-[OpenCode plugins](https://opencode.ai/docs/plugins/),
-[OpenCode v1 migration](https://opencode.ai/v2/docs/build/plugins/migrate-v1/).
+[OpenCode plugins](https://opencode.ai/v2/docs/build/plugins/).
 
 ## 🗺️ Roadmap
 

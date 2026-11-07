@@ -1,14 +1,18 @@
-//! Commands that talk to a running server through `MEMORYOS_URL` and `MEMORYOS_API_KEY`, the agent
-//! hooks, and the hook installer. See `docs/SPEC.md` section 3.
+//! `memoryos setup`, the agent hooks and their installer, the stdio MCP proxy, and the commands that
+//! talk to a running server. They read `credentials.json`, with `MEMORYOS_URL` and
+//! `MEMORYOS_API_KEY` as overrides. See `docs/SPEC.md` section 3.
 //!
 //! The server binary flattens [`Command`] into its own command line and calls [`run`].
 
 mod client;
 mod config;
+mod credentials;
 mod doc;
 mod files;
 mod hook;
 mod install;
+mod mcp;
+mod setup;
 mod turns;
 
 use std::path::PathBuf;
@@ -57,6 +61,29 @@ pub enum Command {
     /// Agent hooks and their installer.
     #[command(subcommand)]
     Hook(HookCommand),
+    /// Start MemoryOS in Docker and connect an agent to it. Safe to run again.
+    Setup(SetupArgs),
+    /// Stdio MCP server for an agent, forwarding to the running server with the agent key.
+    Mcp,
+}
+
+#[derive(Debug, Args)]
+pub struct SetupArgs {
+    /// The agent to connect. Without it, `--uninstall` covers every agent.
+    #[arg(long, value_enum, required_unless_present = "uninstall")]
+    pub agent: Option<Agent>,
+    /// Use this project's configuration, in the current directory. This is the default.
+    #[arg(long, conflicts_with = "global")]
+    pub project: bool,
+    /// Use the user's configuration under the home directory.
+    #[arg(long)]
+    pub global: bool,
+    /// Remove the hooks and MCP configuration. Data stays unless `--delete-data` is given.
+    #[arg(long)]
+    pub uninstall: bool,
+    /// With `--uninstall`: also delete the database, the model cache and the credentials.
+    #[arg(long, requires = "uninstall")]
+    pub delete_data: bool,
 }
 
 #[derive(Debug, Args)]
@@ -133,6 +160,8 @@ pub fn run(command: Command) -> Result<(), String> {
             hook::run_stop();
             Ok(())
         }
+        Command::Setup(args) => setup::run(&args),
+        Command::Mcp => mcp::run(),
         Command::Hook(HookCommand::Install(args)) => install::run_install(&args),
         Command::Hook(HookCommand::Uninstall(args)) => install::run_uninstall(&args),
         Command::Recall {
@@ -223,6 +252,22 @@ mod tests {
     fn agents_use_their_published_names() {
         assert!(parse(&["hook", "install", "--agent", "claude-code"]).is_ok());
         assert!(parse(&["hook", "uninstall", "--agent", "opencode", "--dry-run"]).is_ok());
+        assert!(parse(&["hook", "install", "--agent", "pi"]).is_ok());
         assert!(parse(&["hook", "install", "--agent", "other"]).is_err());
+    }
+
+    #[test]
+    fn setup_needs_an_agent_unless_uninstalling() {
+        assert!(parse(&["setup"]).is_err());
+        assert!(parse(&["setup", "--agent", "opencode", "--project"]).is_ok());
+        assert!(parse(&["setup", "--agent", "pi"]).is_ok());
+        assert!(parse(&["setup", "--agent", "opencode", "--project", "--global"]).is_err());
+        assert!(parse(&["setup", "--uninstall"]).is_ok());
+        assert!(parse(&["setup", "--uninstall", "--delete-data"]).is_ok());
+    }
+
+    #[test]
+    fn delete_data_is_only_valid_with_uninstall() {
+        assert!(parse(&["setup", "--agent", "opencode", "--delete-data"]).is_err());
     }
 }

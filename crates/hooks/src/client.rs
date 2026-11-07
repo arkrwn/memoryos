@@ -72,7 +72,7 @@ pub fn commit(file: Option<&Path>, json: bool) -> Result<(), String> {
 }
 
 pub fn quarantine_list(scopes: &[Scope], limit: Option<i64>, json: bool) -> Result<(), String> {
-    call(|client| async move {
+    call_admin(|client| async move {
         let facts = client.quarantine(scopes, limit).await.map_err(describe)?;
         Ok(if json {
             json!({"facts": facts}).to_string()
@@ -83,14 +83,14 @@ pub fn quarantine_list(scopes: &[Scope], limit: Option<i64>, json: bool) -> Resu
 }
 
 pub fn approve(id: Uuid, json: bool) -> Result<(), String> {
-    call(|client| async move {
+    call_admin(|client| async move {
         let fact = client.approve(id).await.map_err(describe)?;
         Ok(review_output("approved", &fact, json))
     })
 }
 
 pub fn reject(id: Uuid, json: bool) -> Result<(), String> {
-    call(|client| async move {
+    call_admin(|client| async move {
         let fact = client.reject(id).await.map_err(describe)?;
         Ok(review_output("rejected", &fact, json))
     })
@@ -102,7 +102,26 @@ where
     F: FnOnce(MemoryOs) -> Fut,
     Fut: std::future::Future<Output = Result<String, String>>,
 {
-    let client = config::client(&process_env, Options::default())?;
+    run_with(config::client(&process_env, Options::default())?, work)
+}
+
+/// The same with the admin key. Only quarantine review may use this.
+fn call_admin<F, Fut>(work: F) -> Result<(), String>
+where
+    F: FnOnce(MemoryOs) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    run_with(
+        config::admin_client(&process_env, Options::default())?,
+        work,
+    )
+}
+
+fn run_with<F, Fut>(client: MemoryOs, work: F) -> Result<(), String>
+where
+    F: FnOnce(MemoryOs) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
