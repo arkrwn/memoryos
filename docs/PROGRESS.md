@@ -22,9 +22,9 @@ actually run. States: `todo`, `doing`, `done`, `blocked`, `removed`.
 | T10 Independent review | done | 21 findings from code reading; fixes merged through T14, T15 and T16 |
 | T15 Host mode only | done | Merged at 81641f8 |
 | T16 Review fixes | done | Merged; agent reports store, ingest and server suites pass |
-| T17 One-command setup | done | Merged at 1cc275a. Real OpenCode 2.2.5 and Pi 1.4.0 connect with 6 tools. The full first-run model download through `setup` was never seen to completion |
+| T17 One-command setup | done | Merged at 1cc275a. Real OpenCode 2.2.5 and Pi 1.4.0 connect with 6 tools. Full first run through `setup` completed on commit e21543e in a temp home: image build, model download of about 29 minutes at 220 to 470 KB/s, ready and healthy |
 | T18 Eval without a model | done | Merged at 6467518. Lead run against a real server; see `docs/eval-results.md` |
-| T19 Memory page | done | `memoryos ui`, `GET /v1/scopes`, `GET /v1/facts`. Lead run in a real browser: all views, approve, phone width, light and dark, no console errors. Proxy and endpoint integration tests pass |
+| T19 Memory page | done | `memoryos ui`, `GET /v1/scopes`, `GET /v1/facts`. Lead on e21543e: 548 tests pass, fmt and clippy clean. Real browser with sample data: all views, approve, phone width, light and dark. Real `setup` and model: Ask and Review work, no console errors. For "what database do we use?" over 5 facts, the Postgres fact ranked 3rd |
 
 ## Production gates (SPEC section 12)
 
