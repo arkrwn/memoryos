@@ -37,6 +37,7 @@ HostCommitter::commit(&self, ctx: &RequestContext, req: CommitRequest, max_trust
 Retriever::new(store: Arc<dyn MemoryStore>, embedder: Arc<dyn Embedder>) -> Self
 Retriever::recall(&self, ctx: &RequestContext, req: RecallRequest) -> Result<RecallResponse>
 Retriever::candidates(&self, ctx: &RequestContext, scopes: &[Scope], statement: &str, limit: i64) -> Result<Vec<ScoredFact>>
+Retriever::candidates_with_embedding(&self, ctx: &RequestContext, scopes: &[Scope], statement: &str, embedding: &[f32], limit: i64) -> Result<Vec<ScoredFact>>
 pub struct RecallRequest { scopes: Vec<Scope>, query: String, limit: i64, as_of: Option<DateTime<Utc>>, known_at: Option<DateTime<Utc>> }
 pub struct RecallResponse { facts: Vec<ScoredFact> }
 
@@ -52,20 +53,31 @@ The `memoryos` binary (crate `server`) has these commands: `serve`, `migrate`, `
 
 ## 3. Write path
 
-1. `POST /v1/candidates` with `{scopes, statement, limit}` returns related current facts. It ranks
-   like `Retriever::recall`, at the present time.
-2. The host decides, then `POST /v1/commits` sends `{scope, source, content, facts[]}`. Each fact has
+1. Optional: `POST /v1/candidates` with `{scopes, statement, limit}` returns related current facts.
+   It ranks like `Retriever::recall`, at the present time. A host that only saves can skip it.
+2. `POST /v1/commits` sends `{scope, source, content, facts[]}`. Each fact has
    `statement`, `subject {name, kind}`, `predicate`, optional `object {name, kind}`, optional
    `valid_from`, and at most one of `supersedes` and `corroborates`. Maximum 50 facts.
 3. `HostCommitter` stores `content` through `insert_episode` as the source of the facts. Replaying an
    `idempotency_key` returns the existing episode and its facts; a key reused for a different scope,
    source, content or trust returns 400 `invalid_input` and reveals nothing about the first request.
-4. It embeds statements and entities in one call. Entity resolution: same normalized name or known
-   alias with the same kind uses that entity; otherwise cosine similarity of at least 0.90 with the
-   same kind merges. The new name becomes an alias only when this source has an active fact on it.
-5. It builds `FactOp`s, applies the section 5 trust gate, and calls `apply_commit`, which commits
+4. It embeds statements and entities in one call.
+5. Each fact that sets neither `supersedes` nor `corroborates` is matched against the current facts
+   of the commit's scope with the candidates search of step 1, reusing its statement embedding. A
+   candidate with the same statement, compared case-insensitively with whitespace runs collapsed and
+   a final period ignored, makes the fact an automatic `corroborates` of it: no fact and no entity is
+   created, and the existing fact gains this source. Only current, active facts of that one scope and
+   tenant can match, so a quarantined fact or another scope's fact never does, and a fact that this
+   request supersedes is skipped. A fact that is created gets up to 3 other candidates as `related`.
+6. Entity resolution, for the facts that are created: same normalized name or known alias with the
+   same kind uses that entity; otherwise cosine similarity of at least 0.90 with the same kind
+   merges. The new name becomes an alias only when this source has an active fact on it.
+7. It builds `FactOp`s, applies the section 5 trust gate, and calls `apply_commit`, which commits
    everything and sets `processed_at` atomically. If the episode is already processed that is a no-op,
-   so a concurrent replay cannot apply twice. Returns `episode_id` and each fact's `id` and `status`.
+   so a concurrent replay cannot apply twice. Returns `episode_id` and, per request fact, `id`,
+   `status`, `corroborated` when no fact was created, and `related` for a created fact. A replay
+   tells a matched fact from a created one by `recorded_at`, which equals `processed_at` only for
+   facts the episode created, and returns no `related`.
 
 Rules:
 - Commit trust is `agent`, or `external` if the key's `max_trust` is `external`. A request cannot

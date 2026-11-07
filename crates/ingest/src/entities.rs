@@ -23,10 +23,16 @@ fn key(entity: &EntityRef) -> EntityKey {
     (normalize_kind(&entity.kind), normalize_name(&entity.name))
 }
 
-/// One batch's embeddings and resolved entities.
-pub(crate) struct ResolvedBatch {
+/// One batch's embeddings, before any entity is resolved.
+pub(crate) struct EmbeddedBatch {
     /// One vector per input statement, in order.
     pub(crate) statement_embeddings: Vec<Vec<f32>>,
+    /// Each distinct entity in batch order, with its trimmed name and the vector of its key.
+    entities: Vec<(EntityKey, String, Vec<f32>)>,
+}
+
+/// One batch's resolved entities.
+pub(crate) struct ResolvedBatch {
     entity_ids: HashMap<EntityKey, Uuid>,
     /// Names merged into an entity. Written by `add_earned_aliases`, once statuses are known.
     pub(crate) merges: Vec<Merge>,
@@ -47,23 +53,19 @@ impl ResolvedBatch {
     }
 }
 
-/// Embeds `statements` and the distinct entities in one provider call, statements first, then
-/// resolves the entities one at a time, so a later name in the batch can merge into an earlier one.
+/// Embeds `statements` and the distinct entities in one provider call, statements first.
 ///
 /// Names are embedded in normalized form, so one normalized name always has one vector.
-pub(crate) async fn embed_and_resolve(
-    store: &dyn MemoryStore,
+pub(crate) async fn embed_batch(
     embedder: &dyn Embedder,
-    ctx: &RequestContext,
-    scope: &Scope,
     statements: Vec<String>,
     entities: &[&EntityRef],
-) -> Result<ResolvedBatch> {
-    let mut distinct: Vec<(EntityKey, &str)> = Vec::new();
+) -> Result<EmbeddedBatch> {
+    let mut distinct: Vec<(EntityKey, String)> = Vec::new();
     for entity in entities.iter().copied() {
         let entity_key = key(entity);
         if !distinct.iter().any(|(seen, _)| *seen == entity_key) {
-            distinct.push((entity_key, entity.name.trim()));
+            distinct.push((entity_key, entity.name.trim().to_owned()));
         }
     }
 
@@ -88,17 +90,40 @@ pub(crate) async fn embed_and_resolve(
     }
 
     let entity_vectors = vectors.split_off(statement_count);
-    let mut entity_ids = HashMap::with_capacity(distinct.len());
-    let mut merges = Vec::new();
-    for (((kind, normalized), name), embedding) in distinct.into_iter().zip(entity_vectors) {
-        let id = resolve(store, ctx, scope, &kind, name, embedding, &mut merges).await?;
-        entity_ids.insert((kind, normalized), id);
-    }
-    Ok(ResolvedBatch {
+    Ok(EmbeddedBatch {
         statement_embeddings: vectors,
-        entity_ids,
-        merges,
+        entities: distinct
+            .into_iter()
+            .zip(entity_vectors)
+            .map(|((entity_key, name), vector)| (entity_key, name, vector))
+            .collect(),
     })
+}
+
+impl EmbeddedBatch {
+    /// Resolves the embedded entities that `used` names, one at a time in batch order, so a later
+    /// name can merge into an earlier one. An entity named only by a fact that turned out to be a
+    /// corroboration is left alone: a corroboration creates nothing.
+    pub(crate) async fn resolve(
+        self,
+        store: &dyn MemoryStore,
+        ctx: &RequestContext,
+        scope: &Scope,
+        used: &[&EntityRef],
+    ) -> Result<ResolvedBatch> {
+        let used: Vec<EntityKey> = used.iter().map(|entity| key(entity)).collect();
+        let mut entity_ids = HashMap::with_capacity(used.len());
+        let mut merges = Vec::new();
+        for (entity_key, name, embedding) in self.entities {
+            if !used.contains(&entity_key) {
+                continue;
+            }
+            let (kind, _) = &entity_key;
+            let id = resolve(store, ctx, scope, kind, &name, embedding, &mut merges).await?;
+            entity_ids.insert(entity_key, id);
+        }
+        Ok(ResolvedBatch { entity_ids, merges })
+    }
 }
 
 /// Runs after `apply_commit`, because only then is each fact's status final. An alias changes

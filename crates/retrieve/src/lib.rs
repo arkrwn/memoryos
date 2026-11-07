@@ -78,8 +78,16 @@ impl Retriever {
             as_of: req.as_of,
             known_at: req.known_at,
         };
+        let embedding = self.embed_query(&req.query).await;
         let facts = self
-            .ranked_facts(ctx, &req.scopes, &req.query, &filter, limit)
+            .ranked_facts(
+                ctx,
+                &req.scopes,
+                &req.query,
+                embedding.as_deref(),
+                &filter,
+                limit,
+            )
             .await?;
         Ok(RecallResponse { facts })
     }
@@ -93,8 +101,38 @@ impl Retriever {
         limit: i64,
     ) -> Result<Vec<ScoredFact>> {
         let limit = validate(scopes, statement, limit)?;
-        self.ranked_facts(ctx, scopes, statement, &FactFilter::default(), limit)
-            .await
+        let embedding = self.embed_query(statement).await;
+        self.ranked_facts(
+            ctx,
+            scopes,
+            statement,
+            embedding.as_deref(),
+            &FactFilter::default(),
+            limit,
+        )
+        .await
+    }
+
+    /// `candidates` for a statement the caller has already embedded, so a commit that embeds its
+    /// statements anyway does not pay for a second provider call.
+    pub async fn candidates_with_embedding(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        statement: &str,
+        embedding: &[f32],
+        limit: i64,
+    ) -> Result<Vec<ScoredFact>> {
+        let limit = validate(scopes, statement, limit)?;
+        self.ranked_facts(
+            ctx,
+            scopes,
+            statement,
+            Some(embedding),
+            &FactFilter::default(),
+            limit,
+        )
+        .await
     }
 
     async fn ranked_facts(
@@ -102,12 +140,12 @@ impl Retriever {
         ctx: &RequestContext,
         scopes: &[Scope],
         query: &str,
+        embedding: Option<&[f32]>,
         filter: &FactFilter,
         limit: usize,
     ) -> Result<Vec<ScoredFact>> {
-        let embedding = self.embed_query(query).await;
         let (vector, text) = tokio::join!(
-            self.vector_list(ctx, scopes, embedding.as_deref(), filter),
+            self.vector_list(ctx, scopes, embedding, filter),
             self.store
                 .search_facts_text(ctx, scopes, query, filter, CANDIDATES_PER_LIST),
         );

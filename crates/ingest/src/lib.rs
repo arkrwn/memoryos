@@ -7,5 +7,5 @@ mod host;
 mod validate;
 
 pub use host::{
-    CommitFact, CommitRequest, CommitResponse, CommittedFact, EntityRef, HostCommitter,
+    CommitFact, CommitRequest, CommitResponse, CommittedFact, EntityRef, HostCommitter, RelatedFact,
 };

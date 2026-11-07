@@ -1935,8 +1935,10 @@ name = "memoryos-ingest"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "futures",
  "memoryos-core",
  "memoryos-embed",
+ "memoryos-retrieve",
  "memoryos-store",
  "serde",
  "serde_json",
