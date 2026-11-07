@@ -3549,3 +3549,63 @@ async fn supersede_with_existing_keeps_the_trust_rules_and_the_tenant() -> TestR
     unchanged(&db, &c, old, existing).await?;
     Ok(())
 }
+
+/// The state a commit finds when another commit moved the old fact's chain head after the host
+/// checked it: the walk reaches the new head and applies the trust rules to it.
+#[tokio::test]
+async fn supersede_with_existing_follows_a_moved_head() -> TestResult {
+    let db = db().await;
+    let c = ctx("t1");
+    let scope = agent_scope();
+    let subject = entity(&db, &c, &scope, "ada").await?;
+
+    // A head of higher trust is left alone, and the existing fact only gains the source.
+    let (old, existing) = old_and_existing(&db, &c, &scope, Trust::Agent, Trust::Agent).await?;
+    let mut high = new_fact(&scope, subject, "system value", date(2021, 1));
+    high.trust = Trust::System;
+    let head = supersede(&db, &c, old, high).await?;
+    let source = new_episode(&db, &c, &scope, Trust::Agent).await?;
+    let op = FactOp::SupersedeWithExisting {
+        old_fact_id: old,
+        fact_id: existing,
+    };
+    db.store.apply_commit(&c, source, vec![op]).await?;
+    let head_fact = db.store.get_fact(&c, head).await?;
+    assert_eq!((head_fact.superseded_by, head_fact.valid_to), (None, None));
+    assert_eq!(db.store.get_fact(&c, old).await?.superseded_by, Some(head));
+    let existing_fact = db.store.get_fact(&c, existing).await?;
+    assert_eq!(existing_fact.superseded_by, None);
+    assert!(existing_fact.source_episode_ids.contains(&source));
+
+    // A head of equal trust is closed into the existing fact, and a purge reopens it.
+    let scope = Scope::agent("a2");
+    let subject = entity(&db, &c, &scope, "ada").await?;
+    let (old, existing) = old_and_existing(&db, &c, &scope, Trust::Agent, Trust::Agent).await?;
+    let mut same = new_fact(&scope, subject, "agent value", date(2021, 1));
+    same.trust = Trust::Agent;
+    let head = supersede(&db, &c, old, same).await?;
+    let source = new_episode(&db, &c, &scope, Trust::Agent).await?;
+    let op = FactOp::SupersedeWithExisting {
+        old_fact_id: old,
+        fact_id: existing,
+    };
+    db.store.apply_commit(&c, source, vec![op]).await?;
+    let head_fact = db.store.get_fact(&c, head).await?;
+    assert_eq!(head_fact.superseded_by, Some(existing));
+    assert_eq!(head_fact.valid_to, Some(date(2022, 1)));
+    assert_eq!(db.store.get_fact(&c, old).await?.superseded_by, Some(head));
+
+    db.store.purge_episode(&c, source).await?;
+    let head_fact = db.store.get_fact(&c, head).await?;
+    assert_eq!((head_fact.superseded_by, head_fact.valid_to), (None, None));
+    assert_eq!(db.store.get_fact(&c, old).await?.superseded_by, Some(head));
+    assert_eq!(
+        db.store
+            .get_fact(&c, existing)
+            .await?
+            .source_episode_ids
+            .len(),
+        1
+    );
+    Ok(())
+}

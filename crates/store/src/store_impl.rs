@@ -691,6 +691,7 @@ impl MemoryStore for PgStore {
                 state.valid_from,
                 old_id,
                 Some(old_id),
+                None,
             )
             .await?;
             // The review covered `old_id`, not this head, so it does not authorize closing it.

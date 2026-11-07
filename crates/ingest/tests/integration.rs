@@ -1762,3 +1762,85 @@ async fn a_supersede_never_reuses_a_fact_of_another_scope_or_tenant() {
         assert_eq!(fact.superseded_by, None);
     }
 }
+
+/// The two-call flow, returning the old fact, the reused fact, its original episode and call 2's.
+async fn two_calls(w: &World) -> (Uuid, Uuid, Uuid, Uuid) {
+    let scope = Scope::agent("a1");
+    let old = commit_one(w, &scope, "Ada lives in Jakarta", "Ada").await;
+    let kept = commit_one(w, &scope, "Ada lives in Bandung", "Ada").await;
+    let original = w
+        .store
+        .get_fact(&ctx(), kept)
+        .await
+        .expect("kept")
+        .source_episode_ids[0];
+    let second = w
+        .host
+        .commit(
+            &ctx(),
+            supersede_request(&scope, "moved", "Ada lives in Bandung", old),
+            Trust::Agent,
+        )
+        .await
+        .expect("second call");
+    assert_eq!(second.facts[0].id, kept);
+    assert_closed_into(w, old, kept).await;
+    (old, kept, original, second.episode_id)
+}
+
+/// The fact is current and alone in its history.
+async fn assert_current_alone(w: &World, id: Uuid) -> Fact {
+    let fact = w.store.get_fact(&ctx(), id).await.expect("fact");
+    assert_eq!((fact.superseded_by, fact.valid_to), (None, None));
+    assert_eq!(fact.status, FactStatus::Active);
+    let history: Vec<Uuid> = w
+        .store
+        .fact_history(&ctx(), id)
+        .await
+        .expect("history")
+        .into_iter()
+        .map(|fact| fact.id)
+        .collect();
+    assert_eq!(history, [id]);
+    fact
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn purging_the_second_call_reopens_the_old_fact() {
+    let w = world().await;
+    let (old, kept, original, second) = two_calls(&w).await;
+
+    w.store.purge_episode(&ctx(), second).await.expect("purge");
+    assert_current_alone(&w, old).await;
+    let kept_fact = assert_current_alone(&w, kept).await;
+    assert_eq!(kept_fact.source_episode_ids, [original]);
+    assert_eq!(w.count("facts").await, 2);
+
+    // Purging the reused fact's original source afterwards removes it and leaves the old one.
+    w.store
+        .purge_episode(&ctx(), original)
+        .await
+        .expect("purge");
+    assert_current_alone(&w, old).await;
+    assert_eq!(w.count("facts").await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn purging_the_reused_facts_source_first_keeps_the_close_until_call_two_goes() {
+    let w = world().await;
+    let (old, kept, original, second) = two_calls(&w).await;
+
+    // Call 2 still supports the reused fact, so it and the close stay.
+    w.store
+        .purge_episode(&ctx(), original)
+        .await
+        .expect("purge");
+    let kept_fact = w.store.get_fact(&ctx(), kept).await.expect("kept");
+    assert_eq!(kept_fact.source_episode_ids, [second]);
+    let old_fact = w.store.get_fact(&ctx(), old).await.expect("old");
+    assert_eq!(old_fact.superseded_by, Some(kept));
+
+    w.store.purge_episode(&ctx(), second).await.expect("purge");
+    assert_current_alone(&w, old).await;
+    assert_eq!(w.count("facts").await, 1);
+}

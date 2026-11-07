@@ -177,6 +177,9 @@ AND (invalidated_at IS NULL OR invalidated_at > K)
 - `reject_fact` sets `rejected`. Rejected and quarantined facts never appear in recall or graph.
 - `POST /v1/episodes/{id}/purge` removes one bad source and everything derived only from it. A
   fact closed by a purged fact is reopened or relinked, so purging a poison restores the truth.
+  A fact closed through an existing fact (section 3, step 5) records the closing episode in
+  `closed_by_episode`, and purging that episode reopens it the same way, though the existing fact
+  stays while another source supports it.
 - Approve, reject, invalidate and purge each write an `audit_events` row.
 
 ## 6. Tenancy and authorization
