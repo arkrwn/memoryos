@@ -121,6 +121,28 @@ paths:
                       properties:
                         id: { type: string, format: uuid }
                         status: { type: string, enum: [active, quarantined, rejected] }
+                        corroborated:
+                          type: boolean
+                          default: false
+                          description: >-
+                            No fact was created. id is an existing current fact that gained this
+                            source, named by corroborates or matched because a fact that sets
+                            neither supersedes nor corroborates has the same statement, ignoring
+                            case, whitespace runs and a final period. Omitted when false
+                        related:
+                          type: array
+                          maxItems: 3
+                          description: >-
+                            For a created fact, up to three current facts of the same scope that
+                            were candidates but not repeats, best first. Omitted when empty, and
+                            always empty on an idempotency replay
+                          items:
+                            type: object
+                            required: [id, statement, score]
+                            properties:
+                              id: { type: string, format: uuid }
+                              statement: { type: string }
+                              score: { type: number }
         default: { $ref: "#/components/responses/Error" }
   /v1/scopes:
     get:

@@ -14,7 +14,9 @@ use memoryos_core::{
     RequestContext, Scope, Trust, EMBEDDING_DIMS,
 };
 use memoryos_embed::{vector_for, TestEmbedder};
-use memoryos_ingest::{CommitFact, CommitRequest, EntityRef, HostCommitter};
+use memoryos_ingest::{
+    CommitFact, CommitRequest, CommitResponse, CommittedFact, EntityRef, HostCommitter,
+};
 use memoryos_store::PgStore;
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
@@ -435,7 +437,9 @@ async fn host_trust_is_clamped_and_gated() {
             FactStatus::Quarantined,
         ),
     ] {
-        let request = commit_request(scope, content, vec![add_fact("fact", "Ada")]);
+        // A distinct statement each time, since a repeat would corroborate the earlier fact.
+        let statement = format!("fact {content}");
+        let request = commit_request(scope, content, vec![add_fact(&statement, "Ada")]);
         let response = w
             .host
             .commit(&ctx(), request, max_trust)
@@ -1366,4 +1370,156 @@ async fn low_trust_new_entity_is_created_and_purged_with_its_fact() {
         .expect("purge");
     assert_eq!(report.entities_deleted, 1);
     assert_eq!(w.count("entities").await, 0);
+}
+
+// ---- Matching on commit ----------------------------------------------------------------------
+
+/// Commits one fact under `ctx` and returns its response entry.
+async fn commit_as(
+    w: &World,
+    ctx: &RequestContext,
+    scope: &Scope,
+    text: &str,
+    subject: &str,
+) -> CommittedFact {
+    let request = commit_request(
+        scope,
+        &format!("source of {text}"),
+        vec![add_fact(text, subject)],
+    );
+    let mut response = w
+        .host
+        .commit(ctx, request, Trust::Agent)
+        .await
+        .expect("commit");
+    assert_eq!(response.facts.len(), 1);
+    response.facts.remove(0)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_exact_repeat_corroborates_the_existing_fact() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let first = commit_as(&w, &ctx(), &scope, "Ada plays go", "Ada").await;
+    assert!(!first.corroborated);
+    let entities = w.count("entities").await;
+
+    // A new subject name would create an entity if the repeat were treated as a new fact.
+    let repeat = commit_as(&w, &ctx(), &scope, "Ada plays go", "Someone New").await;
+    assert_eq!(repeat.id, first.id);
+    assert!(repeat.corroborated);
+    assert_eq!(repeat.status, FactStatus::Active);
+    assert!(repeat.related.is_empty());
+    assert_eq!(w.count("facts").await, 1);
+    assert_eq!(w.count("entities").await, entities);
+    let fact = w.store.get_fact(&ctx(), first.id).await.expect("fact");
+    assert_eq!(fact.source_episode_ids.len(), 2);
+    assert_eq!(fact.trust, Trust::Agent);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_case_and_spacing_variant_also_corroborates() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let first = commit_as(&w, &ctx(), &scope, "Ada plays go", "Ada").await;
+    let variant = commit_as(&w, &ctx(), &scope, "  ada PLAYS \t go. ", "Ada").await;
+    assert_eq!(variant.id, first.id);
+    assert!(variant.corroborated);
+    assert_eq!(w.count("facts").await, 1);
+    let fact = w.store.get_fact(&ctx(), first.id).await.expect("fact");
+    assert_eq!(fact.statement, "Ada plays go");
+    assert_eq!(fact.source_episode_ids.len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_different_statement_is_created_and_lists_the_similar_fact() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let old = commit_as(&w, &ctx(), &scope, "Ada lives in Paris", "Ada").await;
+    let new = commit_as(&w, &ctx(), &scope, "Ada lives in Berlin", "Ada").await;
+    assert_ne!(new.id, old.id);
+    assert!(!new.corroborated);
+    assert_eq!(w.count("facts").await, 2);
+    let related: Vec<Uuid> = new.related.iter().map(|r| r.id).collect();
+    assert_eq!(related, [old.id]);
+    assert_eq!(new.related[0].statement, "Ada lives in Paris");
+    assert!(new.related[0].score > 0.0);
+    // Listed, not acted on: the old fact stays current.
+    let old = w.store.get_fact(&ctx(), old.id).await.expect("old");
+    assert_eq!((old.valid_to, old.superseded_by), (None, None));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn matching_never_crosses_scopes_or_tenants() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let globex = tenant_ctx("globex");
+    let other_scope = commit_as(&w, &ctx(), &Scope::agent("a2"), "Ada plays go", "Ada").await;
+    let other_tenant = commit_as(&w, &globex, &scope, "Ada plays go", "Ada").await;
+
+    let mine = commit_as(&w, &ctx(), &scope, "Ada plays go", "Ada").await;
+    assert!(!mine.corroborated);
+    assert_ne!(mine.id, other_scope.id);
+    assert_ne!(mine.id, other_tenant.id);
+    assert!(mine.related.is_empty(), "{:?}", mine.related);
+    assert_eq!(w.count("facts").await, 3);
+    for (ctx, foreign) in [(ctx(), other_scope.id), (globex, other_tenant.id)] {
+        let fact = w.store.get_fact(&ctx, foreign).await.expect("fact");
+        assert_eq!(fact.source_episode_ids.len(), 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quarantined_fact_is_never_matched_or_listed() {
+    let w = world().await;
+    // Agent trust in a user scope is held for review.
+    let scope = Scope::user("u1");
+    let held = commit_as(&w, &ctx(), &scope, "Ada plays go", "Ada").await;
+    assert_eq!(held.status, FactStatus::Quarantined);
+
+    let again = commit_as(&w, &ctx(), &scope, "Ada plays go", "Ada").await;
+    assert_ne!(again.id, held.id);
+    assert!(!again.corroborated);
+    assert!(again.related.is_empty(), "{:?}", again.related);
+    assert_eq!(w.count("facts").await, 2);
+    let held = w.store.get_fact(&ctx(), held.id).await.expect("held");
+    assert_eq!(held.source_episode_ids.len(), 1);
+}
+
+/// A replay has no matching results to go by, so this checks the real recorded times.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replay_reports_a_matched_repeat_in_request_order() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let existing = commit_as(&w, &ctx(), &scope, "Ada plays go", "Ada").await;
+
+    let mut request = commit_request(
+        &scope,
+        "keyed",
+        vec![
+            add_fact("Ada reads novels", "Ada"),
+            add_fact("ada plays go.", "Ada"),
+            add_fact("Ada swims", "Ada"),
+        ],
+    );
+    request.idempotency_key = Some("key-matched".into());
+    let first = w
+        .host
+        .commit(&ctx(), request.clone(), Trust::Agent)
+        .await
+        .expect("first");
+    let replay = w
+        .host
+        .commit(&ctx(), request, Trust::Agent)
+        .await
+        .expect("replay");
+
+    let shape = |r: &CommitResponse| -> Vec<(Uuid, bool)> {
+        r.facts.iter().map(|f| (f.id, f.corroborated)).collect()
+    };
+    let flags: Vec<bool> = shape(&first).into_iter().map(|(_, c)| c).collect();
+    assert_eq!(flags, [false, true, false]);
+    assert_eq!(first.facts[1].id, existing.id);
+    assert_eq!(shape(&replay), shape(&first));
+    assert_eq!(w.count("facts").await, 3);
 }

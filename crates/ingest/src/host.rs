@@ -4,14 +4,16 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
+use futures::future::try_join_all;
 use memoryos_core::{
-    Embedder, Episode, Error, Fact, FactOp, FactStatus, MemoryStore, NewEpisode, RequestContext,
-    Result, Scope, Trust,
+    normalize_name, Embedder, Episode, Error, Fact, FactOp, FactStatus, MemoryStore, NewEpisode,
+    RequestContext, Result, Scope, ScoredFact, Trust,
 };
+use memoryos_retrieve::Retriever;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::entities::{add_earned_aliases, embed_and_resolve, Merge};
+use crate::entities::{add_earned_aliases, embed_batch, Merge};
 use crate::gate::{build_op, FactDraft, Resolution, Source};
 use crate::validate::{is_blank_or_unstorable, MAX_CONTENT_CHARS};
 
@@ -21,6 +23,10 @@ const MAX_FACTS: usize = 50;
 const MAX_INDEXED_CHARS: usize = 512;
 const MAX_KIND_CHARS: usize = 64;
 const MAX_FUTURE_VALID_FROM_DAYS: i64 = 1;
+/// Current facts compared with each statement that names neither `supersedes` nor `corroborates`.
+const MATCH_CANDIDATES: i64 = 10;
+/// At most this many `related` facts per created fact: enough to spot an older value, little to read.
+const MAX_RELATED: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,10 +63,26 @@ pub struct CommitRequest {
     pub facts: Vec<CommitFact>,
 }
 
+/// A current fact in the commit's scope that resembles a created fact without repeating it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RelatedFact {
+    pub id: Uuid,
+    pub statement: String,
+    pub score: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommittedFact {
     pub id: Uuid,
     pub status: FactStatus,
+    /// No fact was created: `id` is an existing fact that gained this source, because the request
+    /// named it in `corroborates` or because it holds the same statement after normalization.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub corroborated: bool,
+    /// For a created fact, up to three current facts of the scope that were candidates but not
+    /// repeats, best first. Empty on a replay.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<RelatedFact>,
 }
 
 /// `facts` has one entry per request fact, in order, read back from the store. Each status is the
@@ -75,11 +97,35 @@ pub struct CommitResponse {
 pub struct HostCommitter {
     store: Arc<dyn MemoryStore>,
     embedder: Arc<dyn Embedder>,
+    /// The search behind `recall_candidates`, used to match statements before they are saved.
+    retriever: Retriever,
+}
+
+/// What `build_ops` decided for one request.
+struct Built {
+    ops: Vec<FactOp>,
+    merges: Vec<Merge>,
+    /// One list per request fact, in request order.
+    related: Vec<Vec<RelatedFact>>,
+}
+
+/// The result of comparing one statement with the current facts of its scope.
+#[derive(Debug, Default, PartialEq)]
+struct Matched {
+    /// A current fact with the same normalized statement, which the statement then corroborates.
+    existing: Option<Uuid>,
+    /// Empty when `existing` is set, since nothing is created.
+    related: Vec<RelatedFact>,
 }
 
 impl HostCommitter {
     pub fn new(store: Arc<dyn MemoryStore>, embedder: Arc<dyn Embedder>) -> Self {
-        Self { store, embedder }
+        let retriever = Retriever::new(store.clone(), embedder.clone());
+        Self {
+            store,
+            embedder,
+            retriever,
+        }
     }
 
     /// `max_trust` is the calling key's limit. Commit trust is `external` for an `external` key
@@ -112,10 +158,10 @@ impl HostCommitter {
             .await?;
         require_same_request(&episode, &req, trust)?;
         if episode.processed_at.is_some() {
-            return self.response(ctx, &episode, &req).await;
+            return self.response(ctx, &episode, &req, Vec::new()).await;
         }
 
-        let (ops, merges) = match self.build_ops(ctx, &req, &episode).await {
+        let built = match self.build_ops(ctx, &req, &episode).await {
             Ok(built) => built,
             Err(err) => {
                 // A replay does not own the episode: the request that created it may still be
@@ -128,9 +174,9 @@ impl HostCommitter {
         };
         // A no-op if a concurrent request with the same key won the episode lock. The response
         // below then reports that request's facts, the same as any other replay.
-        let inserted = self.store.apply_commit(ctx, episode.id, ops).await?;
-        add_earned_aliases(self.store.as_ref(), ctx, &episode, merges, &inserted).await;
-        self.response(ctx, &episode, &req).await
+        let inserted = self.store.apply_commit(ctx, episode.id, built.ops).await?;
+        add_earned_aliases(self.store.as_ref(), ctx, &episode, built.merges, &inserted).await;
+        self.response(ctx, &episode, &req, built.related).await
     }
 
     async fn response(
@@ -138,11 +184,17 @@ impl HostCommitter {
         ctx: &RequestContext,
         episode: &Episode,
         req: &CommitRequest,
+        related: Vec<Vec<RelatedFact>>,
     ) -> Result<CommitResponse> {
+        // The episode was claimed before it was processed, so a fresh commit reads the time again.
+        let processed_at = match episode.processed_at {
+            Some(at) => Some(at),
+            None => self.store.get_episode(ctx, episode.id).await?.processed_at,
+        };
         let facts = self.store.facts_for_episode(ctx, episode.id).await?;
         Ok(CommitResponse {
             episode_id: episode.id,
-            facts: in_request_order(req, facts),
+            facts: in_request_order(req, facts, processed_at, related),
         })
     }
 
@@ -151,7 +203,7 @@ impl HostCommitter {
         ctx: &RequestContext,
         req: &CommitRequest,
         episode: &Episode,
-    ) -> Result<(Vec<FactOp>, Vec<Merge>)> {
+    ) -> Result<Built> {
         // Checked before any provider call or entity write, so a rejected commit costs neither.
         let mut targets = Vec::with_capacity(req.facts.len());
         for fact in &req.facts {
@@ -162,42 +214,76 @@ impl HostCommitter {
             targets.push(target);
         }
 
-        // A corroboration only links a source, so it needs no embedding and no entities.
-        let new_facts = || req.facts.iter().filter(|fact| fact.corroborates.is_none());
-        let entities: Vec<&EntityRef> = new_facts()
-            .flat_map(|fact| std::iter::once(&fact.subject).chain(&fact.object))
+        // A named corroboration only links a source, so it needs no embedding. The others are
+        // embedded with every entity they mention in one provider call, before matching decides
+        // which of them are repeats.
+        let embedded: Vec<&CommitFact> = req
+            .facts
+            .iter()
+            .filter(|fact| fact.corroborates.is_none())
             .collect();
-        let mut batch = embed_and_resolve(
-            self.store.as_ref(),
+        let entities: Vec<&EntityRef> = embedded.iter().flat_map(|fact| mentions(fact)).collect();
+        let mut batch = embed_batch(
             self.embedder.as_ref(),
-            ctx,
-            &req.scope,
-            new_facts().map(|fact| fact.statement.clone()).collect(),
+            embedded.iter().map(|fact| fact.statement.clone()).collect(),
             &entities,
         )
         .await?;
-        let mut embeddings = std::mem::take(&mut batch.statement_embeddings).into_iter();
-        let merges = std::mem::take(&mut batch.merges);
+        let mut vectors = std::mem::take(&mut batch.statement_embeddings).into_iter();
+        let embeddings: Vec<Option<Vec<f32>>> = req
+            .facts
+            .iter()
+            .map(|fact| match fact.corroborates {
+                Some(_) => None,
+                None => vectors.next(),
+            })
+            .collect();
+
+        // A fact this request supersedes is closing, so a repeat of it must not be linked to it.
+        let superseded: HashSet<Uuid> = req.facts.iter().filter_map(|f| f.supersedes).collect();
+        // Concurrent, and bounded by the store's connection pool.
+        let searches: Vec<_> = req
+            .facts
+            .iter()
+            .zip(&embeddings)
+            .map(|(fact, embedding)| {
+                self.match_existing(ctx, &req.scope, fact, embedding.as_deref(), &superseded)
+            })
+            .collect();
+        let matches: Vec<Matched> = try_join_all(searches).await?;
+
+        // Only a fact that is created needs its entities resolved, which may create them.
+        let used: Vec<&EntityRef> = req
+            .facts
+            .iter()
+            .zip(&matches)
+            .filter(|(fact, matched)| fact.corroborates.is_none() && matched.existing.is_none())
+            .flat_map(|(fact, _)| mentions(fact))
+            .collect();
+        let resolved = batch
+            .resolve(self.store.as_ref(), ctx, &req.scope, &used)
+            .await?;
 
         let source = Source {
             scope: &episode.scope,
             trust: episode.trust,
         };
         let mut ops = Vec::with_capacity(req.facts.len());
-        for (fact, target) in req.facts.iter().zip(targets) {
-            let resolution = if let Some(fact_id) = fact.corroborates {
+        let mut related = Vec::with_capacity(req.facts.len());
+        let decided = req.facts.iter().zip(targets).zip(embeddings).zip(matches);
+        for (((fact, target), embedding), matched) in decided {
+            let resolution = if let Some(fact_id) = fact.corroborates.or(matched.existing) {
                 Resolution::Corroborate { fact_id }
             } else {
-                let embedding = embeddings
-                    .next()
+                let embedding = embedding
                     .ok_or_else(|| Error::Internal("statement embedding is missing".into()))?;
                 let draft = FactDraft {
-                    subject_id: batch.entity_id(&fact.subject)?,
+                    subject_id: resolved.entity_id(&fact.subject)?,
                     predicate: fact.predicate.clone(),
                     object_id: fact
                         .object
                         .as_ref()
-                        .map(|object| batch.entity_id(object))
+                        .map(|object| resolved.entity_id(object))
                         .transpose()?,
                     statement: fact.statement.clone(),
                     embedding,
@@ -213,8 +299,40 @@ impl HostCommitter {
                 }
             };
             ops.push(build_op(&source, resolution));
+            related.push(matched.related);
         }
-        Ok((ops, merges))
+        Ok(Built {
+            ops,
+            merges: resolved.merges,
+            related,
+        })
+    }
+
+    /// Compares a statement that names neither `supersedes` nor `corroborates` with the current
+    /// facts of the commit's scope, through the same search as `recall_candidates`. The caller is
+    /// already allowed that scope, and the search reads no other scope and no other tenant.
+    async fn match_existing(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        fact: &CommitFact,
+        embedding: Option<&[f32]>,
+        superseded: &HashSet<Uuid>,
+    ) -> Result<Matched> {
+        let (None, None, Some(embedding)) = (fact.supersedes, fact.corroborates, embedding) else {
+            return Ok(Matched::default());
+        };
+        let found = self
+            .retriever
+            .candidates_with_embedding(
+                ctx,
+                std::slice::from_ref(scope),
+                &fact.statement,
+                embedding,
+                MATCH_CANDIDATES,
+            )
+            .await?;
+        Ok(pick(scope, &fact.statement, found, superseded))
     }
 
     /// One message for every failure, so a caller cannot probe which ids exist elsewhere. Row-level
@@ -240,6 +358,52 @@ impl HostCommitter {
             tracing::warn!(%episode_id, error = %err, "could not discard a refused commit");
         }
     }
+}
+
+fn mentions(fact: &CommitFact) -> impl Iterator<Item = &EntityRef> {
+    std::iter::once(&fact.subject).chain(&fact.object)
+}
+
+/// Statement identity for automatic corroboration: case-insensitive, whitespace runs collapsed,
+/// trailing periods ignored.
+fn normalize_statement(statement: &str) -> String {
+    normalize_name(statement.trim_end().trim_end_matches('.'))
+}
+
+/// Splits ranked candidates into the first repeat of `statement` and up to `MAX_RELATED` others.
+fn pick(
+    scope: &Scope,
+    statement: &str,
+    found: Vec<ScoredFact>,
+    superseded: &HashSet<Uuid>,
+) -> Matched {
+    let wanted = normalize_statement(statement);
+    let mut matched = Matched::default();
+    for ScoredFact { fact, score } in found {
+        // The search reads only current, active facts of `scope`. Checked again because a wrong
+        // match would link this source to a fact the caller must not reach.
+        let eligible = fact.scope == *scope
+            && fact.status == FactStatus::Active
+            && fact.superseded_by.is_none()
+            && fact.invalidated_at.is_none()
+            && !superseded.contains(&fact.id);
+        if !eligible {
+            continue;
+        }
+        if normalize_statement(&fact.statement) == wanted {
+            matched.existing.get_or_insert(fact.id);
+        } else if matched.related.len() < MAX_RELATED {
+            matched.related.push(RelatedFact {
+                id: fact.id,
+                statement: fact.statement,
+                score,
+            });
+        }
+    }
+    if matched.existing.is_some() {
+        matched.related.clear();
+    }
+    matched
 }
 
 fn validate_request(req: &CommitRequest) -> Result<()> {
@@ -318,25 +482,62 @@ fn require_same_request(episode: &Episode, req: &CommitRequest, trust: Trust) ->
 }
 
 /// Lines the episode's facts up with the request. A request fact that corroborates names its fact.
-/// The others were created in request order, and `facts` lists those in creation order. The key
-/// check does not compare the fact lists, so a replay may not match: whatever is left over is
-/// appended rather than hidden, and a request fact with no match is skipped.
-fn in_request_order(req: &CommitRequest, facts: Vec<Fact>) -> Vec<CommittedFact> {
+/// A fact the episode created was recorded in the transaction that processed it, at
+/// `processed_at`, and one it only linked was recorded earlier. A request fact that names nothing
+/// takes a linked fact with the same normalized statement if there is one, since that is what it
+/// was matched to, and otherwise the next created fact in creation order. With no `processed_at`
+/// every unnamed fact counts as created. The key check does not compare the fact lists, so a
+/// replay may not match: whatever is left over is appended rather than hidden, and a request fact
+/// with no match is skipped. `related` goes onto created facts by request position.
+fn in_request_order(
+    req: &CommitRequest,
+    facts: Vec<Fact>,
+    processed_at: Option<DateTime<Utc>>,
+    related: Vec<Vec<RelatedFact>>,
+) -> Vec<CommittedFact> {
     let named: HashSet<Uuid> = req.facts.iter().filter_map(|f| f.corroborates).collect();
-    let as_committed = |fact: &Fact| CommittedFact {
+    let as_committed = |fact: &Fact, corroborated: bool, related: Vec<RelatedFact>| CommittedFact {
         id: fact.id,
         status: fact.status,
+        corroborated,
+        related,
     };
-    let mut created = facts.iter().filter(|fact| !named.contains(&fact.id));
+    let (created, linked): (Vec<&Fact>, Vec<&Fact>) = facts
+        .iter()
+        .filter(|fact| !named.contains(&fact.id))
+        .partition(|fact| processed_at.is_none_or(|at| fact.recorded_at >= at));
+    let mut created = created.into_iter();
+    let mut related = related.into_iter();
+    let mut linked_reported = HashSet::new();
     let mut ordered = Vec::with_capacity(facts.len());
     for request_fact in &req.facts {
-        let found = match request_fact.corroborates {
-            Some(id) => facts.iter().find(|fact| fact.id == id),
-            None => created.next(),
+        let fact_related = related.next().unwrap_or_default();
+        let wanted = normalize_statement(&request_fact.statement);
+        let repeated = linked
+            .iter()
+            .find(|fact| normalize_statement(&fact.statement) == wanted);
+        let found = match (request_fact.corroborates, request_fact.supersedes, repeated) {
+            (Some(id), _, _) => facts
+                .iter()
+                .find(|fact| fact.id == id)
+                .map(|fact| as_committed(fact, true, Vec::new())),
+            (None, None, Some(fact)) => {
+                linked_reported.insert(fact.id);
+                Some(as_committed(fact, true, Vec::new()))
+            }
+            (None, _, _) => created
+                .next()
+                .map(|fact| as_committed(fact, false, fact_related)),
         };
-        ordered.extend(found.map(as_committed));
+        ordered.extend(found);
     }
-    ordered.extend(created.map(as_committed));
+    ordered.extend(created.map(|fact| as_committed(fact, false, Vec::new())));
+    ordered.extend(
+        linked
+            .iter()
+            .filter(|fact| !linked_reported.contains(&fact.id))
+            .map(|fact| as_committed(fact, true, Vec::new())),
+    );
     ordered
 }
 
@@ -522,14 +723,39 @@ mod tests {
 
         let response = CommitResponse {
             episode_id: id,
-            facts: vec![CommittedFact {
-                id,
-                status: FactStatus::Quarantined,
-            }],
+            facts: vec![
+                CommittedFact {
+                    id,
+                    status: FactStatus::Quarantined,
+                    corroborated: false,
+                    related: Vec::new(),
+                },
+                CommittedFact {
+                    id,
+                    status: FactStatus::Active,
+                    corroborated: true,
+                    related: Vec::new(),
+                },
+                CommittedFact {
+                    id,
+                    status: FactStatus::Active,
+                    corroborated: false,
+                    related: vec![RelatedFact {
+                        id,
+                        statement: "r".into(),
+                        score: 0.5,
+                    }],
+                },
+            ],
         };
+        // The two optional fields are left out when they say nothing.
         assert_eq!(
             serde_json::to_value(response).expect("serialize"),
-            json!({"episode_id": id, "facts": [{"id": id, "status": "quarantined"}]})
+            json!({"episode_id": id, "facts": [
+                {"id": id, "status": "quarantined"},
+                {"id": id, "status": "active", "corroborated": true},
+                {"id": id, "status": "active", "related": [{"id": id, "statement": "r", "score": 0.5}]},
+            ]})
         );
     }
 
@@ -609,7 +835,7 @@ mod tests {
             stored(second, FactStatus::Quarantined),
         ];
         assert_eq!(
-            got(&in_request_order(&req, facts)),
+            got(&in_request_order(&req, facts, None, Vec::new())),
             [
                 (first, FactStatus::Active),
                 (linked, FactStatus::Active),
@@ -629,8 +855,120 @@ mod tests {
             stored(second, FactStatus::Active),
         ];
         assert_eq!(
-            got(&in_request_order(&req, facts)),
+            got(&in_request_order(&req, facts, None, Vec::new())),
             [(first, FactStatus::Active), (second, FactStatus::Active)]
         );
+    }
+
+    fn said(statement: &str) -> CommitFact {
+        let mut one = fact();
+        one.statement = statement.into();
+        one
+    }
+
+    fn scored(scope: &Scope, statement: &str, score: f64) -> ScoredFact {
+        let mut found = stored(Uuid::now_v7(), FactStatus::Active);
+        found.scope = scope.clone();
+        found.statement = statement.into();
+        ScoredFact { fact: found, score }
+    }
+
+    #[test]
+    fn statements_match_ignoring_case_spacing_and_a_final_period() {
+        let base = normalize_statement("Ada likes tea");
+        for variant in ["ada LIKES tea", "  Ada \t likes\ntea. ", "Ada likes tea..."] {
+            assert_eq!(normalize_statement(variant), base, "{variant:?}");
+        }
+        for different in ["Ada likes teas", "Ada likes tea, black", "Ada.likes tea"] {
+            assert_ne!(normalize_statement(different), base, "{different:?}");
+        }
+    }
+
+    #[test]
+    fn pick_takes_the_first_repeat_and_reports_no_related_with_it() {
+        let scope = Scope::user("u");
+        let found = vec![
+            scored(&scope, "Ada likes coffee", 0.9),
+            scored(&scope, "ada likes tea.", 0.8),
+        ];
+        let repeat = found[1].fact.id;
+        let matched = pick(&scope, "Ada likes tea", found, &HashSet::new());
+        assert_eq!(matched.existing, Some(repeat));
+        assert!(matched.related.is_empty());
+    }
+
+    #[test]
+    fn pick_lists_at_most_three_related_in_rank_order() {
+        let scope = Scope::user("u");
+        let found: Vec<ScoredFact> = (0..5)
+            .map(|i| {
+                scored(
+                    &scope,
+                    &format!("Ada likes drink {i}"),
+                    1.0 - f64::from(i) / 10.0,
+                )
+            })
+            .collect();
+        let expected: Vec<Uuid> = found.iter().take(3).map(|s| s.fact.id).collect();
+        let matched = pick(&scope, "Ada likes tea", found, &HashSet::new());
+        assert_eq!(matched.existing, None);
+        let ids: Vec<Uuid> = matched.related.iter().map(|r| r.id).collect();
+        assert_eq!(ids, expected);
+        assert_eq!(matched.related[0].statement, "Ada likes drink 0");
+    }
+
+    #[test]
+    fn pick_never_matches_another_scope_a_quarantined_or_a_closing_fact() {
+        let scope = Scope::user("u");
+        let other_scope = scored(&Scope::user("v"), "Ada likes tea", 0.9);
+        let mut quarantined = scored(&scope, "Ada likes tea", 0.8);
+        quarantined.fact.status = FactStatus::Quarantined;
+        let mut superseded = scored(&scope, "Ada likes tea", 0.7);
+        superseded.fact.superseded_by = Some(Uuid::now_v7());
+        let mut invalidated = scored(&scope, "Ada likes tea", 0.65);
+        invalidated.fact.invalidated_at = Some(Utc::now());
+        let closing = scored(&scope, "Ada likes tea", 0.6);
+        let closing_id = closing.fact.id;
+        let found = vec![other_scope, quarantined, superseded, invalidated, closing];
+        let matched = pick(&scope, "Ada likes tea", found, &HashSet::from([closing_id]));
+        assert_eq!(matched, Matched::default());
+    }
+
+    /// A replay has no matching results, so a linked fact is told apart from a created one by
+    /// when it was recorded.
+    #[test]
+    fn a_replay_reports_a_matched_repeat_where_the_request_had_it() {
+        let processed_at = Utc::now();
+        let mut repeat = stored(Uuid::now_v7(), FactStatus::Active);
+        repeat.statement = "Ada likes tea".into();
+        repeat.recorded_at = processed_at - Duration::days(1);
+        let mut created = stored(Uuid::now_v7(), FactStatus::Quarantined);
+        created.statement = "Ada likes chess".into();
+        created.recorded_at = processed_at;
+        let req = request(vec![said("Ada likes chess"), said("ADA likes tea.")]);
+        let related = vec![RelatedFact {
+            id: repeat.id,
+            statement: repeat.statement.clone(),
+            score: 0.4,
+        }];
+        let ordered = in_request_order(
+            &req,
+            vec![repeat.clone(), created.clone()],
+            Some(processed_at),
+            vec![related.clone(), Vec::new()],
+        );
+        assert_eq!(
+            got(&ordered),
+            [
+                (created.id, FactStatus::Quarantined),
+                (repeat.id, FactStatus::Active)
+            ]
+        );
+        assert_eq!(
+            (ordered[0].corroborated, ordered[1].corroborated),
+            (false, true)
+        );
+        assert_eq!(ordered[0].related, related);
+        assert!(ordered[1].related.is_empty());
     }
 }
