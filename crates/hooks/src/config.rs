@@ -10,7 +10,7 @@ use crate::credentials;
 
 pub const DEFAULT_URL: &str = "http://localhost:8080";
 const DEFAULT_HOOK_SCOPES: &str = "agent:coding-agent";
-const DEFAULT_STOP_EVERY: u64 = 10;
+const DEFAULT_STOP_EVERY: u64 = 20;
 
 /// A variable's value. Empty counts as unset.
 pub type Env<'a> = &'a dyn Fn(&str) -> Option<String>;
@@ -230,7 +230,7 @@ mod tests {
 
     #[test]
     fn stop_every_must_be_positive() {
-        assert_eq!(stop_every(&with(&[])).expect("default"), 10);
+        assert_eq!(stop_every(&with(&[])).expect("default"), 20);
         assert_eq!(
             stop_every(&with(&[("MEMORYOS_HOOK_STOP_EVERY", "3")])).expect("set"),
             3

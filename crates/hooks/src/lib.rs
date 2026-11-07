@@ -139,6 +139,9 @@ pub enum QuarantineCommand {
 pub enum HookCommand {
     /// Print recalled memories for the host's context. Never fails the host.
     SessionStart,
+    /// Print memories related to the user's prompt that this session has not shown yet, and a
+    /// reminder to save when the prompt seems to state a fact. Never fails the host.
+    Prompt,
     /// Periodically ask the host to save durable facts. Never fails the host.
     Stop,
     /// Add the hooks and the MCP server to an agent's configuration.
@@ -174,6 +177,10 @@ pub fn run(command: Command) -> Result<(), String> {
     match command {
         Command::Hook(HookCommand::SessionStart) => {
             hook::run_session_start();
+            Ok(())
+        }
+        Command::Hook(HookCommand::Prompt) => {
+            hook::run_prompt();
             Ok(())
         }
         Command::Hook(HookCommand::Stop) => {

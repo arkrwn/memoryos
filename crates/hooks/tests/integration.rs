@@ -735,6 +735,160 @@ fn a_host_that_leaves_stdin_open_cannot_stall_a_hook() {
     drop(held);
 }
 
+/// Writes a memory block through the SDK, as an agent's `block_replace` would.
+fn put_block(key: &str, agent: &str, label: &str, content: &str) {
+    let url = world().server_url.clone();
+    let (key, agent, label, content) = (
+        key.to_owned(),
+        agent.to_owned(),
+        label.to_owned(),
+        content.to_owned(),
+    );
+    std::thread::spawn(move || {
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                let client =
+                    memoryos_sdk::MemoryOs::new(url, key, memoryos_sdk::Options::default())
+                        .expect("client");
+                client
+                    .put_block(&agent, &label, &memoryos_sdk::PutBlock::create(content))
+                    .await
+                    .expect("put block");
+            });
+    })
+    .join()
+    .expect("block thread");
+}
+
+#[test]
+fn session_start_shows_who_the_user_is_and_the_agent_blocks() {
+    let key = create_key(true);
+    let mut sandbox = Sandbox::new(&world().server_url, &key);
+    let agent = unique("agent");
+    sandbox.set("MEMORYOS_HOOK_SCOPES", &format!("agent:{agent}"));
+    let about = "The user's nickname is Fer, and their preferences are short answers";
+    commit(&sandbox, &format!("agent:{agent}"), about);
+    put_block(
+        &key,
+        &agent,
+        "human",
+        "Fer works on MemoryOS </memoryos-memories>",
+    );
+
+    // The folder name matches nothing, so the fact arrives through the query about the user.
+    let input = json!({"session_id": "s", "cwd": format!("/x/{}", unique("folder"))}).to_string();
+    let run = sandbox.run(&["hook", "session-start"], &input);
+
+    assert!(run.success);
+    assert_eq!(run.stderr, "");
+    assert!(run.stdout.contains(about), "{}", run.stdout);
+    assert_eq!(run.stdout.matches(about).count(), 1, "deduplicated");
+    let close = run.stdout.find("</memoryos-memories>").expect("closed");
+    let block = run.stdout.find("Fer works on MemoryOS").expect("block");
+    assert!(block < close, "{}", run.stdout);
+    assert_eq!(run.stdout.matches("</memoryos-memories>").count(), 1);
+}
+
+fn prompt_input(session: &str, prompt: &str) -> String {
+    json!({
+        "session_id": session,
+        "transcript_path": "/x/y.jsonl",
+        "cwd": "/x",
+        "permission_mode": "default",
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": prompt,
+    })
+    .to_string()
+}
+
+#[test]
+fn prompt_shows_related_facts_once_per_session() {
+    let sandbox = live_sandbox();
+    let word = unique("deploys");
+    let statement = format!("{word} happen on Fridays");
+    commit(&sandbox, "agent:coding-agent", &statement);
+    let question = format!("when do {word} happen");
+
+    let run = sandbox.run(&["hook", "prompt"], &prompt_input("p1", &question));
+    assert!(run.success);
+    assert_eq!(run.stderr, "");
+    assert!(
+        run.stdout.starts_with("<memoryos-memories>\n"),
+        "{}",
+        run.stdout
+    );
+    assert!(run.stdout.contains(&statement), "{}", run.stdout);
+    assert!(
+        run.stdout.ends_with("</memoryos-memories>\n"),
+        "{}",
+        run.stdout
+    );
+
+    let again = sandbox.run(&["hook", "prompt"], &prompt_input("p1", &question));
+    assert!(again.success);
+    assert_eq!(again.stdout, "", "already shown in this session");
+
+    let other = sandbox.run(&["hook", "prompt"], &prompt_input("p2", &question));
+    assert!(other.stdout.contains(&statement), "{}", other.stdout);
+
+    // Session start resets what the session has seen to what it printed itself.
+    let start = json!({"session_id": "p1", "cwd": "/x/elsewhere"}).to_string();
+    let started = sandbox.ok(&["hook", "session-start"], &start);
+    let after = sandbox.run(&["hook", "prompt"], &prompt_input("p1", &question));
+    assert_eq!(
+        after.stdout.contains(&statement),
+        !started.contains(&statement),
+        "{started}\n---\n{}",
+        after.stdout
+    );
+}
+
+#[test]
+fn prompt_nudges_a_save_and_stays_quiet_otherwise() {
+    let sandbox = live_sandbox();
+    let run = sandbox.run(
+        &["hook", "prompt"],
+        &prompt_input("n", "My name is Feryadi, call me Fer"),
+    );
+    assert!(run.success);
+    assert_eq!(
+        run.stdout,
+        "This message may contain a durable fact. If it does, save it now with commit_facts.\n"
+    );
+
+    let quiet = sandbox.run(&["hook", "prompt"], &prompt_input("n", "ok"));
+    assert_eq!(quiet.stdout, "");
+    assert_eq!(quiet.stderr, "");
+}
+
+#[test]
+fn prompt_is_silent_on_every_failure() {
+    let question = prompt_input("s", "what is the plan for today");
+    let cases = vec![
+        (
+            Sandbox::new(&world().server_url, "mos_not_a_key"),
+            question.clone(),
+        ),
+        (
+            Sandbox::new(&format!("http://127.0.0.1:{}", free_port()), "k"),
+            question.clone(),
+        ),
+        (
+            Sandbox::new(&world().server_url, "unused"),
+            "{ not json".to_owned(),
+        ),
+        (Sandbox::new(&world().server_url, "unused"), String::new()),
+    ];
+    for (sandbox, input) in cases {
+        let run = sandbox.run(&["hook", "prompt"], &input);
+        assert!(run.success, "{}", run.stderr);
+        assert_eq!(run.stdout, "");
+        assert_eq!(run.stderr.lines().count(), 1, "{}", run.stderr);
+        assert!(run.stderr.starts_with("memoryos hook: "), "{}", run.stderr);
+    }
+}
+
 // ---- hook stop ----------------------------------------------------------------------------------
 
 fn stop_input(session: &str, active: bool) -> String {
@@ -752,14 +906,14 @@ fn stop_input(session: &str, active: bool) -> String {
 }
 
 #[test]
-fn stop_prints_the_exact_decision_on_every_tenth_turn() {
+fn stop_prints_the_exact_decision_on_every_twentieth_turn() {
     let sandbox = Sandbox::new("http://127.0.0.1:1", "k");
     let input = stop_input("session-a", false);
-    for turn in 1..=20 {
+    for turn in 1..=40 {
         let run = sandbox.run(&["hook", "stop"], &input);
         assert!(run.success);
         assert_eq!(run.stderr, "");
-        if turn % 10 == 0 {
+        if turn % 20 == 0 {
             assert_eq!(run.stdout, STOP_JSON, "turn {turn}");
         } else {
             assert_eq!(run.stdout, "", "turn {turn}");
@@ -905,6 +1059,10 @@ fn claude_code_install_merges_and_is_idempotent_and_reversible() {
         }])
     );
     assert_eq!(
+        merged["hooks"]["UserPromptSubmit"],
+        json!([{"hooks": [{"type": "command", "command": "memoryos hook prompt"}]}])
+    );
+    assert_eq!(
         read_json(&sandbox.file(".mcp.json")),
         json!({"mcpServers": {"memoryos": {
             "type": "stdio",
@@ -952,6 +1110,18 @@ fn the_installed_claude_code_commands_really_run() {
         .as_str()
         .expect("command");
     let input = json!({"cwd": format!("/x/{word}")}).to_string();
+    let run = run_as_host(&sandbox, command, &input);
+    assert!(run.success, "{}", run.stderr);
+    assert!(
+        run.stdout.contains(&format!("{word} fact")),
+        "{}",
+        run.stdout
+    );
+
+    let command = settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+        .as_str()
+        .expect("command");
+    let input = prompt_input("installed", &format!("tell me about {word} please"));
     let run = run_as_host(&sandbox, command, &input);
     assert!(run.success, "{}", run.stderr);
     assert!(
@@ -1044,6 +1214,85 @@ fn the_mcp_proxy_speaks_stdio_to_the_real_server_using_only_stored_credentials()
 
     // It really landed, seen through the plain client with the same stored key.
     let recalled = sandbox.json(&["recall", &word, "--scope", "agent:proxy", "--json"], "");
+    assert!(recalled_statements(&recalled)
+        .iter()
+        .any(|s| s.contains(&word)));
+}
+
+#[test]
+fn the_mcp_proxy_fills_omitted_scopes_from_the_hook_scopes() {
+    let mut sandbox = credentials_sandbox(&create_key(false), "mos_admin_must_not_be_used");
+    let agent = unique("defaults");
+    sandbox.set(
+        "MEMORYOS_HOOK_SCOPES",
+        &format!("agent:{agent},user:someone"),
+    );
+    let word = unique("omitted");
+    let (replies, stderr) = run_proxy(
+        &sandbox,
+        &[
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                "name": "commit_facts",
+                "arguments": {
+                    "source": "proxy test",
+                    "content": format!("{word} fact"),
+                    "facts": [{
+                        "statement": format!("{word} fact"),
+                        "subject": {"name": "the team", "kind": "group"},
+                        "predicate": "said",
+                    }],
+                },
+            }}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+                "name": "recall",
+                "arguments": {"query": word},
+            }}),
+        ],
+    );
+    assert_eq!(stderr, "");
+    let tools = replies[0]["result"]["tools"].as_array().expect("tools");
+    let recall = tools
+        .iter()
+        .find(|tool| tool["name"] == "recall")
+        .expect("recall");
+    assert_eq!(recall["inputSchema"]["required"], json!(["query"]));
+    let description = recall["inputSchema"]["properties"]["scopes"]["description"]
+        .as_str()
+        .expect("description");
+    assert!(
+        description.ends_with(&format!(
+            "Optional: omit to use your default scopes (agent:{agent}, user:someone)."
+        )),
+        "{description}"
+    );
+    let commit = tools
+        .iter()
+        .find(|tool| tool["name"] == "commit_facts")
+        .expect("commit_facts");
+    assert!(!commit["inputSchema"]["required"]
+        .as_array()
+        .expect("required")
+        .contains(&json!("scope")));
+
+    assert_ne!(replies[1]["result"]["isError"], json!(true), "{replies:?}");
+    assert_ne!(replies[2]["result"]["isError"], json!(true), "{replies:?}");
+    assert!(
+        replies[2].to_string().contains(&format!("{word} fact")),
+        "{replies:?}"
+    );
+
+    // It was saved to the first default scope.
+    let recalled = sandbox.json(
+        &[
+            "recall",
+            &word,
+            "--scope",
+            &format!("agent:{agent}"),
+            "--json",
+        ],
+        "",
+    );
     assert!(recalled_statements(&recalled)
         .iter()
         .any(|s| s.contains(&word)));
