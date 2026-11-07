@@ -323,6 +323,7 @@ These are goals, not measured results:
 |---|---|
 | [`docs/runbook.md`](docs/runbook.md) | Install, upgrades, backup and restore, keys, monitoring, incidents |
 | [`docs/SPEC.md`](docs/SPEC.md) | Behavior and contracts |
+| [`docs/comparison.md`](docs/comparison.md) | How MemoryOS differs from Mem0 and Graphiti |
 | [`docs/PLAN.md`](docs/PLAN.md) | Development waves and ownership |
 | [`docs/PROGRESS.md`](docs/PROGRESS.md) | Status, with proof for each task |
 | [`docs/openapi.yaml`](docs/openapi.yaml) | REST API contract |
