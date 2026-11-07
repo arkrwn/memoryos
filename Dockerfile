@@ -39,7 +39,8 @@ COPY --chmod=0755 deploy/healthcheck.sh /usr/local/bin/memoryos-healthcheck
 ENV MEMORYOS_MODEL_CACHE=/var/lib/memoryos/models
 USER 10001:10001
 EXPOSE 8080
-# The first start downloads a 481 MB model, and /readyz fails until it has loaded.
+# The first start downloads a 481 MB embedding model, and /readyz fails until it has loaded. A 571 MB
+# reranking model downloads after it, without holding readiness back.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15m --start-interval=5s --retries=3 \
     CMD ["/usr/local/bin/memoryos-healthcheck"]
 ENTRYPOINT ["memoryos"]

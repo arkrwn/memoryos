@@ -12,10 +12,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use memoryos_core::{
     Error, FactFilter, FactOp, FactStatus, MemoryStore, NewEntity, NewEpisode, NewFact,
-    RequestContext, Scope, ScoredFact, Trust, EMBEDDING_DIMS,
+    RequestContext, Reranker, Scope, ScoredFact, Trust, EMBEDDING_DIMS,
 };
 use memoryos_embed::TestEmbedder;
 use memoryos_retrieve::{RecallRequest, RecallResponse, Retriever};
@@ -579,6 +580,102 @@ async fn near_copies_do_not_both_appear_in_recall_but_do_in_candidates() {
         .await
         .expect("candidates");
     assert_eq!(ids(&candidates), BTreeSet::from([first, copy, distinct]));
+}
+
+/// Scores a statement 1 when it contains `favorite`, else 0, after `delay`.
+struct KeywordReranker {
+    favorite: &'static str,
+    delay: Duration,
+    calls: AtomicUsize,
+}
+
+impl KeywordReranker {
+    fn new(favorite: &'static str, delay: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            favorite,
+            delay,
+            calls: AtomicUsize::new(0),
+        })
+    }
+}
+
+#[async_trait]
+impl Reranker for KeywordReranker {
+    async fn score(&self, _query: &str, statements: &[String]) -> memoryos_core::Result<Vec<f32>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(self.delay).await;
+        Ok(statements
+            .iter()
+            .map(|s| if s.contains(self.favorite) { 1.0 } else { 0.0 })
+            .collect())
+    }
+}
+
+fn order(facts: &[ScoredFact]) -> Vec<Uuid> {
+    facts.iter().map(|scored| scored.fact.id).collect()
+}
+
+#[tokio::test]
+async fn a_reranker_reorders_recall_but_never_candidates() {
+    let f = fixture().await;
+    let (a, b, c) = (
+        f.entity("a").await,
+        f.entity("b").await,
+        f.entity("c").await,
+    );
+    let first = f.add(a, "a zebra was seen at noon", 1.0).await;
+    let second = f.add(b, "a zebra was seen at dusk", 1.1).await;
+    let third = f.add(c, "a zebra was seen at night", 1.2).await;
+    let plain = order(&f.recall(QUERY).await.facts);
+    assert_eq!(plain, [first, second, third]);
+
+    let reranker = KeywordReranker::new("night", Duration::ZERO);
+    let retriever =
+        Retriever::new(f.store.clone(), f.embedder.clone()).with_reranker(reranker.clone(), 20);
+    let reranked = retriever
+        .recall(&f.ctx, f.request(QUERY))
+        .await
+        .expect("recall")
+        .facts;
+    assert_eq!(order(&reranked), [third, first, second]);
+    assert!(reranked
+        .windows(2)
+        .all(|pair| pair[0].score >= pair[1].score));
+    assert_eq!(reranker.calls.load(Ordering::SeqCst), 1);
+
+    let scopes = [f.scope.clone()];
+    let candidates = retriever
+        .candidates(&f.ctx, &scopes, QUERY, 10)
+        .await
+        .expect("candidates");
+    assert_eq!(order(&candidates), plain);
+    let embedding = at_angle(0.0);
+    let with_embedding = retriever
+        .candidates_with_embedding(&f.ctx, &scopes, QUERY, &embedding, 10)
+        .await
+        .expect("candidates");
+    assert_eq!(order(&with_embedding), plain);
+    assert_eq!(reranker.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_slow_reranker_times_out_and_recall_keeps_the_fused_order() {
+    let f = fixture().await;
+    let (a, b) = (f.entity("a").await, f.entity("b").await);
+    let first = f.add(a, "a zebra was seen at noon", 1.0).await;
+    let second = f.add(b, "a zebra was seen at night", 1.1).await;
+
+    let retriever = Retriever::new(f.store.clone(), f.embedder.clone())
+        .with_reranker(KeywordReranker::new("night", Duration::from_secs(5)), 20)
+        .with_rerank_timeout(Duration::from_millis(200));
+    let started = Instant::now();
+    let facts = retriever
+        .recall(&f.ctx, f.request(QUERY))
+        .await
+        .expect("recall")
+        .facts;
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(order(&facts), [first, second]);
 }
 
 // ---- Time ------------------------------------------------------------------------------------

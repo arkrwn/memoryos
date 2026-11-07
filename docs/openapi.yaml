@@ -19,7 +19,7 @@ paths:
       security: []
       responses:
         "200": { description: Ready }
-        "503": { description: "Not ready: the database is unavailable, or the local embedding model is still loading or failed to load" }
+        "503": { description: "Not ready: the database is unavailable, or the local embedding model is still loading or failed to load. The body also reports the reranker (loading, ready, failed or off), which never makes the server not ready" }
   /metrics:
     get:
       summary: Prometheus metrics

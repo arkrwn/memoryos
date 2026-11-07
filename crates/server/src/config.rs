@@ -11,9 +11,19 @@ pub struct Config {
     pub db_max_connections: u32,
     pub rate_limit_rps: u32,
     pub request_timeout: Duration,
+    /// `MEMORYOS_RERANKER`: whether recall reorders its top facts with the local reranker.
+    pub reranker: RerankerMode,
+    /// `MEMORYOS_RERANK_TOP`: the most fused facts one recall sends to the reranker.
+    pub rerank_top: usize,
     /// `MEMORYOS_TEST_EMBEDDER`, in milliseconds per call: use the test embedder, not the model.
     #[cfg(feature = "test-embedder")]
     pub test_embedder_delay: Option<Duration>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RerankerMode {
+    Local,
+    Off,
 }
 
 impl fmt::Debug for Config {
@@ -46,6 +56,8 @@ impl Config {
                 "MEMORYOS_REQUEST_TIMEOUT_SECS",
                 30,
             )?),
+            reranker: reranker_mode(&get)?,
+            rerank_top: number(&get, "MEMORYOS_RERANK_TOP", 20)?,
             #[cfg(feature = "test-embedder")]
             test_embedder_delay: get("MEMORYOS_TEST_EMBEDDER")
                 .map(|millis| {
@@ -67,6 +79,17 @@ pub fn database_url_from_env() -> ConfigResult<String> {
 
 fn database_url_from(get: &impl Fn(&str) -> Option<String>) -> ConfigResult<String> {
     get("DATABASE_URL").ok_or_else(|| "DATABASE_URL is required".to_owned())
+}
+
+fn reranker_mode(get: &impl Fn(&str) -> Option<String>) -> ConfigResult<RerankerMode> {
+    let Some(text) = get("MEMORYOS_RERANKER") else {
+        return Ok(RerankerMode::Local);
+    };
+    match text.trim().to_ascii_lowercase().as_str() {
+        "local" => Ok(RerankerMode::Local),
+        "off" => Ok(RerankerMode::Off),
+        _ => Err("MEMORYOS_RERANKER must be local or off".to_owned()),
+    }
 }
 
 /// Every number here is a size or a period, where zero would mean the service cannot work.
@@ -124,6 +147,31 @@ mod tests {
     fn bad_values_name_the_variable() {
         let bad_rate = load(&[DB, ("MEMORYOS_RATE_LIMIT_RPS", "0")]);
         assert!(message(bad_rate).contains("MEMORYOS_RATE_LIMIT_RPS"));
+    }
+
+    #[test]
+    fn the_reranker_is_local_with_a_top_of_20_unless_set() {
+        let config = load(&[DB]).expect("valid");
+        assert_eq!(config.reranker, RerankerMode::Local);
+        assert_eq!(config.rerank_top, 20);
+        let config = load(&[
+            DB,
+            ("MEMORYOS_RERANKER", " OFF "),
+            ("MEMORYOS_RERANK_TOP", "8"),
+        ])
+        .expect("valid");
+        assert_eq!(config.reranker, RerankerMode::Off);
+        assert_eq!(config.rerank_top, 8);
+        let config = load(&[DB, ("MEMORYOS_RERANKER", "local")]).expect("valid");
+        assert_eq!(config.reranker, RerankerMode::Local);
+    }
+
+    #[test]
+    fn bad_reranker_settings_name_the_variable() {
+        let bad_mode = load(&[DB, ("MEMORYOS_RERANKER", "remote")]);
+        assert!(message(bad_mode).contains("MEMORYOS_RERANKER"));
+        let bad_top = load(&[DB, ("MEMORYOS_RERANK_TOP", "0")]);
+        assert!(message(bad_top).contains("MEMORYOS_RERANK_TOP"));
     }
 
     #[cfg(feature = "test-embedder")]

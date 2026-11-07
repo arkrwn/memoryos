@@ -16,10 +16,10 @@ Requirements:
 
 | Resource | Need |
 |---|---|
-| Runtime memory | At least 1 GiB per container running the local embedder; 768m is OOM killed. Measured 980 MiB after load. The compose limit is `1536m` (`MEMORYOS_MEM_LIMIT`) |
-| Disk | 144 MB image, 465 MiB model cache, plus the build cache and database |
+| Runtime memory | The compose limit is `2560m` (`MEMORYOS_MEM_LIMIT`). The local embedder needs at least 1 GiB; 768m is OOM killed, and it measured 980 MiB after load. The reranker adds about 1.3 GiB at its peak (macOS process: 1.26 GiB maximum resident set for load plus 15 recalls, 1.64 GiB with 20 statements of 512 tokens; **not yet measured** in the Linux container). With `MEMORYOS_RERANKER=off`, `1536m` is enough |
+| Disk | 144 MB image, 465 MiB embedding model and 571 MB reranking model in the cache, plus the build cache and database |
 | Network at build | `cdn.pyke.io`, for ONNX Runtime |
-| Network at first start | Hugging Face, for the 481 MB model. Took about 2 minutes here |
+| Network at first start | Hugging Face, for the 481 MB embedding model (about 2 minutes here), then the 571 MB reranking model |
 | glibc | 2.38 or newer. `debian:trixie-slim`, `ubuntu:24.04` and `gcr.io/distroless/cc-debian13` work; bookworm and alpine do not |
 
 Normal install, with Docker running:
@@ -48,6 +48,22 @@ The stack is `postgres` (not published on the host), `migrate` (one-shot) and `m
 keep a TLS reverse proxy in front before setting `MEMORYOS_PUBLISH` to a public address.
 
 Leave `HF_HOME` unset, because it overrides `MEMORYOS_MODEL_CACHE`.
+
+### Reranker
+
+Recall reorders its top facts with a local cross-encoder (`bge-reranker-v2-m3`, int8 ONNX), on by
+default. It loads after the embedding model and does not hold `/readyz` back: until it is `ready`,
+recall returns the fused order. On this machine it put the right fact first for 15 of 15 English and
+Chinese test questions, where fused order alone did for 8, at a median 207 ms per recall of 10 facts.
+
+- Turn it off with `MEMORYOS_RERANKER=off` in the `.env` next to the Compose file, then
+  `dc up -d memoryos`. `/readyz` then shows `"reranker":"off"`. `memoryos setup` rewrites its `.env`
+  on every run, so add the line again after one.
+- `MEMORYOS_RERANK_TOP` (default 20) caps how many facts one recall sends to it.
+- An install made before the reranker keeps its old Compose file and the old `1536m` limit. Run
+  `memoryos setup` again, which rewrites the Compose file, or for the stack run by hand set
+  `MEMORYOS_MEM_LIMIT=2560m` in `deploy/.env`. Otherwise the reranker load can be OOM killed (exit
+  code 137). **Not run** as an upgrade.
 
 ### Database roles
 
@@ -184,12 +200,12 @@ Revoking takes effect on the next request: the drill went from 200 to 401 withou
 
 | Signal | Watch for |
 |---|---|
-| `GET /readyz` | 503. The body names `database` (`ok`, `unavailable`) and `embedder` (`loading`, `ready`, `failed`) |
+| `GET /readyz` | 503. The body names `database` (`ok`, `unavailable`) and `embedder` (`loading`, `ready`, `failed`). It also names `reranker` (`loading`, `ready`, `failed`, `off`), which never causes a 503 |
 | `GET /healthz` | Failure means the process is gone. It stays 200 through database and model failures |
 | `memoryos_http_requests_total{status=~"5.."}` | 500 is usually the database, and 502 is the embedding model |
 | `memoryos_http_request_duration_seconds` | Latency by route |
 | `memoryos_recall_duration_seconds` | Target is p95 under 200 ms, not yet measured at scale |
-| Logs, JSON on stdout | `not ready`, `query embedding timed out` |
+| Logs, JSON on stdout | `not ready`, `query embedding timed out`, `reranking timed out`, `reranking failed` |
 | Container memory | Near `MEMORYOS_MEM_LIMIT`. OOM shows as a restart with exit code 137 |
 
 Quarantine backlog is `GET /v1/quarantine`, per scope, below. Traces export only when
@@ -268,6 +284,10 @@ dc up -d memoryos
 
 For a host with no internet, fill the `model-cache` volume from another machine (**not run**).
 
+The reranking model follows the same path after the embedding model: `"reranker":"loading"` or
+`"failed"` and `not ready: the local reranking model ...` in the logs, with recall answering in fused
+order meanwhile. It does not make `/readyz` fail. **Not run** in the container.
+
 ## Docker disk growth
 
 ```bash
@@ -281,7 +301,7 @@ docker volume ls --filter dangling=true
 | Build cache | Largest. A clean image build used about 3 GB here |
 | Old images | Each `--build` leaves the previous `memoryos:local` untagged |
 | `pgdata` | Normal growth. Closed facts are kept on purpose, so this does not shrink by itself |
-| `model-cache` | Fixed at 465 MiB |
+| `model-cache` | Fixed: 465 MiB embedding model plus 571 MB reranking model |
 | Test containers | CI and `cargo test` start Postgres on tmpfs, so they should leave no volume. Check with the `dangling` listing |
 
 Cleanup (**not run**, because they affect everything on the Docker host, not only MemoryOS, so read what they list first):
@@ -298,7 +318,10 @@ delete `pgdata`.
 
 - The full list is in `docs/SPEC.md` section 13. The ones that matter most in operation are below.
 - The rate limiter is per process, so with several instances the limit multiplies.
-- `LocalEmbedder` silently truncates input over 512 tokens.
+- `LocalEmbedder` silently truncates input over 512 tokens. `LocalReranker` cuts each query and
+  statement pair at 512 tokens.
+- Very long statements make reranking slow: 20 statements of 512 tokens took 8.7 s, so that recall
+  times out at 2 s and returns fused order, and recalls queued behind it do the same until it ends.
 - Changing the embedding model needs re-embedding, and there is no tool for it.
 - The compose stack is one Postgres and one server. There is no replication or scheduled backup; add
   those yourself.

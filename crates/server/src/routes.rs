@@ -227,6 +227,8 @@ async fn readyz(State(state): State<AppState>) -> Response {
         }
     };
     let embedder = &state.readiness;
+    // The reranker is reported but not waited for: until it loads, recall keeps the fused order.
+    let reranker = &state.reranker_readiness;
     let ready = database_up && embedder.is_ready();
     let status = if ready {
         StatusCode::OK
@@ -237,6 +239,7 @@ async fn readyz(State(state): State<AppState>) -> Response {
         "status": if ready { "ready" } else { "not_ready" },
         "database": if database_up { "ok" } else { "unavailable" },
         "embedder": embedder.label(),
+        "reranker": reranker.label(),
     });
     (status, Json(body)).into_response()
 }

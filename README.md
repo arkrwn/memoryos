@@ -44,8 +44,13 @@ memoryos setup --agent claude-code   # or: opencode, pi
 ```
 
 The first run builds the image, which takes several minutes, and downloads a 481 MB embedding model,
-about 2.5 minutes on a fast connection and much longer on a slow one. Later runs start in seconds and
-keep your data and keys.
+about 2.5 minutes on a fast connection and much longer on a slow one. The server is ready once that
+model loads; a 571 MB reranking model then downloads in the background, and recall uses it from then
+on. Later runs start in seconds and keep your data and keys.
+
+The server container needs up to 2.5 GiB of memory with both models (`MEMORYOS_MEM_LIMIT`, default
+`2560m`), so Docker needs room for that next to Postgres. `MEMORYOS_RERANKER=off` skips the reranker and fits in
+`1536m`. Both settings are in [SPEC section 10](docs/SPEC.md#10-configuration).
 
 `setup` starts Postgres and the server through Compose, creates two keys, and connects the agent over
 `memoryos mcp`, a local stdio proxy. Agent configuration holds no key and no reference to one.
@@ -125,7 +130,7 @@ let then = mem.recall(user, "where does the user live?")
 flowchart TD
     A[Agents and apps] -->|REST or MCP| S[memoryos-server<br/>auth, scopes, limits, telemetry]
     S -->|commit| G[Trust gate]
-    S -->|read| R[Hybrid retrieval<br/>vector + text + graph]
+    S -->|read| R[Hybrid retrieval<br/>vector + text + graph,<br/>then a local reranker]
     G --> DB[(Postgres + pgvector)]
     R --> DB
 ```

@@ -401,6 +401,8 @@ async fn a_stalled_model_download_blocks_neither_health_nor_the_api_nor_shutdown
     assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body: Value = ready.json().await.expect("json");
     assert_ne!(body["embedder"], "ready", "{body}");
+    // On by default, and waiting for the embedder, so recall below keeps the fused order.
+    assert_eq!(body["reranker"], "loading", "{body}");
     assert_eq!(body["database"], "ok", "{body}");
 
     // Recall answers through text search once the embed timeout passes.

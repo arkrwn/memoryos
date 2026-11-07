@@ -2,11 +2,13 @@
 
 pub mod embedder;
 pub mod error;
+pub mod reranker;
 pub mod store;
 pub mod types;
 
 pub use embedder::Embedder;
 pub use error::{Error, Result};
+pub use reranker::Reranker;
 pub use store::MemoryStore;
 pub use types::*;
 
