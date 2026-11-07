@@ -1723,10 +1723,6 @@ mod tests {
 
     // ---- Claude Code plugin ----
 
-    /// Added to the plugin before `install` writes it; see `integrations/claude-code`.
-    const PROMPT_EVENT: &str = "UserPromptSubmit";
-    const PROMPT_COMMAND: &str = "memoryos hook prompt";
-
     fn plugin_file(path: &str) -> Value {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../integrations/claude-code");
         let text = fs::read_to_string(root.join(path)).expect("plugin file");
