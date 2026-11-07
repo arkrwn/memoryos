@@ -1,4 +1,5 @@
-//! Pure ranking logic: reciprocal rank fusion and the graph candidate list.
+//! Pure ranking logic: reciprocal rank fusion, the source count nudge, near copy removal and the
+//! graph candidate list.
 
 use std::collections::{HashMap, HashSet};
 
@@ -6,6 +7,11 @@ use memoryos_core::{Error, Fact, GraphNeighborhood, Result};
 use uuid::Uuid;
 
 const RRF_K: f64 = 60.0;
+
+/// Score boost for each source episode past the first, see [`boost_by_sources`].
+const SOURCE_BOOST_PER_EXTRA: f64 = 0.02;
+/// Sources past the first that count toward the boost, so the boost tops out at 6%.
+const SOURCE_BOOST_MAX_EXTRA: usize = 3;
 
 /// Reciprocal rank fusion, `score = sum(1 / (60 + rank))` with rank starting at 1, highest first.
 ///
@@ -22,10 +28,70 @@ pub(crate) fn fuse<'a>(lists: &[&'a [Fact]]) -> Vec<(&'a Fact, f64)> {
         }
     }
     let mut fused: Vec<_> = scored.into_values().collect();
-    fused.sort_unstable_by(|(a, a_score), (b, b_score)| {
+    sort_by_score(&mut fused);
+    fused
+}
+
+/// Highest score first, equal scores by fact id.
+fn sort_by_score(ranked: &mut [(&Fact, f64)]) {
+    ranked.sort_unstable_by(|(a, a_score), (b, b_score)| {
         b_score.total_cmp(a_score).then_with(|| a.id.cmp(&b.id))
     });
-    fused
+}
+
+/// Multiplies each fused score by `1 + 0.02 * extra`, where `extra` is the number of source
+/// episodes past the first, capped at 3, then sorts again. A fact with one source keeps its score.
+///
+/// Why 6% at most: near the top of a list it is worth about four ranks (`65 / 61 = 1.066`), so it
+/// breaks ties and nudges. It stays below the 10.9% gap between the best fact found by one list
+/// (`1 / 61`) and the worst found by two (`2 / 110`), so sources never lift a fact found by one
+/// list over a fact found by two.
+pub(crate) fn boost_by_sources(fused: Vec<(&Fact, f64)>) -> Vec<(&Fact, f64)> {
+    let mut boosted: Vec<_> = fused
+        .into_iter()
+        .map(|(fact, score)| (fact, score * source_boost(fact)))
+        .collect();
+    sort_by_score(&mut boosted);
+    boosted
+}
+
+fn source_boost(fact: &Fact) -> f64 {
+    let extra = fact
+        .source_episode_ids
+        .len()
+        .saturating_sub(1)
+        .min(SOURCE_BOOST_MAX_EXTRA);
+    1.0 + SOURCE_BOOST_PER_EXTRA * extra as f64
+}
+
+/// Drops each fact that is a near copy of a higher ranked one, keeping the order, so the next
+/// distinct fact takes its slot. Near copy means the same subject, predicate and object and the
+/// same statement after [`normalize`]. Candidate lists carry no embeddings, so this is the test
+/// that needs no extra read.
+pub(crate) fn without_near_copies(ranked: Vec<(&Fact, f64)>) -> Vec<(&Fact, f64)> {
+    let mut seen = HashSet::new();
+    ranked
+        .into_iter()
+        .filter(|(fact, _)| {
+            let key = (
+                fact.subject_id,
+                fact.predicate.as_str(),
+                fact.object_id,
+                normalize(&fact.statement),
+            );
+            seen.insert(key)
+        })
+        .collect()
+}
+
+/// Lowercase words, split on anything that is not a letter or digit, joined by one space.
+fn normalize(statement: &str) -> String {
+    statement
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Distinct subjects of the first `count` fused facts, best first.
@@ -132,6 +198,18 @@ mod tests {
         ns.iter().map(|n| fact(*n, 1000 + n)).collect()
     }
 
+    fn with_sources(mut fact: Fact, count: u128) -> Fact {
+        fact.source_episode_ids = (0..count).map(|n| id(9000 + n)).collect();
+        fact
+    }
+
+    fn stated(n: u128, subject: u128, statement: &str) -> Fact {
+        Fact {
+            statement: statement.into(),
+            ..fact(n, subject)
+        }
+    }
+
     fn fused_ids(fused: &[(&Fact, f64)]) -> Vec<u128> {
         fused.iter().map(|(fact, _)| fact.id.as_u128()).collect()
     }
@@ -193,6 +271,99 @@ mod tests {
         let empty: Vec<Fact> = vec![];
         assert!(fuse(&[&empty, &empty]).is_empty());
         assert!(fuse(&[]).is_empty());
+    }
+
+    #[test]
+    fn one_source_keeps_the_fused_score() {
+        let list = vec![with_sources(fact(1, 100), 1), fact(2, 200)];
+        let boosted = boost_by_sources(fuse(&[&list]));
+        assert_eq!(fused_ids(&boosted), [1, 2]);
+        assert_eq!(boosted[0].1, 1.0 / 61.0);
+        assert_eq!(boosted[1].1, 1.0 / 62.0);
+    }
+
+    #[test]
+    fn sources_break_a_tie() {
+        // Same rank in two lists, so the fused scores are equal and id order would put 1 first.
+        let (a, b) = (vec![fact(1, 100)], vec![with_sources(fact(2, 200), 3)]);
+        let fused = fuse(&[&a, &b]);
+        assert_eq!(fused[0].1, fused[1].1);
+        assert_eq!(fused_ids(&boost_by_sources(fused)), [2, 1]);
+    }
+
+    #[test]
+    fn sources_nudge_a_few_ranks_and_stop_at_the_cap() {
+        let list = vec![
+            fact(1, 100),
+            with_sources(fact(2, 200), 2),
+            with_sources(fact(3, 300), 50),
+            fact(4, 400),
+            with_sources(fact(5, 500), 50),
+        ];
+        let boosted = boost_by_sources(fuse(&[&list]));
+        // 1/61, 1.02/62, 1.06/63, 1/64 and 1.06/65: rank 5 stays behind rank 1.
+        assert_eq!(fused_ids(&boosted), [3, 2, 1, 5, 4]);
+        assert!((boosted[0].1 - 1.06 / 63.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn many_sources_do_not_lift_a_fact_over_a_clearly_better_match() {
+        // Found by one list only, at its best rank, with as many sources as anything can have.
+        let lone = with_sources(fact(1, 100), 100);
+        // Found by two lists, each at its worst rank, with one source.
+        let filler = |offset: u128| (0..49).map(move |n| fact(offset + n, offset + n));
+        let first: Vec<Fact> = std::iter::once(lone).chain(filler(10)).collect();
+        let second: Vec<Fact> = filler(100).chain([fact(2, 200)]).collect();
+        let third: Vec<Fact> = filler(200).chain([fact(2, 200)]).collect();
+
+        let boosted = boost_by_sources(fuse(&[&first, &second, &third]));
+        let order = fused_ids(&boosted);
+        let rank = |n: u128| order.iter().position(|&id| id == n).expect("ranked");
+        assert!(rank(2) < rank(1));
+    }
+
+    #[test]
+    fn near_copies_give_way_to_the_next_distinct_fact() {
+        let list = vec![
+            stated(1, 100, "The zebra was seen."),
+            stated(2, 100, "the  zebra was SEEN"),
+            stated(3, 100, "the zebra ran"),
+            stated(4, 100, "THE ZEBRA RAN!"),
+        ];
+        let kept = without_near_copies(fuse(&[&list]));
+        assert_eq!(fused_ids(&kept), [1, 3]);
+        assert_eq!(kept[1].1, 1.0 / 63.0);
+    }
+
+    #[test]
+    fn same_words_about_other_entities_are_not_copies() {
+        let other_subject = stated(2, 200, "the zebra was seen");
+        let other_predicate = Fact {
+            predicate: "q".into(),
+            ..stated(3, 100, "the zebra was seen")
+        };
+        let other_object = Fact {
+            object_id: Some(id(500)),
+            ..stated(4, 100, "the zebra was seen")
+        };
+        let list = vec![
+            stated(1, 100, "the zebra was seen"),
+            other_subject,
+            other_predicate,
+            other_object,
+            stated(5, 100, "a zebra was seen"),
+        ];
+        assert_eq!(
+            fused_ids(&without_near_copies(fuse(&[&list]))),
+            [1, 2, 3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn normalize_keeps_words_and_drops_case_and_punctuation() {
+        assert_eq!(normalize("  Uses  Postgres, 17!\n"), "uses postgres 17");
+        assert_eq!(normalize("Ünïcode ÉTÉ"), "ünïcode été");
+        assert_eq!(normalize("--"), "");
     }
 
     #[test]
