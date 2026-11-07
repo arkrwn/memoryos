@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "memoryos": {
+      "type": "stdio",
+      "command": "memoryos",
+      "args": ["mcp"]
+    }
+  }
+}

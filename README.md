@@ -211,6 +211,25 @@ agent act.
 </details>
 
 <details>
+<summary><b>Install as a Claude Code plugin</b></summary>
+
+`integrations/claude-code` packages the same hooks, the `memoryos` MCP server and a short skill on
+when to recall and what to save, as one Claude Code plugin. The repository root is its marketplace.
+The `memoryos` binary must still be on `PATH`, and the server running (`memoryos setup` does both).
+
+```text
+/plugin marketplace add /path/to/memoryos
+/plugin install memoryos@memoryos
+```
+
+The plugin replaces the settings edits that `memoryos setup --agent claude-code` makes. Use one or
+the other: with both, every hook runs twice. To switch to the plugin, run
+`memoryos hook uninstall --agent claude-code` (add `--global` if you installed globally) first. As a
+plugin, the MCP tools are named `mcp__plugin_memoryos_memoryos__*` instead of `mcp__memoryos__*`.
+
+</details>
+
+<details>
 <summary><b>OpenCode setup</b></summary>
 
 `.opencode/plugins/memoryos.ts` and an `mcp.memoryos` entry in `opencode.json`. The plugin adds recalled

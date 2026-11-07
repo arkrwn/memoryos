@@ -1,0 +1,14 @@
+{
+  "name": "memoryos",
+  "description": "MemoryOS, long-term memory for coding agents",
+  "owner": {
+    "name": "MemoryOS"
+  },
+  "plugins": [
+    {
+      "name": "memoryos",
+      "source": "./integrations/claude-code",
+      "description": "MemoryOS hooks, MCP server and memory skill for Claude Code"
+    }
+  ]
+}

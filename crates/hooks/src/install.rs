@@ -1664,4 +1664,94 @@ mod tests {
             }
         }
     }
+
+    // ---- Claude Code plugin ----
+
+    /// Added to the plugin before `install` writes it; see `integrations/claude-code`.
+    const PROMPT_EVENT: &str = "UserPromptSubmit";
+    const PROMPT_COMMAND: &str = "memoryos hook prompt";
+
+    fn plugin_file(path: &str) -> Value {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../integrations/claude-code");
+        let text = fs::read_to_string(root.join(path)).expect("plugin file");
+        value(&text)
+    }
+
+    /// Each event's groups as (matcher, commands), in order.
+    fn plugin_hooks(hooks: &Value, event: &str) -> Vec<(Option<String>, Vec<String>)> {
+        hooks["hooks"][event]
+            .as_array()
+            .unwrap_or_else(|| panic!("{event} missing"))
+            .iter()
+            .map(|group| {
+                let matcher = group["matcher"].as_str().map(str::to_owned);
+                let commands = group["hooks"]
+                    .as_array()
+                    .expect("handlers")
+                    .iter()
+                    .map(|handler| {
+                        assert_eq!(handler["type"], "command");
+                        handler["command"].as_str().expect("command").to_owned()
+                    })
+                    .collect();
+                (matcher, commands)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_plugin_hooks_match_what_install_writes() {
+        let hooks = plugin_file("hooks/hooks.json");
+        let mut events: Vec<&str> = hooks["hooks"]
+            .as_object()
+            .expect("events")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        events.sort_unstable();
+        let mut expected = vec![SESSION_START_EVENT, PROMPT_EVENT, STOP_EVENT];
+        expected.sort_unstable();
+        assert_eq!(events, expected);
+        assert_eq!(
+            plugin_hooks(&hooks, SESSION_START_EVENT),
+            [(
+                Some(SESSION_START_MATCHER.to_owned()),
+                vec![SESSION_START_COMMAND.to_owned()]
+            )]
+        );
+        assert_eq!(
+            plugin_hooks(&hooks, STOP_EVENT),
+            [(None, vec![STOP_COMMAND.to_owned()])]
+        );
+        assert_eq!(
+            plugin_hooks(&hooks, PROMPT_EVENT),
+            [(None, vec![PROMPT_COMMAND.to_owned()])]
+        );
+
+        // The plugin registers exactly what `install` writes into settings.json.
+        let installed = value(&written(install_claude_hooks(None).expect("install")));
+        for event in [SESSION_START_EVENT, STOP_EVENT] {
+            assert_eq!(installed["hooks"][event], hooks["hooks"][event], "{event}");
+        }
+    }
+
+    #[test]
+    fn the_plugin_mcp_server_matches_what_install_writes() {
+        let mcp = plugin_file(".mcp.json");
+        let servers = mcp["mcpServers"].as_object().expect("mcpServers");
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[SERVER_NAME], parsed(CLAUDE_ENTRY));
+    }
+
+    #[test]
+    fn the_plugin_and_marketplace_name_this_release() {
+        let manifest = plugin_file(".claude-plugin/plugin.json");
+        assert_eq!(manifest["name"], SERVER_NAME);
+        assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
+        let marketplace = plugin_file("../../.claude-plugin/marketplace.json");
+        let plugins = marketplace["plugins"].as_array().expect("plugins");
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0]["name"], SERVER_NAME);
+        assert_eq!(plugins[0]["source"], "./integrations/claude-code");
+    }
 }
