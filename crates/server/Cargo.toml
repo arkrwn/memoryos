@@ -32,6 +32,7 @@ opentelemetry = "0.31"
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "reqwest-rustls"] }
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace"] }
 prometheus = { version = "0.14", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
@@ -46,7 +47,6 @@ uuid.workspace = true
 [dev-dependencies]
 memoryos-sdk.workspace = true
 async-trait.workspace = true
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_yaml_ng = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio"] }
 testcontainers = "0.28"

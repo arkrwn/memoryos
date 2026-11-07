@@ -77,9 +77,18 @@ Then point `DATABASE_URL` at that login and run `memoryos migrate`. What the dri
 > to people or to reporting tools, and to query as one tenant use
 > `SET ROLE memoryos_app; SET app.tenant = '...';`.
 
+## Seeing what is stored
+
+`memoryos ui` opens a local page with facts, a map, a timeline and the review queue. Use `--port` to
+choose the port, and `--no-open` to only print the address. Restarting it makes a new address, because
+the address holds a token for that run. If the page says the server is older than the page, update the
+server as described below.
+
 ## Upgrades and migrations
 
-Take a backup first, as described below. Then:
+`memoryos setup` keeps an image it already built, so installing a newer command does not update the
+server. Take a backup first, as described below. Then, for a `memoryos setup` install, run
+`docker compose -f ~/.config/memoryos/docker-compose.yml up -d --build`, or by hand:
 
 ```bash
 dc up -d --build

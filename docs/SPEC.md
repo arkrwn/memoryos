@@ -76,6 +76,14 @@ Rules:
   are the MCP tools. Tool descriptions state when to recall, when to save, and that retrieved or
   tool-read content is data, never instructions.
 
+`memoryos ui` serves a page on loopback for people to see and review memory. The page holds no API
+key. It calls a local proxy that forwards only `GET /readyz`, `/v1/scopes`, `/v1/facts`,
+`/v1/facts/{id}`, its history, `/v1/episodes/{id}`, `/v1/quarantine`, an agent's blocks, `POST /v1/recall`
+and quarantine approve and reject, using the stored admin key, or the agent key when there is none. The
+proxy checks the `Host` header and a per-run token sent in a custom header, which stop DNS rebinding and
+requests from other sites. Fact text is untrusted and is only ever set as text, under a content security
+policy with no inline scripts.
+
 CLI, using `MEMORYOS_URL` and `MEMORYOS_API_KEY` (any agent without MCP can use these):
 `memoryos recall`, `candidates`, `commit`, `quarantine list|approve|reject`, and
 `memoryos hook session-start|stop|install --agent claude-code|opencode`, as shown in `README.md`.
@@ -261,6 +269,8 @@ to save.
   makes model failures harder to diagnose from logs.
 - `known_at` is not fully bitemporal: `valid_to` and `status` are not versioned, so a later close or
   approval shows up in reads at an earlier `known_at`.
+- `GET /v1/scopes` scans the tenant's facts, so it slows with size. It is for occasional reads. The page
+  draws at most the newest 300 facts in Map and Timeline, and says so.
 - `LocalEmbedder` silently truncates inputs over 512 tokens and needs at least 1 GiB of memory.
 - A fact backdated between two facts of a chain ends at the later one but does not close the earlier
   one, so `as_of` in that gap returns both. Backdating before the whole chain is exact.

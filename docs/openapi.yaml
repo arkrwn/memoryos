@@ -122,6 +122,56 @@ paths:
                         id: { type: string, format: uuid }
                         status: { type: string, enum: [active, quarantined, rejected] }
         default: { $ref: "#/components/responses/Error" }
+  /v1/scopes:
+    get:
+      summary: The scopes this key may read, with counts, most recently written first
+      responses:
+        "200":
+          description: >-
+            Scopes. `quarantined` is 0 for a key that is not an admin. `truncated` is true when more
+            than 500 scopes exist and the rest were left out
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [scopes, truncated]
+                properties:
+                  scopes: { type: array, items: { $ref: "#/components/schemas/ScopeSummary" } }
+                  truncated: { type: boolean }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/facts:
+    get:
+      summary: List active facts of one scope, newest recorded first
+      parameters:
+        - name: scope
+          in: query
+          required: true
+          description: An exact scope the key allows
+          schema: { type: string }
+        - name: state
+          in: query
+          description: >-
+            `current` is what recall can return now. `past` is closed, retracted or starting later.
+            Quarantined and rejected facts are never listed here
+          schema: { type: string, enum: [current, past, all], default: current }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+        - name: before
+          in: query
+          description: The last id of the previous page
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Facts
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [facts]
+                properties:
+                  facts: { type: array, items: { $ref: "#/components/schemas/FactView" } }
+        default: { $ref: "#/components/responses/Error" }
   /v1/facts/{id}:
     get:
       summary: Read a fact
@@ -454,6 +504,27 @@ components:
         superseded_by: { type: [string, "null"], format: uuid }
         pending_supersede_of: { type: [string, "null"], format: uuid }
         source_episode_ids: { type: array, items: { type: string, format: uuid } }
+    FactView:
+      allOf:
+        - $ref: "#/components/schemas/Fact"
+        - type: object
+          required: [subject_name, subject_kind]
+          properties:
+            subject_name: { type: string }
+            subject_kind: { type: string }
+            object_name: { type: [string, "null"] }
+            object_kind: { type: [string, "null"] }
+    ScopeSummary:
+      type: object
+      required: [scope, current, past, quarantined, entities, blocks]
+      properties:
+        scope: { type: string }
+        current: { type: integer }
+        past: { type: integer }
+        quarantined: { type: integer }
+        entities: { type: integer }
+        blocks: { type: integer }
+        last_recorded_at: { type: [string, "null"], format: date-time }
     RecallRequest:
       type: object
       required: [scopes, query]

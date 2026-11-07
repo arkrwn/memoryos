@@ -20,12 +20,24 @@ pub(crate) const FACT_COLS: &str = "f.id, f.scope, f.subject_id, f.predicate, f.
 /// SPEC section 4 visibility for `facts f`, with `$t` the valid time and `$k` the knowledge time.
 /// Both parameters are nullable and default to the transaction's `now()`.
 pub(crate) fn visible(t: u8, k: u8) -> String {
+    visible_at(
+        &format!("COALESCE(${t}::timestamptz, now())"),
+        &format!("COALESCE(${k}::timestamptz, now())"),
+    )
+}
+
+/// The same filter at the transaction's `now()`, with no parameters.
+pub(crate) fn visible_now() -> String {
+    visible_at("now()", "now()")
+}
+
+fn visible_at(t: &str, k: &str) -> String {
     format!(
         "f.status = 'active' \
-         AND f.valid_from <= COALESCE(${t}::timestamptz, now()) \
-         AND (f.valid_to IS NULL OR f.valid_to > COALESCE(${t}::timestamptz, now())) \
-         AND f.recorded_at <= COALESCE(${k}::timestamptz, now()) \
-         AND (f.invalidated_at IS NULL OR f.invalidated_at > COALESCE(${k}::timestamptz, now()))"
+         AND f.valid_from <= {t} \
+         AND (f.valid_to IS NULL OR f.valid_to > {t}) \
+         AND f.recorded_at <= {k} \
+         AND (f.invalidated_at IS NULL OR f.invalidated_at > {k})"
     )
 }
 

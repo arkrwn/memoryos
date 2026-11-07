@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put, MethodRouter};
 use axum::{Extension, Json, Router};
 use chrono::{DateTime, Utc};
-use memoryos_core::Scope;
+use memoryos_core::{FactListState, Scope};
 use memoryos_ingest::CommitRequest;
 use memoryos_retrieve::RecallRequest;
 use serde::de::DeserializeOwned;
@@ -64,6 +64,8 @@ pub fn route_table() -> Vec<Route> {
         bearer("POST", "/v1/recall", post(recall)),
         bearer("POST", "/v1/candidates", post(candidates)),
         bearer("POST", "/v1/commits", post(commit)),
+        bearer("GET", "/v1/scopes", get(list_scopes)),
+        bearer("GET", "/v1/facts", get(list_facts)),
         bearer("GET", "/v1/facts/{id}", get(get_fact)),
         bearer("GET", "/v1/facts/{id}/history", get(fact_history)),
         bearer("POST", "/v1/facts/{id}/invalidate", post(invalidate_fact)),
@@ -295,6 +297,40 @@ async fn commit(
     ApiJson(req): ApiJson<CommitRequest>,
 ) -> ApiResult<impl IntoResponse> {
     Ok(Json(state.services.commit(&caller, req).await?))
+}
+
+async fn list_scopes(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+) -> ApiResult<impl IntoResponse> {
+    let (scopes, truncated) = state.services.list_scopes(&caller).await?;
+    Ok(Json(json!({"scopes": scopes, "truncated": truncated})))
+}
+
+#[derive(Deserialize)]
+struct FactsQuery {
+    scope: Scope,
+    state: Option<FactListState>,
+    limit: Option<i64>,
+    before: Option<Uuid>,
+}
+
+async fn list_facts(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    ApiQuery(query): ApiQuery<FactsQuery>,
+) -> ApiResult<impl IntoResponse> {
+    let facts = state
+        .services
+        .list_facts(
+            &caller,
+            &query.scope,
+            query.state,
+            query.limit,
+            query.before,
+        )
+        .await?;
+    Ok(Json(json!({"facts": facts})))
 }
 
 async fn get_fact(

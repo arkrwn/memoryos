@@ -6,8 +6,8 @@ use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use memoryos_core::{
-    Block, BlockVersion, Entity, Episode, Fact, FactFilter, GraphNeighborhood, MemoryStore,
-    PurgeReport, Scope, ScoredFact, Trust,
+    Block, BlockVersion, Entity, Episode, Fact, FactFilter, FactListState, FactView,
+    GraphNeighborhood, MemoryStore, PurgeReport, Scope, ScopeSummary, ScoredFact, Trust,
 };
 use memoryos_ingest::{CommitRequest, CommitResponse, HostCommitter};
 use memoryos_retrieve::{RecallRequest, RecallResponse, Retriever};
@@ -24,6 +24,9 @@ const MAX_BLOCK_CHARS: i32 = 100_000;
 const DEFAULT_CANDIDATES: i64 = 10;
 const DEFAULT_QUARANTINE_PAGE: i64 = 50;
 const MAX_QUARANTINE_PAGE: i64 = 200;
+const DEFAULT_FACT_PAGE: i64 = 100;
+const MAX_FACT_PAGE: i64 = 500;
+const MAX_SCOPE_SUMMARIES: usize = 500;
 const DEFAULT_DEPTH: i32 = 1;
 /// Edges one neighbors request may read. A hub entity would otherwise answer with the store's cap
 /// of 5000, each edge carrying its full statement.
@@ -117,6 +120,44 @@ impl Services {
         let fact = self.store.get_fact(&caller.ctx, id).await?;
         caller.require_visible(&fact.scope)?;
         Ok(fact)
+    }
+
+    /// The scopes this key may read, most recently written first, and whether the list was cut.
+    /// Only an admin can list quarantined facts, so only an admin sees how many there are.
+    pub async fn list_scopes(&self, caller: &Caller) -> ApiResult<(Vec<ScopeSummary>, bool)> {
+        let mut scopes = self.pg.scope_summaries(&caller.ctx).await?;
+        scopes.retain(|summary| caller.may_read(&summary.scope));
+        scopes.sort_by_key(|summary| std::cmp::Reverse(summary.last_recorded_at));
+        let truncated = scopes.len() > MAX_SCOPE_SUMMARIES;
+        scopes.truncate(MAX_SCOPE_SUMMARIES);
+        if !caller.key.is_admin {
+            for summary in &mut scopes {
+                summary.quarantined = 0;
+            }
+        }
+        Ok((scopes, truncated))
+    }
+
+    pub async fn list_facts(
+        &self,
+        caller: &Caller,
+        scope: &Scope,
+        state: Option<FactListState>,
+        limit: Option<i64>,
+        before: Option<Uuid>,
+    ) -> ApiResult<Vec<FactView>> {
+        caller.require_scope(scope)?;
+        let limit = limit.unwrap_or(DEFAULT_FACT_PAGE);
+        if !(1..=MAX_FACT_PAGE).contains(&limit) {
+            return Err(ApiError::invalid_input(format!(
+                "limit must be in 1..={MAX_FACT_PAGE}, got {limit}"
+            )));
+        }
+        let state = state.unwrap_or(FactListState::Current);
+        Ok(self
+            .pg
+            .list_facts(&caller.ctx, scope, state, limit, before)
+            .await?)
     }
 
     pub async fn fact_history(&self, caller: &Caller, id: Uuid) -> ApiResult<Vec<Fact>> {

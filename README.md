@@ -69,8 +69,34 @@ memoryos quarantine list --scope user:alice
 memoryos quarantine approve <fact-id>
 ```
 
-Backups, upgrades and incidents are in the [runbook](docs/runbook.md), which still describes the manual
-Compose install.
+Backups, upgrades and incidents are in the [runbook](docs/runbook.md).
+
+## 👀 See your memory
+
+```bash
+memoryos ui
+```
+
+This opens a page in your browser showing what is remembered. It needs no extra install, and it keeps
+running until you press Ctrl+C. Press `/` to ask a question, `1` to `4` to switch views, and `Esc` to
+close a detail panel.
+
+| View | What it answers |
+|---|---|
+| **Facts** | What is known now, grouped by person or thing, and what was replaced |
+| **Map** | How people and things connect. Click one to see only what touches it |
+| **Timeline** | When each fact was true and how it changed |
+| **Review** | What is held back from your agent, with its source, to approve or reject |
+| **Ask** | The facts your agent would get for a question |
+
+![The timeline, with one fact's history and source](docs/images/ui-timeline.png)
+
+![Held-back facts waiting for review](docs/images/ui-review.png)
+
+The page is on your machine only. It never receives an API key: it calls a small local proxy that
+forwards a fixed list of reads plus approve and reject, and it cannot purge, retract or write facts.
+After upgrading from an older install, update the server with
+`docker compose -f ~/.config/memoryos/docker-compose.yml up -d --build`.
 
 ## 🔍 Example
 

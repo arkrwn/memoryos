@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::auth::{generate_token, hash_token, validate_pattern};
 use crate::config::{database_url_from_env, Config};
-use crate::{app, telemetry};
+use crate::{app, telemetry, ui};
 
 const ADMIN_DB_CONNECTIONS: u32 = 2;
 /// Blocking tasks cannot be cancelled, and a stalled model download is one. Past this the process
@@ -40,6 +40,15 @@ pub enum Command {
     /// Manage API keys.
     #[command(subcommand)]
     Key(KeyCommand),
+    /// Open a local page to see and review what is remembered. Keeps running until Ctrl+C.
+    Ui {
+        /// Local port. Falls back to a free one when the default is taken.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Print the address without opening a browser.
+        #[arg(long)]
+        no_open: bool,
+    },
     #[command(flatten)]
     Client(memoryos_hooks::Command),
 }
@@ -78,6 +87,7 @@ pub fn dispatch(cli: Cli) -> Result<(), String> {
             admin,
         }) => block_on(create_key(tenant, name, scopes, max_trust, admin)),
         Command::Key(KeyCommand::Revoke { id }) => block_on(revoke_key(id)),
+        Command::Ui { port, no_open } => block_on(ui::run(port, !no_open)),
         Command::Client(command) => memoryos_hooks::run(command),
     }
 }
@@ -111,7 +121,7 @@ fn serve() -> Result<(), String> {
     result
 }
 
-async fn cancel_on_signal(shutdown: CancellationToken) {
+pub(crate) async fn cancel_on_signal(shutdown: CancellationToken) {
     wait_for_signal().await;
     tracing::info!("shutdown signal received");
     shutdown.cancel();

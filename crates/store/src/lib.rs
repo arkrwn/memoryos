@@ -1,10 +1,14 @@
 //! PostgreSQL implementation of `MemoryStore`. See docs/SPEC.md section 2 for the public API.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
-use memoryos_core::{Error, Fact, RequestContext, Result, Scope, Trust};
+use memoryos_core::{
+    Error, Fact, FactListState, FactView, RequestContext, Result, Scope, ScopeSummary, Trust,
+};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Row, Transaction};
+use uuid::Uuid;
 
 mod facts;
 mod rows;
@@ -66,6 +70,118 @@ impl PgStore {
         let result = found.iter().map(rows::fact).collect::<Result<_>>()?;
         tx.commit().await.map_err(db)?;
         Ok(result)
+    }
+
+    /// Every scope of the tenant with its counts. Scans the tenant's facts, so it is for occasional
+    /// reads and not a hot path.
+    pub async fn scope_summaries(&self, ctx: &RequestContext) -> Result<Vec<ScopeSummary>> {
+        let mut tx = self.tenant_tx(ctx).await?;
+        let filter = rows::visible_now();
+        let sql = format!(
+            "SELECT f.scope, \
+                 count(*) FILTER (WHERE {filter}) AS current, \
+                 count(*) FILTER (WHERE f.status = 'active') AS active, \
+                 count(*) FILTER (WHERE f.status = 'quarantined') AS quarantined, \
+                 max(f.recorded_at) AS last_recorded_at \
+             FROM facts f GROUP BY f.scope"
+        );
+        let facts = sqlx::query(&sql).fetch_all(&mut *tx).await.map_err(db)?;
+        let entities: Vec<(String, i64)> =
+            sqlx::query_as("SELECT scope, count(*) FROM entities GROUP BY scope")
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db)?;
+        let blocks: Vec<(String, i64)> =
+            sqlx::query_as("SELECT 'agent:' || agent_id, count(*) FROM blocks GROUP BY agent_id")
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+
+        fn entry<'a>(
+            all: &'a mut BTreeMap<String, ScopeSummary>,
+            scope: &str,
+        ) -> Result<&'a mut ScopeSummary> {
+            let parsed: Scope = scope.parse()?;
+            Ok(all.entry(scope.to_owned()).or_insert(ScopeSummary {
+                scope: parsed,
+                current: 0,
+                past: 0,
+                quarantined: 0,
+                entities: 0,
+                blocks: 0,
+                last_recorded_at: None,
+            }))
+        }
+        let mut all = BTreeMap::new();
+        for row in &facts {
+            let scope: String = row.try_get("scope").map_err(db)?;
+            let current: i64 = row.try_get("current").map_err(db)?;
+            let active: i64 = row.try_get("active").map_err(db)?;
+            let summary = entry(&mut all, &scope)?;
+            summary.current = current;
+            summary.past = active - current;
+            summary.quarantined = row.try_get("quarantined").map_err(db)?;
+            summary.last_recorded_at = row.try_get("last_recorded_at").map_err(db)?;
+        }
+        for (scope, count) in entities {
+            entry(&mut all, &scope)?.entities = count;
+        }
+        for (scope, count) in blocks {
+            entry(&mut all, &scope)?.blocks = count;
+        }
+        Ok(all.into_values().collect())
+    }
+
+    /// Active facts of one scope, newest recorded first. `before` is the last id of the previous
+    /// page: ids are UUIDv7, so they sort by when the fact was recorded.
+    pub async fn list_facts(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        state: FactListState,
+        limit: i64,
+        before: Option<Uuid>,
+    ) -> Result<Vec<FactView>> {
+        let limit = validate::limit(limit)?;
+        let filter = match state {
+            FactListState::Current => rows::visible_now(),
+            FactListState::Past => {
+                format!("f.status = 'active' AND NOT ({})", rows::visible_now())
+            }
+            FactListState::All => "f.status = 'active'".to_owned(),
+        };
+        let sql = format!(
+            "SELECT {FACT_COLS}, s.name AS subject_name, s.kind AS subject_kind, \
+                 o.name AS object_name, o.kind AS object_kind \
+             FROM facts f \
+             JOIN entities s ON s.id = f.subject_id \
+             LEFT JOIN entities o ON o.id = f.object_id \
+             WHERE f.scope = $1 AND ($2::uuid IS NULL OR f.id < $2) AND {filter} \
+             ORDER BY f.id DESC LIMIT $3"
+        );
+        let mut tx = self.tenant_tx(ctx).await?;
+        let found = sqlx::query(&sql)
+            .bind(scope.to_string())
+            .bind(before)
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db)?;
+        let views = found
+            .iter()
+            .map(|row| {
+                Ok(FactView {
+                    fact: rows::fact(row)?,
+                    subject_name: row.try_get("subject_name").map_err(db)?,
+                    subject_kind: row.try_get("subject_kind").map_err(db)?,
+                    object_name: row.try_get("object_name").map_err(db)?,
+                    object_kind: row.try_get("object_kind").map_err(db)?,
+                })
+            })
+            .collect::<Result<_>>()?;
+        tx.commit().await.map_err(db)?;
+        Ok(views)
     }
 
     /// The highest trust among the scope's facts and episodes, `None` if it holds neither.

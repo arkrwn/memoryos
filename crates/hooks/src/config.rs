@@ -66,6 +66,17 @@ pub fn admin_client(env: Env<'_>, options: Options) -> Result<MemoryOs, String> 
     MemoryOs::new(base_url(env)?, key, options).map_err(|e| e.to_string())
 }
 
+/// For `memoryos ui`: the stored admin key when there is one, so review works, else the agent key.
+/// `MEMORYOS_API_KEY` overrides both.
+pub fn ui_key(env: Env<'_>) -> Result<String, String> {
+    match env("MEMORYOS_API_KEY") {
+        Some(key) => Ok(key),
+        None => credentials::load(env)?
+            .and_then(|stored| stored.admin_key.or(stored.agent_key))
+            .ok_or_else(|| NO_KEY.to_owned()),
+    }
+}
+
 pub fn hook_scopes(env: Env<'_>) -> Result<Vec<Scope>, String> {
     let raw = env("MEMORYOS_HOOK_SCOPES").unwrap_or_else(|| DEFAULT_HOOK_SCOPES.to_owned());
     let scopes = raw

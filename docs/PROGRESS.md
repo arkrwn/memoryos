@@ -24,6 +24,7 @@ actually run. States: `todo`, `doing`, `done`, `blocked`, `removed`.
 | T16 Review fixes | done | Merged; agent reports store, ingest and server suites pass |
 | T17 One-command setup | done | Merged at 1cc275a. Real OpenCode 2.2.5 and Pi 1.4.0 connect with 6 tools. The full first-run model download through `setup` was never seen to completion |
 | T18 Eval without a model | done | Merged at 6467518. Lead run against a real server; see `docs/eval-results.md` |
+| T19 Memory page | done | `memoryos ui`, `GET /v1/scopes`, `GET /v1/facts`. Lead run in a real browser: all views, approve, phone width, light and dark, no console errors. Proxy and endpoint integration tests pass |
 
 ## Production gates (SPEC section 12)
 

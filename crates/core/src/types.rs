@@ -226,6 +226,39 @@ pub struct Fact {
     pub source_episode_ids: Vec<Uuid>,
 }
 
+/// A fact with the names of what it connects, for listing and drawing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactView {
+    #[serde(flatten)]
+    pub fact: Fact,
+    pub subject_name: String,
+    pub subject_kind: String,
+    pub object_name: Option<String>,
+    pub object_kind: Option<String>,
+}
+
+/// Which active facts a listing returns. `Current` is what recall can return now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FactListState {
+    Current,
+    Past,
+    All,
+}
+
+/// What one scope holds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScopeSummary {
+    pub scope: Scope,
+    pub current: i64,
+    /// Active facts that recall does not return now: closed, retracted or starting later.
+    pub past: i64,
+    pub quarantined: i64,
+    pub entities: i64,
+    pub blocks: i64,
+    pub last_recorded_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewEntity {
     pub scope: Scope,

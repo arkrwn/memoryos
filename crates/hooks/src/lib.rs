@@ -150,6 +150,12 @@ pub struct InstallArgs {
 
 /// Returns a message for the caller to print when a command fails. Hook commands always return
 /// `Ok`, having already logged any failure.
+/// The server URL and key `memoryos ui` forwards with.
+pub fn ui_connection() -> Result<(String, String), String> {
+    let env: config::Env<'_> = &config::process_env;
+    Ok((config::base_url(env)?, config::ui_key(env)?))
+}
+
 pub fn run(command: Command) -> Result<(), String> {
     match command {
         Command::Hook(HookCommand::SessionStart) => {
