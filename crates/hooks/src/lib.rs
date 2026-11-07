@@ -13,6 +13,7 @@ mod hook;
 mod install;
 mod mcp;
 mod setup;
+mod stats;
 mod turns;
 
 use std::path::PathBuf;
@@ -65,6 +66,19 @@ pub enum Command {
     Setup(SetupArgs),
     /// Stdio MCP server for an agent, forwarding to the running server with the agent key.
     Mcp,
+    /// Count MemoryOS tool use and prompt cache reads in Claude Code transcripts. Prints counts
+    /// only, never transcript text.
+    Stats {
+        /// Directory of per-project transcript folders. Default: `~/.claude/projects`.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Only transcripts modified in the last N days.
+        #[arg(long, default_value_t = 14)]
+        days: u64,
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -168,6 +182,7 @@ pub fn run(command: Command) -> Result<(), String> {
         }
         Command::Setup(args) => setup::run(&args),
         Command::Mcp => mcp::run(),
+        Command::Stats { dir, days, json } => stats::run(dir.as_deref(), days, json),
         Command::Hook(HookCommand::Install(args)) => install::run_install(&args),
         Command::Hook(HookCommand::Uninstall(args)) => install::run_uninstall(&args),
         Command::Recall {
@@ -270,6 +285,16 @@ mod tests {
         assert!(parse(&["setup", "--agent", "opencode", "--project", "--global"]).is_err());
         assert!(parse(&["setup", "--uninstall"]).is_ok());
         assert!(parse(&["setup", "--uninstall", "--delete-data"]).is_ok());
+    }
+
+    #[test]
+    fn stats_defaults_to_fourteen_days() {
+        let Command::Stats { dir, days, json } = parse(&["stats"]).expect("ok") else {
+            panic!("wrong command");
+        };
+        assert_eq!((dir, days, json), (None, 14, false));
+        assert!(parse(&["stats", "--days", "3", "--dir", "/x", "--json"]).is_ok());
+        assert!(parse(&["stats", "--days", "-1"]).is_err());
     }
 
     #[test]
