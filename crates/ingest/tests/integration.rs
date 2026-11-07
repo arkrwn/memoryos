@@ -16,6 +16,7 @@ use memoryos_core::{
 use memoryos_embed::{vector_for, TestEmbedder};
 use memoryos_ingest::{
     CommitFact, CommitRequest, CommitResponse, CommittedFact, EntityRef, HostCommitter,
+    SingleValued,
 };
 use memoryos_store::PgStore;
 use serde_json::json;
@@ -2025,4 +2026,243 @@ async fn an_expiry_not_after_the_start_is_refused_and_stores_nothing() {
     assert!(message.contains("expires_at"), "{message}");
     assert_eq!(w.count("episodes").await, 0);
     assert_eq!(w.count("facts").await, 0);
+}
+
+// ---- Single-valued predicates ------------------------------------------------------------------
+
+/// Where Ada lives, with the city as the object, as a host would send it.
+fn lives_in(city: &str) -> CommitFact {
+    let mut fact = add_fact(&format!("Ada lives in {city}"), "Ada");
+    fact.predicate = "lives_in".into();
+    fact.object = Some(EntityRef {
+        name: city.into(),
+        kind: "place".into(),
+    });
+    fact
+}
+
+/// Commits one fact under `ctx` as an agent key and returns the response entry and episode.
+async fn commit_fact(
+    host: &HostCommitter,
+    ctx: &RequestContext,
+    scope: &Scope,
+    fact: CommitFact,
+) -> (CommittedFact, Uuid) {
+    let request = commit_request(scope, &format!("source of {}", fact.statement), vec![fact]);
+    let mut response = host
+        .commit(ctx, request, Trust::Agent)
+        .await
+        .expect("commit");
+    (response.facts.remove(0), response.episode_id)
+}
+
+impl World {
+    /// A current `lives_in` fact on Ada at `trust`, stored directly because commits stop at agent.
+    async fn seed_lives_in(&self, scope: &Scope, trust: Trust, city: &str) -> Fact {
+        let statement = format!("Ada lives in {city}");
+        let episode = self
+            .store
+            .insert_episode(
+                &ctx(),
+                NewEpisode {
+                    scope: scope.clone(),
+                    source: "seed".into(),
+                    trust,
+                    content: statement.clone(),
+                    occurred_at: Some(date(2020)),
+                    metadata: json!({}),
+                    idempotency_key: None,
+                },
+            )
+            .await
+            .expect("insert episode");
+        let subject_id = self.seed_entity(scope, "Ada", vector_for("Ada")).await;
+        let ids = self
+            .store
+            .apply_commit(
+                &ctx(),
+                episode.id,
+                vec![FactOp::Add(NewFact {
+                    scope: scope.clone(),
+                    subject_id,
+                    predicate: "lives_in".into(),
+                    object_id: None,
+                    embedding: vector_for(&statement),
+                    statement,
+                    trust,
+                    status: FactStatus::Active,
+                    valid_from: date(2020),
+                    valid_to: None,
+                    expires_at: None,
+                })],
+            )
+            .await
+            .expect("apply");
+        self.store.get_fact(&ctx(), ids[0]).await.expect("fact")
+    }
+
+    async fn is_current(&self, id: Uuid) -> bool {
+        let fact = self.store.get_fact(&ctx(), id).await.expect("fact");
+        fact.status == FactStatus::Active && fact.superseded_by.is_none() && fact.valid_to.is_none()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_value_of_a_single_valued_predicate_closes_the_old_one() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let (old, _) = commit_fact(&w.host, &ctx(), &scope, lives_in("Jakarta")).await;
+    // A multi-valued fact on the same subject is never touched.
+    let (likes, _) = commit_fact(&w.host, &ctx(), &scope, add_fact("Ada likes tea", "Ada")).await;
+
+    let (new, episode) = commit_fact(&w.host, &ctx(), &scope, lives_in("Bandung")).await;
+    assert_eq!(new.status, FactStatus::Active);
+    assert!(!new.corroborated);
+    assert_eq!(new.superseded, Some(old.id));
+    assert!(
+        new.related.iter().all(|r| r.id != old.id),
+        "{:?}",
+        new.related
+    );
+    let closed = w.store.get_fact(&ctx(), old.id).await.expect("old");
+    assert_eq!(closed.superseded_by, Some(new.id));
+    assert!(closed.valid_to.is_some());
+    assert!(w.is_current(new.id).await);
+    assert!(w.is_current(likes.id).await);
+    let now = w.recall_ids(&scope, "Ada lives in", None).await;
+    assert!(now.contains(&new.id) && !now.contains(&old.id), "{now:?}");
+    let history: Vec<Uuid> = w
+        .store
+        .fact_history(&ctx(), new.id)
+        .await
+        .expect("history")
+        .into_iter()
+        .map(|fact| fact.id)
+        .collect();
+    assert_eq!(history, [old.id, new.id]);
+
+    // Purging the commit that closed the old value reopens it, as any supersede purge does.
+    w.store.purge_episode(&ctx(), episode).await.expect("purge");
+    assert!(w.is_current(old.id).await);
+    let reopened = w.store.get_fact(&ctx(), old.id).await.expect("old");
+    assert_eq!(reopened.superseded_by, None);
+
+    // Saying the current value again is a repeat, and closes nothing.
+    let (repeat, _) = commit_fact(&w.host, &ctx(), &scope, lives_in("Jakarta")).await;
+    assert_eq!((repeat.id, repeat.corroborated), (old.id, true));
+    assert_eq!(repeat.superseded, None);
+    assert!(w.is_current(old.id).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_predicate_matches_after_normalizing_to_snake_case() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let mut first = lives_in("Jakarta");
+    first.predicate = "Lives In".into();
+    let (old, _) = commit_fact(&w.host, &ctx(), &scope, first).await;
+    let mut second = lives_in("Bandung");
+    second.predicate = "livesIn".into();
+    let (new, _) = commit_fact(&w.host, &ctx(), &scope, second).await;
+    assert_eq!(new.superseded, Some(old.id));
+    assert!(!w.is_current(old.id).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quarantined_new_value_waits_for_approval_to_close_the_old_one() {
+    let w = world().await;
+    // An agent's commit to a user scope is quarantined whatever it says. The first value is
+    // approved, so the old fact is current at the same trust as the new one.
+    let scope = Scope::user("u1");
+    let (old, _) = commit_fact(&w.host, &ctx(), &scope, lives_in("Jakarta")).await;
+    assert_eq!(
+        (old.status, old.superseded),
+        (FactStatus::Quarantined, None)
+    );
+    w.store
+        .approve_fact(&ctx(), old.id)
+        .await
+        .expect("approve old");
+    let (new, _) = commit_fact(&w.host, &ctx(), &scope, lives_in("Bandung")).await;
+    assert_eq!(new.status, FactStatus::Quarantined);
+    assert_eq!(new.superseded, Some(old.id));
+    let held = w.store.get_fact(&ctx(), new.id).await.expect("new");
+    assert_eq!(held.pending_supersede_of, Some(old.id));
+    assert!(w.is_current(old.id).await);
+
+    w.store.approve_fact(&ctx(), new.id).await.expect("approve");
+    let closed = w.store.get_fact(&ctx(), old.id).await.expect("old");
+    assert_eq!(closed.superseded_by, Some(new.id));
+    assert!(w.is_current(new.id).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_below_the_old_facts_trust_does_not_close_it_and_lists_it() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let old = w.seed_lives_in(&scope, Trust::User, "Jakarta").await;
+    let (new, _) = commit_fact(&w.host, &ctx(), &scope, lives_in("Bandung")).await;
+    assert_eq!(new.superseded, None);
+    assert_eq!(new.related.first().map(|r| r.id), Some(old.id));
+    assert_eq!(new.related[0].statement, "Ada lives in Jakarta");
+    assert!(w.is_current(old.id).await);
+    // The store's subject and predicate rule still holds the lower-trust fact for review.
+    let added = w.store.get_fact(&ctx(), new.id).await.expect("new");
+    assert_eq!(added.pending_supersede_of, None);
+    assert_eq!(new.status, FactStatus::Quarantined);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn another_scope_or_tenant_is_never_touched() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let globex = tenant_ctx("globex");
+    let (other_scope, _) =
+        commit_fact(&w.host, &ctx(), &Scope::agent("a2"), lives_in("Jakarta")).await;
+    let (other_tenant, _) = commit_fact(&w.host, &globex, &scope, lives_in("Jakarta")).await;
+
+    let (mine, _) = commit_fact(&w.host, &ctx(), &scope, lives_in("Bandung")).await;
+    assert_eq!(mine.superseded, None);
+    assert!(w.is_current(other_scope.id).await);
+    let foreign = w
+        .store
+        .get_fact(&globex, other_tenant.id)
+        .await
+        .expect("other tenant");
+    assert_eq!((foreign.superseded_by, foreign.valid_to), (None, None));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expired_value_or_a_turned_off_list_closes_nothing() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let mut leave = lives_in("Jakarta");
+    leave.valid_from = Some(Utc::now() - chrono::Duration::days(10));
+    leave.expires_at = Some(Utc::now() - chrono::Duration::days(1));
+    let (expired, _) = commit_fact(&w.host, &ctx(), &scope, leave).await;
+    let (new, _) = commit_fact(&w.host, &ctx(), &scope, lives_in("Bandung")).await;
+    assert_eq!(new.superseded, None);
+    let untouched = w.store.get_fact(&ctx(), expired.id).await.expect("expired");
+    assert_eq!(untouched.superseded_by, None);
+
+    let off = HostCommitter::new(w.store.clone(), w.embedder.clone())
+        .with_single_valued(SingleValued::parse(","));
+    let (other, _) = commit_fact(&off, &ctx(), &scope, lives_in("Surabaya")).await;
+    assert_eq!(other.superseded, None);
+    assert!(w.is_current(new.id).await);
+    assert!(w.is_current(other.id).await);
+
+    // A configured list replaces the default.
+    let custom = HostCommitter::new(w.store.clone(), w.embedder.clone())
+        .with_single_valued(SingleValued::parse("likes"));
+    let likes = |text: &str| {
+        let mut fact = add_fact(text, "Ada");
+        fact.predicate = "likes".into();
+        fact
+    };
+    let (tea, _) = commit_fact(&custom, &ctx(), &scope, likes("Ada likes tea")).await;
+    let (coffee, _) = commit_fact(&custom, &ctx(), &scope, likes("Ada likes coffee")).await;
+    assert_eq!(coffee.superseded, Some(tea.id));
+    let (medan, _) = commit_fact(&custom, &ctx(), &scope, lives_in("Medan")).await;
+    assert_eq!(medan.superseded, None);
 }

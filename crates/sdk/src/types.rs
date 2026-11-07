@@ -149,6 +149,8 @@ pub struct CommittedFact {
     #[serde(default)]
     pub related: Vec<RelatedFact>,
     /// With `corroborated`: the fact this request superseded, now closed with `id` as successor.
+    /// On a created fact with a single-valued predicate, such as `lives_in`: the current fact it
+    /// replaced, closed now if `status` is active and on approval if quarantined.
     #[serde(default)]
     pub superseded: Option<Uuid>,
 }

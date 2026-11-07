@@ -4,6 +4,8 @@
 use std::fmt;
 use std::time::Duration;
 
+use memoryos_ingest::SingleValued;
+
 #[derive(Clone)]
 pub struct Config {
     pub database_url: String,
@@ -11,6 +13,9 @@ pub struct Config {
     pub db_max_connections: u32,
     pub rate_limit_rps: u32,
     pub request_timeout: Duration,
+    /// `MEMORYOS_SINGLE_VALUED_PREDICATES`, a comma list that replaces the default list. A value
+    /// with no names, such as `,`, turns the rule off.
+    pub single_valued: SingleValued,
     /// `MEMORYOS_TEST_EMBEDDER`, in milliseconds per call: use the test embedder, not the model.
     #[cfg(feature = "test-embedder")]
     pub test_embedder_delay: Option<Duration>,
@@ -46,6 +51,9 @@ impl Config {
                 "MEMORYOS_REQUEST_TIMEOUT_SECS",
                 30,
             )?),
+            single_valued: get("MEMORYOS_SINGLE_VALUED_PREDICATES")
+                .map(|list| SingleValued::parse(&list))
+                .unwrap_or_default(),
             #[cfg(feature = "test-embedder")]
             test_embedder_delay: get("MEMORYOS_TEST_EMBEDDER")
                 .map(|millis| {
@@ -124,6 +132,26 @@ mod tests {
     fn bad_values_name_the_variable() {
         let bad_rate = load(&[DB, ("MEMORYOS_RATE_LIMIT_RPS", "0")]);
         assert!(message(bad_rate).contains("MEMORYOS_RATE_LIMIT_RPS"));
+    }
+
+    #[test]
+    fn single_valued_predicates_default_and_can_be_replaced_or_turned_off() {
+        assert_eq!(
+            load(&[DB]).expect("valid").single_valued,
+            SingleValued::default()
+        );
+        let custom = load(&[
+            DB,
+            ("MEMORYOS_SINGLE_VALUED_PREDICATES", "owns_car, livesIn"),
+        ])
+        .expect("valid")
+        .single_valued;
+        assert_eq!(custom.names().collect::<Vec<_>>(), ["lives_in", "owns_car"]);
+        assert!(!custom.contains("works_at"));
+        let off = load(&[DB, ("MEMORYOS_SINGLE_VALUED_PREDICATES", ",")]).expect("valid");
+        assert_eq!(off.single_valued.names().count(), 0);
+        let blank = load(&[DB, ("MEMORYOS_SINGLE_VALUED_PREDICATES", " ")]).expect("valid");
+        assert_eq!(blank.single_valued, SingleValued::default());
     }
 
     #[cfg(feature = "test-embedder")]

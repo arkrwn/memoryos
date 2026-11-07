@@ -76,14 +76,30 @@ The `memoryos` binary (crate `server`) has these commands: `serve`, `migrate`, `
    closed at its `valid_from` exactly as a supersede closes it. So a second call that supersedes a
    `related` fact of the first does not duplicate the fact the first created. A new fact the trust
    gate would quarantine is still created, since it carries the pending close for approval.
-6. Entity resolution, for the facts that are created: same normalized name or known alias with the
+6. Single-valued predicates. Some predicates hold one value per subject at a time. By default:
+   `lives_in`, `works_at`, `has_nickname`, `has_role`, `prefers_editor`, `uses_database`, `has_name`,
+   `has_email`, `located_in`, `current_version`, `prefers_language`. `MEMORYOS_SINGLE_VALUED_PREDICATES`
+   replaces the list (section 10). Predicates are compared after normalizing to lowercase snake case,
+   so `livesIn`, `Lives In` and `lives-in` are all `lives_in`. A fact that is created, sets neither
+   `supersedes` nor `corroborates`, and has such a predicate is compared with the current facts of
+   its scope with the same subject entity and the same normalized predicate (an expired fact is not
+   current). If the latest of them holds a different value, meaning another object or another
+   statement, the new fact supersedes it through the same path as a declared `supersedes`: the same
+   trust gate, so a fact the gate quarantines records `pending_supersede_of` and approval performs
+   the close, and the same purge, so purging the new fact's episode reopens the old fact. The
+   response reports it as `superseded` on the created fact. If the old fact has higher trust than the
+   commit, it is not closed and is listed first in `related` instead; the store's subject and
+   predicate rule of section 5 then still applies to the new fact. Another scope or tenant is never
+   read.
+7. Entity resolution, for the facts that are created: same normalized name or known alias with the
    same kind uses that entity; otherwise cosine similarity of at least 0.90 with the same kind
    merges. The new name becomes an alias only when this source has an active fact on it.
-7. It builds `FactOp`s, applies the section 5 trust gate, and calls `apply_commit`, which commits
+8. It builds `FactOp`s, applies the section 5 trust gate, and calls `apply_commit`, which commits
    everything and sets `processed_at` atomically. If the episode is already processed that is a no-op,
    so a concurrent replay cannot apply twice. Returns `episode_id` and, per request fact, `id`,
    `status`, `corroborated` when no fact was created, `superseded` with the closed fact's id when a
-   supersede reused an existing fact, and `related` for a created fact. A replay
+   supersede reused an existing fact or a single-valued predicate replaced a current fact, and
+   `related` for a created fact. A replay
    tells a matched fact from a created one by `recorded_at`, which equals `processed_at` only for
    facts the episode created, and returns no `related`. The response also has `redacted`, true when
    a secret was masked (see Rules).
@@ -144,7 +160,7 @@ CLI, using `MEMORYOS_URL` and `MEMORYOS_API_KEY` (any agent without MCP can use 
 - `invalidated_at`: retracted as wrong. Never returned by current or `as_of` reads.
 - `expires_at`: optional, set on commit and never changed, after `valid_from`. For a fact true only
   for a while, such as "on leave until Friday". From then on the fact is not current, without anyone
-  superseding it: recall, candidates and matching of repeats skip it, and
+  superseding it: recall, candidates, matching of repeats and the single-valued check skip it, and
   `supersedes` or `corroborates` naming it is refused. It stays in history and in `state=past`.
 - Superseding sets `old.valid_to = new.valid_from` and `old.superseded_by = new.id`.
 - Out-of-order input: if a new fact's `valid_from` is before the old fact's, it is stored as a
@@ -279,6 +295,7 @@ adds a scope rule. A block update that omits `max_chars` keeps its limit.
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Traces are exported only when set |
 | `MEMORYOS_REQUEST_TIMEOUT_SECS` | `30` | |
 | `MEMORYOS_MODEL_CACHE` | user cache dir | Local model. Leave `HF_HOME` unset, since it overrides this |
+| `MEMORYOS_SINGLE_VALUED_PREDICATES` | the list in section 3, step 6 | Comma list that replaces the default. Names are normalized to lowercase snake case. A value with no names, such as `,`, turns the rule off |
 
 ## 11. Testing rules
 

@@ -169,7 +169,9 @@ fn commit_facts_tool() -> Value {
          fact lists up to three related current facts. Read them, and only if one is an older \
          value of the same thing, send a second call with supersedes set to its id. Set at most \
          one of supersedes and corroborates on a fact, only with an id a tool returned. For a \
-         fact true only for a while, such as on leave until Friday, set expires_at. Facts you \
+         fact true only for a while, such as on leave until Friday, set expires_at. Predicates \
+         that hold one value at a time, such as lives_in or works_at, replace the current value of \
+         the same subject on their own, and the response names it in superseded. Facts you \
          save to user:* or shared:* scopes are quarantined until an admin approves them and do \
          not appear in recall until then, which is expected: do not retry. Facts in your own \
          agent:* scope go active at once. The response gives each fact's id and status."
@@ -437,6 +439,7 @@ mod tests {
         assert!(commit.contains("related"));
         assert!(commit.contains("[redacted]"));
         assert!(commit.contains("expires_at"));
+        assert!(commit.contains("superseded"));
         assert!(description(RECALL_CANDIDATES).contains("when you want to check before saving"));
     }
 

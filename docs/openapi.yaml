@@ -142,7 +142,11 @@ paths:
                             Set with corroborated when the request fact named this id in
                             supersedes and a current fact already held its statement: no fact
                             was created, and id became the successor of the superseded fact.
-                            Omitted otherwise
+                            Also set on a created fact whose predicate is single-valued (such as
+                            lives_in or works_at, see MEMORYOS_SINGLE_VALUED_PREDICATES) to the
+                            current fact of the same subject and predicate that it replaced:
+                            closed now when status is active, and when approved when it is
+                            quarantined. Omitted otherwise, and on an idempotency replay
                         related:
                           type: array
                           maxItems: 3

@@ -1,13 +1,14 @@
 //! Commits (SPEC section 3): the host decides the facts, and MemoryOS validates and gates them.
 
-use std::collections::HashSet;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 use futures::future::try_join_all;
 use memoryos_core::{
-    normalize_name, Embedder, Episode, Error, Fact, FactOp, FactStatus, MemoryStore, NewEpisode,
-    RequestContext, Result, Scope, ScoredFact, Trust,
+    Embedder, Episode, Error, Fact, FactOp, FactStatus, MemoryStore, NewEpisode, RequestContext,
+    Result, Scope, ScoredFact, Trust,
 };
 use memoryos_retrieve::Retriever;
 use serde::{Deserialize, Serialize};
@@ -16,7 +17,8 @@ use uuid::Uuid;
 use crate::entities::{add_earned_aliases, embed_batch, Merge};
 use crate::gate::{build_op, status_for, FactDraft, Resolution, Source};
 use crate::redact::redact;
-use crate::validate::{is_blank_or_unstorable, MAX_CONTENT_CHARS};
+use crate::single::{replaced, NewValue, SingleValued};
+use crate::validate::{is_blank_or_unstorable, normalize_statement, MAX_CONTENT_CHARS};
 
 const MAX_FACTS: usize = 50;
 /// Names and keys are in unique indexes, whose rows PostgreSQL limits to about 2700 bytes. At four
@@ -89,7 +91,10 @@ pub struct CommittedFact {
     pub related: Vec<RelatedFact>,
     /// Set with `corroborated` when the request fact named this id in `supersedes` and the
     /// statement was already a current fact: that fact, `id`, gained this source and became the
-    /// successor of the superseded fact, instead of a duplicate being created.
+    /// successor of the superseded fact, instead of a duplicate being created. Also set on a created
+    /// fact whose predicate is single-valued, to the current fact of the same subject and predicate
+    /// that it replaces: closed now if `status` is active, and on approval if quarantined. Not set
+    /// on a replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded: Option<Uuid>,
 }
@@ -113,6 +118,7 @@ pub struct HostCommitter {
     embedder: Arc<dyn Embedder>,
     /// The search behind `recall_candidates`, used to match statements before they are saved.
     retriever: Retriever,
+    single_valued: SingleValued,
 }
 
 /// What `build_ops` decided for one request.
@@ -121,6 +127,8 @@ struct Built {
     merges: Vec<Merge>,
     /// One list per request fact, in request order.
     related: Vec<Vec<RelatedFact>>,
+    /// Per request fact, the current fact a single-valued predicate made it supersede.
+    replaced: Vec<Option<Uuid>>,
 }
 
 /// The result of comparing one statement with the current facts of its scope.
@@ -139,7 +147,14 @@ impl HostCommitter {
             store,
             embedder,
             retriever,
+            single_valued: SingleValued::default(),
         }
+    }
+
+    /// Replaces the default single-valued predicates. An empty list turns the rule off.
+    pub fn with_single_valued(mut self, single_valued: SingleValued) -> Self {
+        self.single_valued = single_valued;
+        self
     }
 
     /// `max_trust` is the calling key's limit. Commit trust is `external` for an `external` key
@@ -176,7 +191,7 @@ impl HostCommitter {
         require_same_request(&episode, &req, trust)?;
         if episode.processed_at.is_some() {
             return self
-                .response(ctx, &episode, &req, Vec::new(), redacted)
+                .response(ctx, &episode, &req, Vec::new(), Vec::new(), redacted)
                 .await;
         }
 
@@ -195,7 +210,7 @@ impl HostCommitter {
         // below then reports that request's facts, the same as any other replay.
         let inserted = self.store.apply_commit(ctx, episode.id, built.ops).await?;
         add_earned_aliases(self.store.as_ref(), ctx, &episode, built.merges, &inserted).await;
-        self.response(ctx, &episode, &req, built.related, redacted)
+        self.response(ctx, &episode, &req, built.related, built.replaced, redacted)
             .await
     }
 
@@ -205,6 +220,7 @@ impl HostCommitter {
         episode: &Episode,
         req: &CommitRequest,
         related: Vec<Vec<RelatedFact>>,
+        replaced: Vec<Option<Uuid>>,
         redacted: bool,
     ) -> Result<CommitResponse> {
         // The episode was claimed before it was processed, so a fresh commit reads the time again.
@@ -215,7 +231,7 @@ impl HostCommitter {
         let facts = self.store.facts_for_episode(ctx, episode.id).await?;
         Ok(CommitResponse {
             episode_id: episode.id,
-            facts: in_request_order(req, facts, processed_at, related),
+            facts: in_request_order(req, facts, processed_at, related, replaced),
             redacted,
         })
     }
@@ -302,8 +318,12 @@ impl HostCommitter {
         };
         let mut ops = Vec::with_capacity(req.facts.len());
         let mut related = Vec::with_capacity(req.facts.len());
+        let mut replaced_ids = Vec::with_capacity(req.facts.len());
+        // Current facts per subject, read once for the single-valued check.
+        let mut subject_facts: HashMap<Uuid, Vec<Fact>> = HashMap::new();
         let decided = req.facts.iter().zip(targets).zip(embeddings).zip(matches);
-        for (((fact, target), embedding), matched) in decided {
+        for (((fact, target), embedding), mut matched) in decided {
+            let mut replaced_id = None;
             let resolution = if let (Some(fact_id), Some(old)) = (matched.existing, &target) {
                 // Only a supersede has both a target and a match.
                 Resolution::SupersedeWithExisting {
@@ -334,17 +354,79 @@ impl HostCommitter {
                         old_trust: old.trust,
                         draft,
                     },
-                    None => Resolution::Add(draft),
+                    None => match self
+                        .single_valued_target(
+                            ctx,
+                            &req.scope,
+                            fact,
+                            &draft,
+                            &superseded,
+                            &mut subject_facts,
+                        )
+                        .await?
+                    {
+                        // Only a declared supersede may close a fact of higher trust, through a
+                        // review. An inferred one lists that fact first instead, and adds beside it.
+                        Some(old) if old.trust > episode.trust => {
+                            list_first(&mut matched.related, &old);
+                            Resolution::Add(draft)
+                        }
+                        // The same gate and store path as a declared supersede.
+                        Some(old) => {
+                            replaced_id = Some(old.id);
+                            matched.related.retain(|r| r.id != old.id);
+                            Resolution::Supersede {
+                                old_fact_id: old.id,
+                                old_trust: old.trust,
+                                draft,
+                            }
+                        }
+                        None => Resolution::Add(draft),
+                    },
                 }
             };
             ops.push(build_op(&source, resolution));
             related.push(matched.related);
+            replaced_ids.push(replaced_id);
         }
         Ok(Built {
             ops,
             merges: resolved.merges,
             related,
+            replaced: replaced_ids,
         })
+    }
+
+    /// For a fact that names neither `supersedes` nor `corroborates`, is not a repeat and has a
+    /// single-valued predicate: the current fact of its scope, subject and predicate that it
+    /// replaces, if one holds a different value. Reads each subject's current facts once.
+    async fn single_valued_target(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        fact: &CommitFact,
+        draft: &FactDraft,
+        closing: &HashSet<Uuid>,
+        subject_facts: &mut HashMap<Uuid, Vec<Fact>>,
+    ) -> Result<Option<Fact>> {
+        if !self.single_valued.contains(&fact.predicate) {
+            return Ok(None);
+        }
+        let current = match subject_facts.entry(draft.subject_id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(
+                self.store
+                    .current_facts_for_subject(ctx, scope, draft.subject_id)
+                    .await?,
+            ),
+        };
+        let new = NewValue {
+            scope,
+            predicate: &fact.predicate,
+            object_id: draft.object_id,
+            statement: &draft.statement,
+        };
+        Ok(replaced(current, &new, &|id| closing.contains(&id), Utc::now()).cloned())
     }
 
     /// Compares a statement that does not name `corroborates` with the current facts of the
@@ -418,14 +500,26 @@ fn redact_request(req: &mut CommitRequest) -> bool {
     changed
 }
 
-fn mentions(fact: &CommitFact) -> impl Iterator<Item = &EntityRef> {
-    std::iter::once(&fact.subject).chain(&fact.object)
+/// Puts `old` first in `related`, keeping its search score if it was already listed, else 1.
+fn list_first(related: &mut Vec<RelatedFact>, old: &Fact) {
+    let score = related
+        .iter()
+        .find(|r| r.id == old.id)
+        .map_or(1.0, |r| r.score);
+    related.retain(|r| r.id != old.id);
+    related.insert(
+        0,
+        RelatedFact {
+            id: old.id,
+            statement: old.statement.clone(),
+            score,
+        },
+    );
+    related.truncate(MAX_RELATED);
 }
 
-/// Statement identity for automatic corroboration: case-insensitive, whitespace runs collapsed,
-/// trailing periods ignored.
-fn normalize_statement(statement: &str) -> String {
-    normalize_name(statement.trim_end().trim_end_matches('.'))
+fn mentions(fact: &CommitFact) -> impl Iterator<Item = &EntityRef> {
+    std::iter::once(&fact.subject).chain(&fact.object)
 }
 
 /// Splits ranked candidates into the first repeat of `statement` and up to `MAX_RELATED` others.
@@ -558,12 +652,14 @@ fn require_same_request(episode: &Episode, req: &CommitRequest, trust: Trust) ->
 /// supersede matched that way reports the fact it closed as `superseded`. With no `processed_at`
 /// every unnamed fact counts as created. The key check does not compare the fact lists, so a
 /// replay may not match: whatever is left over is appended rather than hidden, and a request fact
-/// with no match is skipped. `related` goes onto created facts by request position.
+/// with no match is skipped. `related` and `replaced` go onto created facts by request position,
+/// `replaced` as `superseded`.
 fn in_request_order(
     req: &CommitRequest,
     facts: Vec<Fact>,
     processed_at: Option<DateTime<Utc>>,
     related: Vec<Vec<RelatedFact>>,
+    replaced: Vec<Option<Uuid>>,
 ) -> Vec<CommittedFact> {
     let named: HashSet<Uuid> = req.facts.iter().filter_map(|f| f.corroborates).collect();
     let as_committed = |fact: &Fact, corroborated: bool, related: Vec<RelatedFact>| CommittedFact {
@@ -579,10 +675,12 @@ fn in_request_order(
         .partition(|fact| processed_at.is_none_or(|at| fact.recorded_at >= at));
     let mut created = created.into_iter();
     let mut related = related.into_iter();
+    let mut replaced = replaced.into_iter();
     let mut linked_reported = HashSet::new();
     let mut ordered = Vec::with_capacity(facts.len());
     for request_fact in &req.facts {
         let fact_related = related.next().unwrap_or_default();
+        let fact_replaced = replaced.next().flatten();
         let wanted = normalize_statement(&request_fact.statement);
         let repeated = linked
             .iter()
@@ -599,9 +697,10 @@ fn in_request_order(
                     ..as_committed(fact, true, Vec::new())
                 })
             }
-            (None, _, _) => created
-                .next()
-                .map(|fact| as_committed(fact, false, fact_related)),
+            (None, _, _) => created.next().map(|fact| CommittedFact {
+                superseded: fact_replaced,
+                ..as_committed(fact, false, fact_related)
+            }),
         };
         ordered.extend(found);
     }
@@ -964,7 +1063,7 @@ mod tests {
             stored(second, FactStatus::Quarantined),
         ];
         assert_eq!(
-            got(&in_request_order(&req, facts, None, Vec::new())),
+            got(&in_request_order(&req, facts, None, Vec::new(), Vec::new())),
             [
                 (first, FactStatus::Active),
                 (linked, FactStatus::Active),
@@ -984,7 +1083,7 @@ mod tests {
             stored(second, FactStatus::Active),
         ];
         assert_eq!(
-            got(&in_request_order(&req, facts, None, Vec::new())),
+            got(&in_request_order(&req, facts, None, Vec::new(), Vec::new())),
             [(first, FactStatus::Active), (second, FactStatus::Active)]
         );
     }
@@ -1089,11 +1188,13 @@ mod tests {
             statement: repeat.statement.clone(),
             score: 0.4,
         }];
+        let replaced = Uuid::now_v7();
         let ordered = in_request_order(
             &req,
             vec![repeat.clone(), created.clone()],
             Some(processed_at),
             vec![related.clone(), Vec::new()],
+            vec![Some(replaced), None],
         );
         assert_eq!(
             got(&ordered),
@@ -1108,5 +1209,10 @@ mod tests {
         );
         assert_eq!(ordered[0].related, related);
         assert!(ordered[1].related.is_empty());
+        // A single-valued replacement is reported on the created fact it belongs to.
+        assert_eq!(
+            (ordered[0].superseded, ordered[1].superseded),
+            (Some(replaced), None)
+        );
     }
 }
