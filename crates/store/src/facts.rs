@@ -59,10 +59,14 @@ pub(crate) async fn apply_ops(
     // deadlocking. Missing rows are reported per op below.
     let referenced: Vec<Uuid> = ops
         .iter()
-        .filter_map(|op| match op {
-            FactOp::Add(_) => None,
-            FactOp::Supersede { old_fact_id, .. } => Some(*old_fact_id),
-            FactOp::Corroborate { fact_id } => Some(*fact_id),
+        .flat_map(|op| match op {
+            FactOp::Add(_) => Vec::new(),
+            FactOp::Supersede { old_fact_id, .. } => vec![*old_fact_id],
+            FactOp::Corroborate { fact_id } => vec![*fact_id],
+            FactOp::SupersedeWithExisting {
+                old_fact_id,
+                fact_id,
+            } => vec![*old_fact_id, *fact_id],
         })
         .collect();
     if !referenced.is_empty() {
@@ -114,9 +118,61 @@ pub(crate) async fn apply_ops(
                 require_fact_in_scope(conn, *fact_id, &episode.scope).await?;
                 link_source(conn, ctx, *fact_id, episode.id).await?;
             }
+            FactOp::SupersedeWithExisting {
+                old_fact_id,
+                fact_id,
+            } => supersede_with_existing(conn, ctx, episode, *old_fact_id, *fact_id).await?,
         }
     }
     Ok(inserted)
+}
+
+/// Closes `old_id` with the current fact `existing_id` as its successor, as a `Supersede` whose new
+/// fact already exists, and links the episode to `existing_id`. The rules of an active `Supersede`
+/// hold: an episode whose facts must be quarantined cannot close anything this way, and neither can
+/// one of lower trust than `old_id`. Those cases need the quarantined new fact that records
+/// `pending_supersede_of`, so the caller sends a `Supersede` for them. If another commit has since
+/// given the chain a head of higher trust, the chain is left alone, as nothing reviewed allows
+/// closing that head and the existing fact cannot be quarantined in its place.
+async fn supersede_with_existing(
+    conn: &mut PgConnection,
+    ctx: &RequestContext,
+    episode: &LockedEpisode,
+    old_id: Uuid,
+    existing_id: Uuid,
+) -> Result<()> {
+    require_fact_in_scope(conn, old_id, &episode.scope).await?;
+    require_fact_in_scope(conn, existing_id, &episode.scope).await?;
+    if old_id == existing_id {
+        return Err(Error::InvalidInput(format!(
+            "fact {old_id} cannot supersede itself"
+        )));
+    }
+    if source_requires_quarantine(&episode.scope, episode.trust) {
+        return Err(Error::InvalidInput(format!(
+            "{} facts in this scope must be quarantined",
+            episode.trust.as_str()
+        )));
+    }
+    let row = sqlx::query(
+        "SELECT valid_from FROM facts WHERE id = $1 AND status = 'active' \
+         AND superseded_by IS NULL AND invalidated_at IS NULL",
+    )
+    .bind(existing_id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(db)?
+    .ok_or_else(|| Error::InvalidInput(format!("fact {existing_id} is not current")))?;
+    let valid_from: DateTime<Utc> = row.try_get("valid_from").map_err(db)?;
+    link_source(conn, ctx, existing_id, episode.id).await?;
+    let settled =
+        settle_supersede(conn, existing_id, episode.trust, valid_from, old_id, None).await?;
+    match settled {
+        Settled::Outranked { head } if head == old_id => Err(Error::InvalidInput(format!(
+            "fact {old_id} has higher trust than this source"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// SPEC section 5: a fact that does not declare a contradiction still gets reviewed when a current
@@ -308,6 +364,10 @@ pub(crate) async fn settle_supersede(
         {
             current = next;
             continue;
+        }
+        // Only an existing fact can already be in the chain: it was closed into it, or follows it.
+        if current == new_id {
+            return Ok(Settled::Done);
         }
         let status: String = row.try_get("status").map_err(db)?;
         let invalidated: bool = row.try_get("invalidated").map_err(db)?;

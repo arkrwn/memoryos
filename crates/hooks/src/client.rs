@@ -344,6 +344,9 @@ mod tests {
             facts: vec![CommittedFact {
                 id: Uuid::nil(),
                 status: FactStatus::Quarantined,
+                corroborated: false,
+                related: Vec::new(),
+                superseded: None,
             }],
         };
         assert!(commit_text(&response).contains("quarantined"));

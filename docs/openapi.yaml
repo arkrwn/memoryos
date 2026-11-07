@@ -126,9 +126,17 @@ paths:
                           default: false
                           description: >-
                             No fact was created. id is an existing current fact that gained this
-                            source, named by corroborates or matched because a fact that sets
-                            neither supersedes nor corroborates has the same statement, ignoring
-                            case, whitespace runs and a final period. Omitted when false
+                            source, named by corroborates or matched because a fact that does
+                            not set corroborates has the same statement, ignoring case,
+                            whitespace runs and a final period. Omitted when false
+                        superseded:
+                          type: string
+                          format: uuid
+                          description: >-
+                            Set with corroborated when the request fact named this id in
+                            supersedes and a current fact already held its statement: no fact
+                            was created, and id became the successor of the superseded fact.
+                            Omitted otherwise
                         related:
                           type: array
                           maxItems: 3

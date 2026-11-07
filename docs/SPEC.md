@@ -69,13 +69,20 @@ The `memoryos` binary (crate `server`) has these commands: `serve`, `migrate`, `
    created, and the existing fact gains this source. Only current, active facts of that one scope and
    tenant can match, so a quarantined fact or another scope's fact never does, and a fact that this
    request supersedes is skipped. A fact that is created gets up to 3 other candidates as `related`.
+   A fact that sets `supersedes` is matched the same way, without `related`. If a current fact other
+   than the superseded one already has its statement and the new fact would be active, no fact is
+   created: that fact gains this source and becomes the successor of the superseded fact, which is
+   closed at its `valid_from` exactly as a supersede closes it. So a second call that supersedes a
+   `related` fact of the first does not duplicate the fact the first created. A new fact the trust
+   gate would quarantine is still created, since it carries the pending close for approval.
 6. Entity resolution, for the facts that are created: same normalized name or known alias with the
    same kind uses that entity; otherwise cosine similarity of at least 0.90 with the same kind
    merges. The new name becomes an alias only when this source has an active fact on it.
 7. It builds `FactOp`s, applies the section 5 trust gate, and calls `apply_commit`, which commits
    everything and sets `processed_at` atomically. If the episode is already processed that is a no-op,
    so a concurrent replay cannot apply twice. Returns `episode_id` and, per request fact, `id`,
-   `status`, `corroborated` when no fact was created, and `related` for a created fact. A replay
+   `status`, `corroborated` when no fact was created, `superseded` with the closed fact's id when a
+   supersede reused an existing fact, and `related` for a created fact. A replay
    tells a matched fact from a created one by `recorded_at`, which equals `processed_at` only for
    facts the episode created, and returns no `related`.
 

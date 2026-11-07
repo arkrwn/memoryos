@@ -291,6 +291,10 @@ pub enum FactOp {
     Supersede { old_fact_id: Uuid, new: NewFact },
     /// The episode restates an existing fact: only link the episode as another source.
     Corroborate { fact_id: Uuid },
+    /// The episode replaces `old_fact_id` with a statement that the current fact `fact_id` already
+    /// holds: link the episode to `fact_id`, and close `old_fact_id` as a supersede by `fact_id`
+    /// would, at `fact_id`'s `valid_from`. Only for an episode whose new fact would be active.
+    SupersedeWithExisting { old_fact_id: Uuid, fact_id: Uuid },
 }
 
 /// Time and visibility filter for fact reads.
