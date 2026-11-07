@@ -31,3 +31,11 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 unwrap_used = "warn"
+
+# Proc macros and build scripts are loaded as dylibs at build time. On macOS 27 a stripped one fails
+# to load ("mis-aligned LINKEDIT string pool"), and release builds strip by default.
+[profile.release.build-override]
+strip = "none"
+
+[profile.dev.build-override]
+strip = "none"
