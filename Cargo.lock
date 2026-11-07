@@ -1919,6 +1919,7 @@ dependencies = [
  "clap",
  "getrandom 0.3.4",
  "memoryos-sdk",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
