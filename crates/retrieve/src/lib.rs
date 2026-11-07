@@ -28,6 +28,17 @@ const MAX_GRAPH_CANDIDATES: usize = 50;
 /// A slow embedder must not hold up recall, since text search can answer without it.
 const DEFAULT_EMBED_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// What a ranking is for, which sets its time filter and how the fused list is finished.
+#[derive(Debug, Clone, Copy)]
+enum Purpose<'a> {
+    /// Facts at the requested time. Source count nudges the order and near copies give way to
+    /// distinct facts.
+    Recall(&'a FactFilter),
+    /// Current facts related to a statement. Plain fusion, because finding near copies of the
+    /// statement is the point.
+    Candidates,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecallRequest {
@@ -85,8 +96,8 @@ impl Retriever {
                 &req.scopes,
                 &req.query,
                 embedding.as_deref(),
-                &filter,
                 limit,
+                Purpose::Recall(&filter),
             )
             .await?;
         Ok(RecallResponse { facts })
@@ -107,8 +118,8 @@ impl Retriever {
             scopes,
             statement,
             embedding.as_deref(),
-            &FactFilter::default(),
             limit,
+            Purpose::Candidates,
         )
         .await
     }
@@ -129,8 +140,8 @@ impl Retriever {
             scopes,
             statement,
             Some(embedding),
-            &FactFilter::default(),
             limit,
+            Purpose::Candidates,
         )
         .await
     }
@@ -141,9 +152,14 @@ impl Retriever {
         scopes: &[Scope],
         query: &str,
         embedding: Option<&[f32]>,
-        filter: &FactFilter,
         limit: usize,
+        purpose: Purpose<'_>,
     ) -> Result<Vec<ScoredFact>> {
+        let current = FactFilter::default();
+        let filter = match purpose {
+            Purpose::Recall(filter) => filter,
+            Purpose::Candidates => &current,
+        };
         let (vector, text) = tokio::join!(
             self.vector_list(ctx, scopes, embedding, filter),
             self.store
@@ -156,7 +172,12 @@ impl Retriever {
         let subjects = fusion::top_subjects(&fusion::fuse(&[&vector, &text]), GRAPH_SEED_FACTS);
         let graph = self.graph_list(ctx, scopes, &subjects, filter).await;
 
-        Ok(fusion::fuse(&[&vector, &text, &graph])
+        let fused = fusion::fuse(&[&vector, &text, &graph]);
+        let ranked = match purpose {
+            Purpose::Recall(_) => fusion::without_near_copies(fusion::boost_by_sources(fused)),
+            Purpose::Candidates => fused,
+        };
+        Ok(ranked
             .into_iter()
             .take(limit)
             .map(|(fact, score)| ScoredFact {

@@ -473,8 +473,13 @@ async fn graph_candidates_are_capped_at_50() {
     let ops = (0..120)
         .map(|i| {
             let degrees = 121.0 - i as f32;
-            let statement = if i == 119 { "a zebra" } else { "hub edge" };
-            FactOp::Add(new_fact(&f.scope, hub, statement, degrees))
+            // Distinct statements, so recall does not fold them together as near copies.
+            let statement = if i == 119 {
+                "a zebra".to_owned()
+            } else {
+                format!("hub edge {i}")
+            };
+            FactOp::Add(new_fact(&f.scope, hub, &statement, degrees))
         })
         .collect();
     let inserted = f.apply_in(&f.ctx, &f.scope, Trust::User, ops).await;
@@ -507,12 +512,73 @@ async fn each_fact_appears_once_ordered_by_score() {
     let f = fixture().await;
     let subject = f.entity("a").await;
     for i in 0..8 {
-        f.add(subject, "a zebra was seen", i as f32).await;
+        f.add(subject, &format!("a zebra was seen {i}"), i as f32)
+            .await;
     }
     let facts = f.recall(QUERY).await.facts;
     assert_eq!(facts.len(), 8);
     assert_eq!(ids(&facts).len(), 8);
     assert!(facts.windows(2).all(|pair| pair[0].score >= pair[1].score));
+}
+
+#[tokio::test]
+async fn corroborated_facts_outrank_an_equal_single_source_fact() {
+    let f = fixture().await;
+    let (a, b, c) = (
+        f.entity("a").await,
+        f.entity("b").await,
+        f.entity("c").await,
+    );
+    // Close to the query and to each other, with no words in common with it. The single source
+    // fact is nearest, so plain fusion would put it first.
+    let single = f.add(a, "first close statement", 1.0).await;
+    let twice = f.add(b, "second close statement", 1.1).await;
+    let thrice = f.add(c, "third close statement", 1.2).await;
+    for fact_id in [twice, thrice, thrice] {
+        let op = FactOp::Corroborate { fact_id };
+        f.apply_in(&f.ctx, &f.scope, Trust::User, vec![op]).await;
+    }
+
+    let scopes = [f.scope.clone()];
+    let plain = f
+        .retriever
+        .candidates(&f.ctx, &scopes, QUERY, 10)
+        .await
+        .expect("candidates");
+    let plain: Vec<Uuid> = plain.iter().map(|scored| scored.fact.id).collect();
+    assert_eq!(plain, [single, twice, thrice]);
+
+    let facts = f.recall(QUERY).await.facts;
+    let order: Vec<Uuid> = facts.iter().map(|scored| scored.fact.id).collect();
+    assert_eq!(order, [thrice, twice, single]);
+    assert_eq!(facts[1].fact.source_episode_ids.len(), 2);
+    assert_eq!(facts[0].fact.source_episode_ids.len(), 3);
+    // Vector rank 1 and graph rank 1, unboosted.
+    assert_eq!(score_of(&facts, single), 2.0 / 61.0);
+}
+
+#[tokio::test]
+async fn near_copies_do_not_both_appear_in_recall_but_do_in_candidates() {
+    let f = fixture().await;
+    let subject = f.entity("a").await;
+    let first = f.add(subject, "The zebra was seen.", 1.0).await;
+    let copy = f.add(subject, "the zebra  was SEEN", 1.1).await;
+    let distinct = f.add(subject, "a zebra ran away", 1.2).await;
+
+    let facts = f.recall(QUERY).await.facts;
+    let found = ids(&facts);
+    assert!(found.contains(&first));
+    assert!(!found.contains(&copy));
+    assert!(found.contains(&distinct));
+    assert_eq!(facts.len(), 2);
+
+    let scopes = [f.scope.clone()];
+    let candidates = f
+        .retriever
+        .candidates(&f.ctx, &scopes, QUERY, 10)
+        .await
+        .expect("candidates");
+    assert_eq!(ids(&candidates), BTreeSet::from([first, copy, distinct]));
 }
 
 // ---- Time ------------------------------------------------------------------------------------
@@ -876,7 +942,10 @@ async fn limit_defaults_to_10_and_truncates() {
     let f = fixture().await;
     let subject = f.entity("a").await;
     let ops = (0..120)
-        .map(|i| FactOp::Add(new_fact(&f.scope, subject, "a zebra", i as f32 / 10.0)))
+        .map(|i| {
+            let statement = format!("a zebra {i}");
+            FactOp::Add(new_fact(&f.scope, subject, &statement, i as f32 / 10.0))
+        })
         .collect();
     f.apply_in(&f.ctx, &f.scope, Trust::User, ops).await;
 

@@ -202,8 +202,19 @@ AND (invalidated_at IS NULL OR invalidated_at > K)
 2. Run vector and text fact searches concurrently, 50 candidates each, using the section 4 filter.
 3. Graph expansion: take the subjects of the top 5 fused facts and add facts from `neighbors` at
    depth 1 as a third ranked list.
-4. Reciprocal rank fusion with `k = 60`: `score = sum(1 / (60 + rank))`. Return the top `limit`
-   (default 10, max 100).
+4. Reciprocal rank fusion with `k = 60`: `score = sum(1 / (60 + rank))`.
+5. Source count: multiply each score by `1 + 0.02 * extra`, where `extra` is the fact's source
+   episodes past the first, capped at 3 (at most 6%). That is about four ranks near the top of a
+   list, and below the 10.9% gap between the best fact found by one list (`1 / 61`) and the worst
+   found by two (`2 / 110`), so corroboration breaks ties and nudges but never lifts a fact found by
+   one list over a fact found by two.
+6. Near copies: walking down the ranking, drop a fact with the same subject, predicate and object as
+   a higher ranked one and the same statement once lowercased and reduced to its letter and digit
+   words, so the next distinct fact takes the slot. Candidate lists carry no embeddings, so the test
+   is textual and needs no extra read. Return the top `limit` (default 10, max 100).
+
+`Retriever::candidates` (and `/v1/candidates`, `recall_candidates`, commit matching) runs steps 1 to
+4 only: no source boost, and near copies are kept, since finding them is its job.
 
 ## 8. Blocks
 
