@@ -86,9 +86,24 @@ policy with no inline scripts.
 
 CLI, using `MEMORYOS_URL` and `MEMORYOS_API_KEY` (any agent without MCP can use these):
 `memoryos recall`, `candidates`, `commit`, `quarantine list|approve|reject`, and
-`memoryos hook session-start|stop|install --agent claude-code|opencode`, as shown in `README.md`.
+`memoryos hook session-start|prompt|stop|install --agent claude-code|opencode|pi`, as shown in
+`README.md`. The hooks recall from `MEMORYOS_HOOK_SCOPES` (default `agent:coding-agent`).
+- `hook session-start` recalls with the working folder's name and with a fixed query about the user,
+  merges both by fact id, and adds the memory blocks of each `agent:<id>` hook scope. All of it is
+  printed inside one data-labelled block with stored text escaped, under 9,000 characters. With a
+  `session_id` it resets that session's shown-ids state file to the ids it printed.
+- `hook prompt` (Claude Code `UserPromptSubmit`) recalls up to 5 facts with the prompt as the query,
+  skipping prompts under 3 words, and prints only facts whose ids the session has not shown, adding
+  them to the state file. When the prompt matches a fixed list of phrases (such as "my ", "I'm",
+  "call me", "we decided", "remember"), it adds one line after the block asking the agent to save
+  the fact now with `commit_facts`. It prints nothing when there is nothing new.
 - `hook stop` reads the host's JSON from stdin, prints nothing when `stop_hook_active` is true, and
-  otherwise prints the block decision once every 10 turns, counted per `session_id` in a state file.
+  otherwise prints the block decision once every 20 turns (`MEMORYOS_HOOK_STOP_EVERY`), counted per
+  `session_id` in a state file. It is a fallback to the prompt hook's nudge.
+- `memoryos mcp` fills an omitted `scopes` argument of `recall`, `recall_candidates` and
+  `graph_neighbors` with every hook scope, and an omitted `scope` of `commit_facts` with the first
+  one, and its `tools/list` reply marks those fields optional and names the defaults. It never
+  changes a value the model sent.
 - Hook commands never fail the host: on any error they log to stderr and exit 0 with no output.
 - `hook install` merges into existing settings, keeps other entries, is idempotent, and also
   registers the MCP server. The API key stays in an environment variable reference, never in the file.

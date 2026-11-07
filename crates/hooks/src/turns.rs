@@ -1,11 +1,14 @@
-//! Per-session turn counts for `hook stop`. Each session has its own small file, written atomically,
+//! Per-session state for the hooks: turn counts for `hook stop`, and the fact ids already shown by
+//! `hook session-start` and `hook prompt`. Each session has its own small files, written atomically,
 //! so concurrent sessions never share a file and a reader never sees a partial one.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::files::write_atomic;
 
@@ -24,12 +27,53 @@ pub fn count_turn(dir: &Path, session_id: &str) -> Result<u64, String> {
     Ok(count)
 }
 
+/// The fact ids already shown in this session. A missing or unreadable file means none.
+pub fn seen(dir: &Path, session_id: &str) -> HashSet<Uuid> {
+    fs::read_to_string(seen_file(dir, session_id))
+        .map(|text| {
+            text.lines()
+                .filter_map(|line| line.trim().parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Replaces the session's shown ids with `ids`. Session start calls it, so a new or cleared session
+/// starts from what it printed.
+pub fn reset_seen(dir: &Path, session_id: &str, ids: &[Uuid]) -> Result<(), String> {
+    write_seen(dir, session_id, ids)
+}
+
+/// Adds `ids` to the session's shown ids.
+pub fn add_seen(dir: &Path, session_id: &str, ids: &[Uuid]) -> Result<(), String> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let mut all: Vec<Uuid> = seen(dir, session_id).into_iter().collect();
+    all.extend(ids.iter().copied());
+    all.sort_unstable();
+    all.dedup();
+    write_seen(dir, session_id, &all)
+}
+
+fn write_seen(dir: &Path, session_id: &str, ids: &[Uuid]) -> Result<(), String> {
+    let text: String = ids.iter().map(|id| format!("{id}\n")).collect();
+    write_atomic(&seen_file(dir, session_id), text.as_bytes(), None)
+}
+
 /// The session id comes from the host's JSON, so it is hashed rather than used as a file name: a
 /// value like `../../x` must not reach outside the state directory.
 fn state_file(dir: &Path, session_id: &str) -> PathBuf {
+    dir.join(format!("{}.turns", hashed(session_id)))
+}
+
+fn seen_file(dir: &Path, session_id: &str) -> PathBuf {
+    dir.join(format!("{}.seen", hashed(session_id)))
+}
+
+fn hashed(session_id: &str) -> String {
     let digest = Sha256::digest(session_id.as_bytes());
-    let name: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    dir.join(format!("{name}.turns"))
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Removes files older than [`MAX_AGE`], including temporary files left by a killed process. Best
@@ -118,6 +162,29 @@ mod tests {
         assert!(!state_file(dir.path(), "old").exists());
         assert!(!stale_temp.exists());
         assert!(state_file(dir.path(), "new").exists());
+    }
+
+    #[test]
+    fn seen_ids_are_reset_added_and_kept_per_session() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (a, b, c) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        assert!(seen(dir.path(), "s").is_empty(), "nothing before a start");
+        reset_seen(dir.path(), "s", &[a]).expect("reset");
+        add_seen(dir.path(), "s", &[b, a]).expect("add");
+        assert_eq!(seen(dir.path(), "s"), HashSet::from([a, b]));
+        assert!(seen(dir.path(), "other").is_empty());
+        reset_seen(dir.path(), "s", &[c]).expect("reset");
+        assert_eq!(seen(dir.path(), "s"), HashSet::from([c]));
+        reset_seen(dir.path(), "s", &[]).expect("reset");
+        assert!(seen(dir.path(), "s").is_empty());
+    }
+
+    #[test]
+    fn a_corrupt_seen_file_keeps_its_valid_ids() {
+        let dir = tempfile::tempdir().expect("dir");
+        let id = Uuid::now_v7();
+        fs::write(seen_file(dir.path(), "s"), format!("junk\n{id}\n")).expect("seed");
+        assert_eq!(seen(dir.path(), "s"), HashSet::from([id]));
     }
 
     #[test]

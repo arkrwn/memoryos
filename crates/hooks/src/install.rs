@@ -16,8 +16,10 @@ use crate::InstallArgs;
 
 const SERVER_NAME: &str = "memoryos";
 const SESSION_START_EVENT: &str = "SessionStart";
+const PROMPT_EVENT: &str = "UserPromptSubmit";
 const STOP_EVENT: &str = "Stop";
 const SESSION_START_COMMAND: &str = "memoryos hook session-start";
+const PROMPT_COMMAND: &str = "memoryos hook prompt";
 const STOP_COMMAND: &str = "memoryos hook stop";
 const SESSION_START_MATCHER: &str = "startup|resume|clear|compact";
 /// Every matcher an install has written, so uninstall also removes what older installs left.
@@ -433,8 +435,14 @@ fn install_claude_hooks(existing: Option<&str>) -> Result<Outcome, String> {
         SESSION_START_COMMAND,
         &mut notes,
     )?;
+    let added_prompt = add_hook(hooks, PROMPT_EVENT, None, PROMPT_COMMAND, &mut notes)?;
     let added_stop = add_hook(hooks, STOP_EVENT, None, STOP_COMMAND, &mut notes)?;
-    Ok(finish(&root, added_start || added_stop, false, notes))
+    Ok(finish(
+        &root,
+        added_start || added_prompt || added_stop,
+        false,
+        notes,
+    ))
 }
 
 fn add_hook(
@@ -495,6 +503,7 @@ fn uninstall_claude_hooks(existing: Option<&str>) -> Result<Outcome, String> {
             SESSION_START_COMMAND,
             &mut notes,
         );
+        changed |= remove_hook(hooks, PROMPT_EVENT, &[], PROMPT_COMMAND, &mut notes);
         changed |= remove_hook(hooks, STOP_EVENT, &[], STOP_COMMAND, &mut notes);
         if changed && hooks.is_empty_container() {
             root.remove_key("hooks");
@@ -852,6 +861,10 @@ mod tests {
         json!({"hooks": [{"type": "command", "command": "memoryos hook stop"}]})
     }
 
+    fn prompt_group() -> Value {
+        json!({"hooks": [{"type": "command", "command": "memoryos hook prompt"}]})
+    }
+
     // ---- Claude hooks ----
 
     #[test]
@@ -859,7 +872,46 @@ mod tests {
         let text = written(install_claude_hooks(None).expect("install"));
         assert_eq!(
             value(&text),
-            json!({"hooks": {"SessionStart": [start_group()], "Stop": [stop_group()]}})
+            json!({"hooks": {
+                "SessionStart": [start_group()],
+                "UserPromptSubmit": [prompt_group()],
+                "Stop": [stop_group()],
+            }})
+        );
+    }
+
+    #[test]
+    fn the_prompt_hook_is_added_to_an_install_that_lacks_it() {
+        let old = json!({"hooks": {
+            "SessionStart": [start_group()],
+            "Stop": [stop_group()],
+        }})
+        .to_string();
+        let outcome = install_claude_hooks(Some(&old)).expect("install");
+        assert!(outcome
+            .notes
+            .contains(&"added UserPromptSubmit hook".to_owned()));
+        let merged = value(&written(outcome));
+        assert_eq!(merged["hooks"]["UserPromptSubmit"], json!([prompt_group()]));
+        assert_eq!(merged["hooks"]["Stop"], json!([stop_group()]));
+    }
+
+    #[test]
+    fn uninstall_removes_the_prompt_hook_and_keeps_a_foreign_one() {
+        let shape = json!({"hooks": {"UserPromptSubmit": [
+            {"hooks": [{"type": "command", "command": "foreign"}]},
+            prompt_group(),
+        ]}})
+        .to_string();
+        let outcome = uninstall_claude_hooks(Some(&shape)).expect("uninstall");
+        assert!(outcome
+            .notes
+            .contains(&"removed UserPromptSubmit hook".to_owned()));
+        assert_eq!(
+            value(&written(outcome)),
+            json!({"hooks": {"UserPromptSubmit": [
+                {"hooks": [{"type": "command", "command": "foreign"}]},
+            ]}})
         );
     }
 
@@ -895,6 +947,10 @@ mod tests {
             assert!(start.contains(&start_group()), "{shape}");
             let stop = merged["hooks"]["Stop"].as_array().expect("array");
             assert!(stop.contains(&stop_group()), "{shape}");
+            let prompt = merged["hooks"]["UserPromptSubmit"]
+                .as_array()
+                .expect("array");
+            assert!(prompt.contains(&prompt_group()), "{shape}");
         }
     }
 
@@ -918,7 +974,7 @@ mod tests {
         let first = written(install_claude_hooks(Some(r#"{"a":1}"#)).expect("first"));
         let second = install_claude_hooks(Some(&first)).expect("second");
         assert_eq!(second.after, After::Unchanged);
-        assert_eq!(second.notes.len(), 2);
+        assert_eq!(second.notes.len(), 3);
     }
 
     #[test]

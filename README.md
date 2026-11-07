@@ -163,11 +163,30 @@ save, and they cannot bypass validation or quarantine. `memoryos setup` installs
 
 ```mermaid
 flowchart LR
-    A[Session start] -->|hook: load memories| B[During work]
-    B -->|recall_candidates, commit_facts| B
-    B --> C[Before stop]
-    C -->|hook: reminder to save| D[Done]
+    A[Session start] -->|hook: load memories| B[Each prompt]
+    B -->|hook: related memories, save nudge| C[During work]
+    C -->|recall_candidates, commit_facts| C
+    C --> B
+    C --> D[Before stop]
+    D -->|hook: fallback reminder to save| E[Done]
 ```
+
+| Hook | What it does |
+|---|---|
+| `memoryos hook session-start` | Recalls with the folder name and with a fixed query about the user (name, nickname, preferences, how they work), merges the two, and prints the agent's memory blocks for each `agent:<id>` hook scope. Output stays under 9,000 characters. |
+| `memoryos hook prompt` | Recalls up to 5 facts with the prompt as the query, and prints only those this session has not shown yet. Prompts under 3 words skip recall. When the prompt looks like the user stating a fact ("my ", "I'm", "call me", "we decided", "remember", ...), it adds one line asking the agent to save it now. Prints nothing when there is nothing new. |
+| `memoryos hook stop` | A fallback: once every 20 turns per session, asks the agent to save what it learned. |
+
+Facts and blocks are printed inside a `<memoryos-memories>` block labelled as data, with stored text
+escaped so it cannot close the block. The fact ids already shown are kept per session in
+`~/.local/state/memoryos/hook-turns`, reset at each session start; files idle for 7 days are removed.
+
+`MEMORYOS_HOOK_SCOPES` (default `agent:coding-agent`) names the scopes the hooks recall from, and
+`MEMORYOS_HOOK_STOP_EVERY` (default 20) the stop interval. `memoryos mcp` also uses the hook scopes as
+defaults: when the model omits `scopes` in `recall`, `recall_candidates` or `graph_neighbors`, or `scope`
+in `commit_facts`, the proxy fills in every hook scope, or the first one for `commit_facts`. Its
+`tools/list` marks those fields optional and names the defaults. A value the model sends is never
+changed.
 
 Without hooks, memory still works, but saving depends on the agent choosing to do it. A hook may
 not run if the agent crashes or is killed, so agents should also save during work.
@@ -182,8 +201,13 @@ not run if the agent crashes or is killed, so agents should also save during wor
   "hooks": {
     "SessionStart": [
       {
-        "matcher": "startup|resume|compact",
+        "matcher": "startup|resume|clear|compact",
         "hooks": [{ "type": "command", "command": "memoryos hook session-start" }]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [{ "type": "command", "command": "memoryos hook prompt" }]
       }
     ],
     "Stop": [
@@ -204,9 +228,9 @@ When a save is due, `memoryos hook stop` prints:
 }
 ```
 
-`Stop` fires at the end of every turn, so the command limits itself to once every 10 turns per
-session. `SessionEnd` cannot be used for this, because it has no decision control and cannot make the
-agent act.
+`Stop` fires at the end of every turn, so the command limits itself to once every 20 turns per
+session. The prompt hook's nudge is the main save prompt; this is the fallback. `SessionEnd` cannot be
+used for this, because it has no decision control and cannot make the agent act.
 
 </details>
 
