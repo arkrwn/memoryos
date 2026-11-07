@@ -47,6 +47,9 @@ pub struct CommitFact {
     pub object: Option<EntityRef>,
     #[serde(default)]
     pub valid_from: Option<DateTime<Utc>>,
+    /// When the fact stops being true with nothing replacing it. After `valid_from`.
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub supersedes: Option<Uuid>,
     #[serde(default)]
@@ -323,6 +326,7 @@ impl HostCommitter {
                     statement: fact.statement.clone(),
                     embedding,
                     valid_from: fact.valid_from.unwrap_or(episode.occurred_at),
+                    expires_at: fact.expires_at,
                 };
                 match target {
                     Some(old) => Resolution::Supersede {
@@ -433,6 +437,7 @@ fn pick(
 ) -> Matched {
     let wanted = normalize_statement(statement);
     let mut matched = Matched::default();
+    let now = Utc::now();
     for ScoredFact { fact, score } in found {
         // The search reads only current, active facts of `scope`. Checked again because a wrong
         // match would link this source to a fact the caller must not reach.
@@ -440,6 +445,7 @@ fn pick(
             && fact.status == FactStatus::Active
             && fact.superseded_by.is_none()
             && fact.invalidated_at.is_none()
+            && !fact.expired_at(now)
             && !superseded.contains(&fact.id);
         if !eligible {
             continue;
@@ -477,12 +483,21 @@ fn validate_request(req: &CommitRequest) -> Result<()> {
         non_empty("idempotency_key", key)?;
         at_most("idempotency_key", key, MAX_INDEXED_CHARS)?;
     }
-    let latest_valid_from = Utc::now() + Duration::days(MAX_FUTURE_VALID_FROM_DAYS);
+    let now = Utc::now();
+    let latest_valid_from = now + Duration::days(MAX_FUTURE_VALID_FROM_DAYS);
     for fact in &req.facts {
         if fact.valid_from.is_some_and(|from| from > latest_valid_from) {
             return Err(Error::InvalidInput(format!(
                 "valid_from is more than {MAX_FUTURE_VALID_FROM_DAYS} day in the future"
             )));
+        }
+        // An omitted valid_from becomes the time the episode is stored, which is about now.
+        if let Some(expires_at) = fact.expires_at {
+            if expires_at <= fact.valid_from.unwrap_or(now) {
+                return Err(Error::InvalidInput(
+                    "expires_at must be after valid_from".into(),
+                ));
+            }
         }
         non_empty("statement", &fact.statement)?;
         non_empty("predicate", &fact.predicate)?;
@@ -617,6 +632,7 @@ mod tests {
             predicate: "p".into(),
             object: None,
             valid_from: None,
+            expires_at: None,
             supersedes: None,
             corroborates: None,
         }
@@ -738,6 +754,29 @@ mod tests {
             validate_request(&at(Duration::hours(25))),
             Err(Error::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn refuses_expiry_not_after_the_start() {
+        let at = |valid_from: Option<DateTime<Utc>>, expires_at: DateTime<Utc>| {
+            let mut one = fact();
+            one.valid_from = valid_from;
+            one.expires_at = Some(expires_at);
+            request(vec![one])
+        };
+        let start = Utc::now() - Duration::days(10);
+        assert!(validate_request(&at(Some(start), start + Duration::days(1))).is_ok());
+        assert!(validate_request(&at(None, Utc::now() + Duration::hours(1))).is_ok());
+        for bad in [
+            at(Some(start), start),
+            at(Some(start), start - Duration::days(1)),
+            at(None, Utc::now() - Duration::hours(1)),
+        ] {
+            assert!(matches!(
+                validate_request(&bad),
+                Err(Error::InvalidInput(_))
+            ));
+        }
     }
 
     #[test]
@@ -898,6 +937,7 @@ mod tests {
             status,
             valid_from: Utc::now(),
             valid_to: None,
+            expires_at: None,
             recorded_at: Utc::now(),
             invalidated_at: None,
             superseded_by: None,
@@ -1007,9 +1047,11 @@ mod tests {
     }
 
     #[test]
-    fn pick_never_matches_another_scope_a_quarantined_or_a_closing_fact() {
+    fn pick_never_matches_another_scope_an_expired_a_quarantined_or_a_closing_fact() {
         let scope = Scope::user("u");
         let other_scope = scored(&Scope::user("v"), "Ada likes tea", 0.9);
+        let mut expired = scored(&scope, "Ada likes tea", 0.85);
+        expired.fact.expires_at = Some(Utc::now() - Duration::minutes(1));
         let mut quarantined = scored(&scope, "Ada likes tea", 0.8);
         quarantined.fact.status = FactStatus::Quarantined;
         let mut superseded = scored(&scope, "Ada likes tea", 0.7);
@@ -1018,7 +1060,14 @@ mod tests {
         invalidated.fact.invalidated_at = Some(Utc::now());
         let closing = scored(&scope, "Ada likes tea", 0.6);
         let closing_id = closing.fact.id;
-        let found = vec![other_scope, quarantined, superseded, invalidated, closing];
+        let found = vec![
+            other_scope,
+            expired,
+            quarantined,
+            superseded,
+            invalidated,
+            closing,
+        ];
         let matched = pick(&scope, "Ada likes tea", found, &HashSet::from([closing_id]));
         assert_eq!(matched, Matched::default());
     }

@@ -129,6 +129,7 @@ function factStatus(fact) {
   if (fact.valid_to && new Date(fact.valid_to).getTime() <= now) {
     return { key: "past", label: fact.superseded_by ? "Replaced" : "Ended", kind: "past" };
   }
+  if (fact.expires_at && new Date(fact.expires_at).getTime() <= now) return { key: "past", label: "Expired", kind: "past" };
   return { key: "current", label: "True now", kind: "current" };
 }
 
@@ -896,6 +897,7 @@ function renderFactDrawer({ fact, history, sources }) {
       h("dt", {}, "About"), h("dd", {}, humanize(fact.predicate)),
       h("dt", {}, "True from"), h("dd", {}, date(fact.valid_from)),
       h("dt", {}, "True until"), h("dd", {}, fact.valid_to ? date(fact.valid_to) : status.key === "current" ? "Still true" : "Not set"),
+      fact.expires_at && [h("dt", {}, "Expires"), h("dd", {}, date(fact.expires_at))],
       h("dt", {}, "Learned"), h("dd", {}, `${date(fact.recorded_at)} (${ago(fact.recorded_at)})`),
       fact.invalidated_at && [h("dt", {}, "Retracted"), h("dd", {}, date(fact.invalidated_at))],
       h("dt", {}, "Trust"), h("dd", {}, trust[0], h("div", { class: "help" }, trust[1])),

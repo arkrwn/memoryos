@@ -545,6 +545,7 @@ pub async fn seed_fact(
         status: FactStatus::Active,
         valid_from: episode.occurred_at,
         valid_to: None,
+        expires_at: None,
     };
     let op = match supersedes {
         Some(old_fact_id) => FactOp::Supersede { old_fact_id, new },

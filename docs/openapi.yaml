@@ -497,6 +497,13 @@ components:
               predicate: { type: string }
               object: { oneOf: [{ $ref: "#/components/schemas/EntityRef" }, { type: "null" }] }
               valid_from: { type: [string, "null"], format: date-time }
+              expires_at:
+                type: [string, "null"]
+                format: date-time
+                description: >-
+                  When the fact stops being true with nothing replacing it, such as the end of a
+                  leave. Must be after valid_from. From then on it is not current: recall,
+                  candidates and matching skip it, and it stays in history and in state=past
               supersedes: { type: [string, "null"], format: uuid }
               corroborates: { type: [string, "null"], format: uuid }
     Episode:
@@ -535,6 +542,10 @@ components:
         status: { type: string, enum: [active, quarantined, rejected] }
         valid_from: { type: string, format: date-time }
         valid_to: { type: [string, "null"], format: date-time }
+        expires_at:
+          type: [string, "null"]
+          format: date-time
+          description: The commit's own end of the fact. The fact is not current from this time
         recorded_at: { type: string, format: date-time }
         invalidated_at: { type: [string, "null"], format: date-time }
         superseded_by: { type: [string, "null"], format: uuid }

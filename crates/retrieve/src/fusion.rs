@@ -120,6 +120,7 @@ mod tests {
             status: FactStatus::Active,
             valid_from: Utc::now(),
             valid_to: None,
+            expires_at: None,
             recorded_at: Utc::now(),
             invalidated_at: None,
             superseded_by: None,

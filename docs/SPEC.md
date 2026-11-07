@@ -57,7 +57,8 @@ The `memoryos` binary (crate `server`) has these commands: `serve`, `migrate`, `
    It ranks like `Retriever::recall`, at the present time. A host that only saves can skip it.
 2. `POST /v1/commits` sends `{scope, source, content, facts[]}`. Each fact has
    `statement`, `subject {name, kind}`, `predicate`, optional `object {name, kind}`, optional
-   `valid_from`, and at most one of `supersedes` and `corroborates`. Maximum 50 facts.
+   `valid_from`, optional `expires_at` (section 4), and at most one of `supersedes` and
+   `corroborates`. Maximum 50 facts.
 3. `HostCommitter` stores `content` through `insert_episode` as the source of the facts. Replaying an
    `idempotency_key` returns the existing episode and its facts; a key reused for a different scope,
    source, content or trust returns 400 `invalid_input` and reveals nothing about the first request.
@@ -141,6 +142,10 @@ CLI, using `MEMORYOS_URL` and `MEMORYOS_API_KEY` (any agent without MCP can use 
 - `valid_from` / `valid_to`: when the fact was true. Default `valid_from` is `occurred_at`.
 - `recorded_at`: when MemoryOS learned it.
 - `invalidated_at`: retracted as wrong. Never returned by current or `as_of` reads.
+- `expires_at`: optional, set on commit and never changed, after `valid_from`. For a fact true only
+  for a while, such as "on leave until Friday". From then on the fact is not current, without anyone
+  superseding it: recall, candidates and matching of repeats skip it, and
+  `supersedes` or `corroborates` naming it is refused. It stays in history and in `state=past`.
 - Superseding sets `old.valid_to = new.valid_from` and `old.superseded_by = new.id`.
 - Out-of-order input: if a new fact's `valid_from` is before the old fact's, it is stored as a
   closed historical fact, with `valid_to` the start of the earliest later live fact in that chain, and
@@ -151,6 +156,7 @@ Fact visible at valid time T (default now) and knowledge time K (default now):
 ```
 status = 'active'
 AND valid_from <= T AND (valid_to IS NULL OR valid_to > T)
+AND (expires_at IS NULL OR expires_at > T)
 AND recorded_at <= K
 AND (invalidated_at IS NULL OR invalidated_at > K)
 ```

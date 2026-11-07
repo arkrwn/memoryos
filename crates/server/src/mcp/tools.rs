@@ -144,6 +144,7 @@ fn commit_facts_tool() -> Value {
             "predicate": {"type": "string", "description": "Short relation in snake_case, such as lives_in or prefers."},
             "object": entity_schema("The other entity, when the statement links two. Omit otherwise."),
             "valid_from": {"type": "string", "format": "date-time", "description": "When this became true, if the conversation says. Omit to use now."},
+            "expires_at": {"type": "string", "format": "date-time", "description": "When this stops being true on its own, for a fact that holds only for a while, such as on leave until Friday or blocked until the release. After this time it no longer appears in recall but stays in history. Must be after valid_from. Omit for a fact with no known end."},
             "supersedes": {"type": "string", "format": "uuid", "description": "Id of a current fact, from related or recall_candidates, that this statement replaces. It stays in history and stops being current."},
             "corroborates": {"type": "string", "format": "uuid", "description": "Id of a current fact that this statement repeats in other words. No new fact is created. Exact repeats need no id."},
         },
@@ -167,7 +168,8 @@ fn commit_facts_tool() -> Value {
          is created and the response marks it corroborated with the existing id. Each created \
          fact lists up to three related current facts. Read them, and only if one is an older \
          value of the same thing, send a second call with supersedes set to its id. Set at most \
-         one of supersedes and corroborates on a fact, only with an id a tool returned. Facts you \
+         one of supersedes and corroborates on a fact, only with an id a tool returned. For a \
+         fact true only for a while, such as on leave until Friday, set expires_at. Facts you \
          save to user:* or shared:* scopes are quarantined until an admin approves them and do \
          not appear in recall until then, which is expected: do not retry. Facts in your own \
          agent:* scope go active at once. The response gives each fact's id and status."
@@ -434,6 +436,7 @@ mod tests {
         assert!(commit.contains("matched automatically"));
         assert!(commit.contains("related"));
         assert!(commit.contains("[redacted]"));
+        assert!(commit.contains("expires_at"));
         assert!(description(RECALL_CANDIDATES).contains("when you want to check before saving"));
     }
 

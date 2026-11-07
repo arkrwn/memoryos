@@ -482,6 +482,7 @@ mod tests {
                 status: FactStatus::Active,
                 valid_from: now,
                 valid_to: None,
+                expires_at: None,
                 recorded_at: now,
                 invalidated_at: None,
                 superseded_by: None,

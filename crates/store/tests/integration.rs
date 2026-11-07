@@ -234,6 +234,7 @@ fn new_fact(scope: &Scope, subject_id: Uuid, statement: &str, from: DateTime<Utc
         status: FactStatus::Active,
         valid_from: from,
         valid_to: None,
+        expires_at: None,
     }
 }
 

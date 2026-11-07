@@ -277,6 +277,7 @@ impl World {
                     status: FactStatus::Active,
                     valid_from: date(2020),
                     valid_to: None,
+                    expires_at: None,
                 })],
             )
             .await
@@ -303,6 +304,7 @@ fn add_fact(text: &str, subject: &str) -> CommitFact {
         predicate: "fact_about".into(),
         object: None,
         valid_from: None,
+        expires_at: None,
         supersedes: None,
         corroborates: None,
     }
@@ -888,6 +890,7 @@ async fn a_current_target_is_accepted_on_a_subject_with_many_facts() {
                 status: FactStatus::Active,
                 valid_from: date(2020),
                 valid_to: None,
+                expires_at: None,
             })
         })
         .collect();
@@ -1843,4 +1846,183 @@ async fn purging_the_reused_facts_source_first_keeps_the_close_until_call_two_go
     w.store.purge_episode(&ctx(), second).await.expect("purge");
     assert_current_alone(&w, old).await;
     assert_eq!(w.count("facts").await, 1);
+}
+
+// ---- Expiry ------------------------------------------------------------------------------------
+
+/// A fact on Ada that started ten days ago and ends at `expires_at`.
+fn expiring_fact(text: &str, expires_at: DateTime<Utc>) -> CommitFact {
+    let mut fact = add_fact(text, "Ada");
+    fact.valid_from = Some(Utc::now() - chrono::Duration::days(10));
+    fact.expires_at = Some(expires_at);
+    fact
+}
+
+async fn recalled(w: &World, scope: &Scope, query: &str) -> Vec<Uuid> {
+    let retriever = memoryos_retrieve::Retriever::new(w.store.clone(), w.embedder.clone());
+    let request = memoryos_retrieve::RecallRequest {
+        scopes: vec![scope.clone()],
+        query: query.into(),
+        limit: 20,
+        as_of: None,
+        known_at: None,
+    };
+    retriever
+        .recall(&ctx(), request)
+        .await
+        .expect("recall")
+        .facts
+        .into_iter()
+        .map(|scored| scored.fact.id)
+        .collect()
+}
+
+async fn text_hits(w: &World, scope: &Scope, query: &str) -> Vec<Uuid> {
+    w.store
+        .search_facts_text(
+            &ctx(),
+            std::slice::from_ref(scope),
+            query,
+            &FactFilter::default(),
+            20,
+        )
+        .await
+        .expect("text search")
+        .into_iter()
+        .map(|scored| scored.fact.id)
+        .collect()
+}
+
+async fn listed(w: &World, scope: &Scope, state: memoryos_core::FactListState) -> Vec<Uuid> {
+    w.store
+        .list_facts(&ctx(), scope, state, 50, None)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|view| view.fact.id)
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expired_fact_leaves_recall_but_stays_in_history() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let response = w
+        .host
+        .commit(
+            &ctx(),
+            commit_request(
+                &scope,
+                "Ada was on leave, and is reviewing until next week",
+                vec![
+                    expiring_fact("Ada is on leave", Utc::now() - chrono::Duration::days(1)),
+                    expiring_fact(
+                        "Ada is reviewing the parser",
+                        Utc::now() + chrono::Duration::days(7),
+                    ),
+                ],
+            ),
+            Trust::Agent,
+        )
+        .await
+        .expect("commit");
+    let (expired, future) = (response.facts[0].id, response.facts[1].id);
+    let stored = w.store.get_fact(&ctx(), expired).await.expect("expired");
+    assert!(stored.expires_at.is_some());
+    assert_eq!((stored.valid_to, stored.superseded_by), (None, None));
+
+    // Neither vector nor text search, nor recall, returns the expired fact. The other one is current.
+    for ids in [
+        w.recall_ids(&scope, "Ada is on leave", None).await,
+        text_hits(&w, &scope, "Ada").await,
+        recalled(&w, &scope, "Ada is on leave").await,
+    ] {
+        assert!(!ids.contains(&expired), "{ids:?}");
+        assert!(ids.contains(&future), "{ids:?}");
+    }
+    // Asked about a time before it expired, it is there.
+    let then = Utc::now() - chrono::Duration::days(5);
+    assert!(w
+        .recall_ids(&scope, "Ada is on leave", Some(then))
+        .await
+        .contains(&expired));
+
+    // History and the past listing keep it.
+    let history = w
+        .store
+        .fact_history(&ctx(), expired)
+        .await
+        .expect("history");
+    assert_eq!(
+        history.iter().map(|fact| fact.id).collect::<Vec<_>>(),
+        [expired]
+    );
+    use memoryos_core::FactListState::{Current, Past};
+    assert_eq!(listed(&w, &scope, Past).await, [expired]);
+    assert_eq!(listed(&w, &scope, Current).await, [future]);
+
+    // Not current: no repeat matches it, and no supersede or corroborate may name it.
+    let again = commit_as(&w, &ctx(), &scope, "Ada is on leave", "Ada").await;
+    assert!(!again.corroborated);
+    assert_ne!(again.id, expired);
+    assert!(again.related.iter().all(|related| related.id != expired));
+    let mut corroborating = add_fact("Ada is away", "Ada");
+    corroborating.corroborates = Some(expired);
+    for named in [
+        supersede_request(&scope, "back", "Ada is back", expired),
+        commit_request(&scope, "away", vec![corroborating]),
+    ] {
+        let message = is_invalid(w.host.commit(&ctx(), named, Trust::Agent).await);
+        assert!(message.contains("not current"), "{message}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fact_drops_out_of_recall_when_its_expiry_passes() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let mut fact = add_fact("Ada is in a meeting", "Ada");
+    fact.expires_at = Some(Utc::now() + chrono::Duration::seconds(2));
+    let response = w
+        .host
+        .commit(
+            &ctx(),
+            commit_request(&scope, "meeting", vec![fact]),
+            Trust::Agent,
+        )
+        .await
+        .expect("commit");
+    let id = response.facts[0].id;
+    assert_eq!(response.facts[0].status, FactStatus::Active);
+    assert!(recalled(&w, &scope, "Ada is in a meeting")
+        .await
+        .contains(&id));
+
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(!recalled(&w, &scope, "Ada is in a meeting")
+        .await
+        .contains(&id));
+    let fact = w.store.get_fact(&ctx(), id).await.expect("fact");
+    assert_eq!((fact.valid_to, fact.superseded_by), (None, None));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expiry_not_after_the_start_is_refused_and_stores_nothing() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let mut fact = add_fact("Ada was away", "Ada");
+    fact.valid_from = Some(date(2024));
+    fact.expires_at = Some(date(2023));
+    let message = is_invalid(
+        w.host
+            .commit(
+                &ctx(),
+                commit_request(&scope, "away", vec![fact]),
+                Trust::Agent,
+            )
+            .await,
+    );
+    assert!(message.contains("expires_at"), "{message}");
+    assert_eq!(w.count("episodes").await, 0);
+    assert_eq!(w.count("facts").await, 0);
 }

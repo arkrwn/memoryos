@@ -164,7 +164,8 @@ async fn supersede_with_existing(
     }
     let row = sqlx::query(
         "SELECT valid_from FROM facts WHERE id = $1 AND status = 'active' \
-         AND superseded_by IS NULL AND invalidated_at IS NULL",
+         AND superseded_by IS NULL AND invalidated_at IS NULL \
+         AND (expires_at IS NULL OR expires_at > now())",
     )
     .bind(existing_id)
     .fetch_optional(&mut *conn)
@@ -272,6 +273,11 @@ async fn insert_fact(
     if new.valid_to.is_some_and(|to| to < new.valid_from) {
         return Err(Error::InvalidInput("valid_to is before valid_from".into()));
     }
+    if new.expires_at.is_some_and(|at| at <= new.valid_from) {
+        return Err(Error::InvalidInput(
+            "expires_at must be after valid_from".into(),
+        ));
+    }
     require_entity_in_scope(conn, new.subject_id, &episode.scope).await?;
     if let Some(object_id) = new.object_id {
         require_entity_in_scope(conn, object_id, &episode.scope).await?;
@@ -280,8 +286,8 @@ async fn insert_fact(
     let id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO facts (id, tenant, scope, subject_id, predicate, object_id, statement, \
-         embedding, trust, status, valid_from, valid_to, pending_supersede_of) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+         embedding, trust, status, valid_from, valid_to, pending_supersede_of, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
     )
     .bind(id)
     .bind(&ctx.tenant)
@@ -296,6 +302,7 @@ async fn insert_fact(
     .bind(new.valid_from)
     .bind(new.valid_to)
     .bind(pending_supersede_of)
+    .bind(new.expires_at)
     .execute(&mut *conn)
     .await
     .map_err(db)?;

@@ -18,6 +18,7 @@ pub(crate) struct FactDraft {
     pub(crate) statement: String,
     pub(crate) embedding: Vec<f32>,
     pub(crate) valid_from: DateTime<Utc>,
+    pub(crate) expires_at: Option<DateTime<Utc>>,
 }
 
 /// What a statement does to existing memory, after validation against the candidates.
@@ -87,6 +88,7 @@ fn new_fact(source: &Source<'_>, draft: FactDraft, contradicted: Option<Trust>) 
         status: status_for(source.scope, source.trust, contradicted),
         valid_from: draft.valid_from,
         valid_to: None,
+        expires_at: draft.expires_at,
     }
 }
 
@@ -111,6 +113,7 @@ mod tests {
             statement: "s".into(),
             embedding: vec![1.0],
             valid_from: Utc::now(),
+            expires_at: None,
         }
     }
 
