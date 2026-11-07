@@ -71,7 +71,7 @@ fn seen_file(dir: &Path, session_id: &str) -> PathBuf {
     dir.join(format!("{}.seen", hashed(session_id)))
 }
 
-fn hashed(session_id: &str) -> String {
+pub(crate) fn hashed(session_id: &str) -> String {
     let digest = Sha256::digest(session_id.as_bytes());
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }

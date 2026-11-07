@@ -18,9 +18,13 @@ const SERVER_NAME: &str = "memoryos";
 const SESSION_START_EVENT: &str = "SessionStart";
 const PROMPT_EVENT: &str = "UserPromptSubmit";
 const STOP_EVENT: &str = "Stop";
+const SESSION_END_EVENT: &str = "SessionEnd";
+const PRE_COMPACT_EVENT: &str = "PreCompact";
 const SESSION_START_COMMAND: &str = "memoryos hook session-start";
 const PROMPT_COMMAND: &str = "memoryos hook prompt";
 const STOP_COMMAND: &str = "memoryos hook stop";
+const SESSION_END_COMMAND: &str = "memoryos hook session-end";
+const PRE_COMPACT_COMMAND: &str = "memoryos hook pre-compact";
 const SESSION_START_MATCHER: &str = "startup|resume|clear|compact";
 /// Every matcher an install has written, so uninstall also removes what older installs left.
 const SESSION_START_MATCHERS: &[&str] = &[SESSION_START_MATCHER, "startup|resume|compact"];
@@ -437,9 +441,23 @@ fn install_claude_hooks(existing: Option<&str>) -> Result<Outcome, String> {
     )?;
     let added_prompt = add_hook(hooks, PROMPT_EVENT, None, PROMPT_COMMAND, &mut notes)?;
     let added_stop = add_hook(hooks, STOP_EVENT, None, STOP_COMMAND, &mut notes)?;
+    let added_end = add_hook(
+        hooks,
+        SESSION_END_EVENT,
+        None,
+        SESSION_END_COMMAND,
+        &mut notes,
+    )?;
+    let added_compact = add_hook(
+        hooks,
+        PRE_COMPACT_EVENT,
+        None,
+        PRE_COMPACT_COMMAND,
+        &mut notes,
+    )?;
     Ok(finish(
         &root,
-        added_start || added_prompt || added_stop,
+        added_start || added_prompt || added_stop || added_end || added_compact,
         false,
         notes,
     ))
@@ -505,6 +523,20 @@ fn uninstall_claude_hooks(existing: Option<&str>) -> Result<Outcome, String> {
         );
         changed |= remove_hook(hooks, PROMPT_EVENT, &[], PROMPT_COMMAND, &mut notes);
         changed |= remove_hook(hooks, STOP_EVENT, &[], STOP_COMMAND, &mut notes);
+        changed |= remove_hook(
+            hooks,
+            SESSION_END_EVENT,
+            &[],
+            SESSION_END_COMMAND,
+            &mut notes,
+        );
+        changed |= remove_hook(
+            hooks,
+            PRE_COMPACT_EVENT,
+            &[],
+            PRE_COMPACT_COMMAND,
+            &mut notes,
+        );
         if changed && hooks.is_empty_container() {
             root.remove_key("hooks");
         }
@@ -865,6 +897,14 @@ mod tests {
         json!({"hooks": [{"type": "command", "command": "memoryos hook prompt"}]})
     }
 
+    fn end_group() -> Value {
+        json!({"hooks": [{"type": "command", "command": "memoryos hook session-end"}]})
+    }
+
+    fn compact_group() -> Value {
+        json!({"hooks": [{"type": "command", "command": "memoryos hook pre-compact"}]})
+    }
+
     // ---- Claude hooks ----
 
     #[test]
@@ -876,7 +916,44 @@ mod tests {
                 "SessionStart": [start_group()],
                 "UserPromptSubmit": [prompt_group()],
                 "Stop": [stop_group()],
+                "SessionEnd": [end_group()],
+                "PreCompact": [compact_group()],
             }})
+        );
+    }
+
+    #[test]
+    fn the_capture_hooks_are_added_to_an_install_that_lacks_them_and_removed() {
+        let old = json!({"hooks": {
+            "SessionStart": [start_group()],
+            "UserPromptSubmit": [prompt_group()],
+            "Stop": [stop_group()],
+            "SessionEnd": [{"hooks": [{"type": "command", "command": "foreign"}]}],
+        }})
+        .to_string();
+        let outcome = install_claude_hooks(Some(&old)).expect("install");
+        for note in ["added SessionEnd hook", "added PreCompact hook"] {
+            assert!(outcome.notes.contains(&note.to_owned()), "{note}");
+        }
+        let merged = written(outcome);
+        assert_eq!(
+            value(&merged)["hooks"]["SessionEnd"],
+            json!([{"hooks": [{"type": "command", "command": "foreign"}]}, end_group()])
+        );
+        assert_eq!(
+            value(&merged)["hooks"]["PreCompact"],
+            json!([compact_group()])
+        );
+
+        let outcome = uninstall_claude_hooks(Some(&merged)).expect("uninstall");
+        for note in ["removed SessionEnd hook", "removed PreCompact hook"] {
+            assert!(outcome.notes.contains(&note.to_owned()), "{note}");
+        }
+        assert_eq!(
+            value(&written(outcome)),
+            json!({"hooks": {"SessionEnd": [
+                {"hooks": [{"type": "command", "command": "foreign"}]},
+            ]}})
         );
     }
 
@@ -951,6 +1028,10 @@ mod tests {
                 .as_array()
                 .expect("array");
             assert!(prompt.contains(&prompt_group()), "{shape}");
+            let end = merged["hooks"]["SessionEnd"].as_array().expect("array");
+            assert!(end.contains(&end_group()), "{shape}");
+            let compact = merged["hooks"]["PreCompact"].as_array().expect("array");
+            assert!(compact.contains(&compact_group()), "{shape}");
         }
     }
 
@@ -974,7 +1055,7 @@ mod tests {
         let first = written(install_claude_hooks(Some(r#"{"a":1}"#)).expect("first"));
         let second = install_claude_hooks(Some(&first)).expect("second");
         assert_eq!(second.after, After::Unchanged);
-        assert_eq!(second.notes.len(), 3);
+        assert_eq!(second.notes.len(), 5);
     }
 
     #[test]
@@ -1761,7 +1842,13 @@ mod tests {
             .map(String::as_str)
             .collect();
         events.sort_unstable();
-        let mut expected = vec![SESSION_START_EVENT, PROMPT_EVENT, STOP_EVENT];
+        let mut expected = vec![
+            SESSION_START_EVENT,
+            PROMPT_EVENT,
+            STOP_EVENT,
+            SESSION_END_EVENT,
+            PRE_COMPACT_EVENT,
+        ];
         expected.sort_unstable();
         assert_eq!(events, expected);
         assert_eq!(
@@ -1779,12 +1866,18 @@ mod tests {
             plugin_hooks(&hooks, PROMPT_EVENT),
             [(None, vec![PROMPT_COMMAND.to_owned()])]
         );
+        assert_eq!(
+            plugin_hooks(&hooks, SESSION_END_EVENT),
+            [(None, vec![SESSION_END_COMMAND.to_owned()])]
+        );
+        assert_eq!(
+            plugin_hooks(&hooks, PRE_COMPACT_EVENT),
+            [(None, vec![PRE_COMPACT_COMMAND.to_owned()])]
+        );
 
         // The plugin registers exactly what `install` writes into settings.json.
         let installed = value(&written(install_claude_hooks(None).expect("install")));
-        for event in [SESSION_START_EVENT, STOP_EVENT] {
-            assert_eq!(installed["hooks"][event], hooks["hooks"][event], "{event}");
-        }
+        assert_eq!(installed["hooks"], hooks["hooks"]);
     }
 
     #[test]

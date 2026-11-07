@@ -4,6 +4,7 @@
 //!
 //! The server binary flattens [`Command`] into its own command line and calls [`run`].
 
+mod capture;
 mod client;
 mod config;
 mod credentials;
@@ -144,6 +145,11 @@ pub enum HookCommand {
     Prompt,
     /// Periodically ask the host to save durable facts. Never fails the host.
     Stop,
+    /// At session end, keep the user's typed prompts locally when the session saved nothing, for
+    /// the next session start to show. Never fails the host.
+    SessionEnd,
+    /// The same as `session-end`, before the host compacts the conversation. Never fails the host.
+    PreCompact,
     /// Add the hooks and the MCP server to an agent's configuration.
     Install(InstallArgs),
     /// Remove what `hook install` added.
@@ -185,6 +191,10 @@ pub fn run(command: Command) -> Result<(), String> {
         }
         Command::Hook(HookCommand::Stop) => {
             hook::run_stop();
+            Ok(())
+        }
+        Command::Hook(HookCommand::SessionEnd | HookCommand::PreCompact) => {
+            hook::run_capture();
             Ok(())
         }
         Command::Setup(args) => setup::run(&args),
@@ -282,6 +292,18 @@ mod tests {
         assert!(parse(&["hook", "uninstall", "--agent", "opencode", "--dry-run"]).is_ok());
         assert!(parse(&["hook", "install", "--agent", "pi"]).is_ok());
         assert!(parse(&["hook", "install", "--agent", "other"]).is_err());
+    }
+
+    #[test]
+    fn the_capture_hooks_have_their_host_event_names() {
+        assert!(matches!(
+            parse(&["hook", "session-end"]),
+            Ok(Command::Hook(HookCommand::SessionEnd))
+        ));
+        assert!(matches!(
+            parse(&["hook", "pre-compact"]),
+            Ok(Command::Hook(HookCommand::PreCompact))
+        ));
     }
 
     #[test]

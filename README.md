@@ -169,6 +169,7 @@ flowchart LR
     C --> B
     C --> D[Before stop]
     D -->|hook: fallback reminder to save| E[Done]
+    E -->|hook: keep unsaved prompts on disk| A
 ```
 
 | Hook | What it does |
@@ -176,10 +177,23 @@ flowchart LR
 | `memoryos hook session-start` | Recalls with the folder name and with a fixed query about the user (name, nickname, preferences, how they work), merges the two, and prints the agent's memory blocks for each `agent:<id>` hook scope. Output stays under 9,000 characters. |
 | `memoryos hook prompt` | Recalls up to 5 facts with the prompt as the query, and prints only those this session has not shown yet. Prompts under 3 words skip recall. When the prompt looks like the user stating a fact ("my ", "I'm", "call me", "we decided", "remember", ...), it adds one line asking the agent to save it now. Prints nothing when there is nothing new. |
 | `memoryos hook stop` | A fallback: once every 20 turns per session, asks the agent to save what it learned. |
+| `memoryos hook session-end`, `memoryos hook pre-compact` | When the part of the session since the last capture has no `commit_facts` call, keeps the user's typed prompts in a local file for the next session start, which shows them once. Needs no server and prints nothing. |
 
 Facts and blocks are printed inside a `<memoryos-memories>` block labelled as data, with stored text
 escaped so it cannot close the block. The fact ids already shown are kept per session in
 `~/.local/state/memoryos/hook-turns`, reset at each session start; files idle for 7 days are removed.
+
+When a session ends, or is about to be compacted, without saving anything, its typed prompts would
+be lost. No model is called and nothing leaves the machine. Instead, the capture hooks read the
+transcript (`transcript_path` from the host), keep only what the user typed (not tool results, not
+hook or system-reminder text, not `<memoryos-memories>` blocks), mask strings that look like secrets
+(`sk-`, `ghp_`, `AKIA`, `mos_`, `xoxb-` keys, private key blocks, `password=...`, long hex or base64
+runs) as `[redacted]`, and write the newest 4,000 characters to
+`~/.local/state/memoryos/hook-turns/pending/<sha256 of session id>.txt` with mode 0600. The next
+session start prints them, oldest first and under 4,000 characters, in a separate
+`<memoryos-unsaved>` data block after the memories, followed by one line asking the agent to save any
+durable fact with `commit_facts` and otherwise ignore them. The model of that session decides what is
+worth saving. A file is deleted once shown, and after 14 days if it never is.
 
 `MEMORYOS_HOOK_SCOPES` (default `agent:coding-agent`) names the scopes the hooks recall from, and
 `MEMORYOS_HOOK_STOP_EVERY` (default 20) the stop interval. `memoryos mcp` also uses the hook scopes as
@@ -214,6 +228,16 @@ not run if the agent crashes or is killed, so agents should also save during wor
       {
         "hooks": [{ "type": "command", "command": "memoryos hook stop" }]
       }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [{ "type": "command", "command": "memoryos hook session-end" }]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [{ "type": "command", "command": "memoryos hook pre-compact" }]
+      }
     ]
   }
 }
@@ -229,8 +253,9 @@ When a save is due, `memoryos hook stop` prints:
 ```
 
 `Stop` fires at the end of every turn, so the command limits itself to once every 20 turns per
-session. The prompt hook's nudge is the main save prompt; this is the fallback. `SessionEnd` cannot be
-used for this, because it has no decision control and cannot make the agent act.
+session. The prompt hook's nudge is the main save prompt; this is the fallback. `SessionEnd` cannot
+ask the agent to save, because it has no decision control. It only keeps the unsaved prompts for the
+next session.
 
 </details>
 

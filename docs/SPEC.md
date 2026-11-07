@@ -98,7 +98,8 @@ policy with no inline scripts.
 
 CLI, using `MEMORYOS_URL` and `MEMORYOS_API_KEY` (any agent without MCP can use these):
 `memoryos recall`, `candidates`, `commit`, `quarantine list|approve|reject`, and
-`memoryos hook session-start|prompt|stop|install --agent claude-code|opencode|pi`, as shown in
+`memoryos hook session-start|prompt|stop|session-end|pre-compact|install --agent
+claude-code|opencode|pi`, as shown in
 `README.md`. The hooks recall from `MEMORYOS_HOOK_SCOPES` (default `agent:coding-agent`).
 - `hook session-start` recalls with the working folder's name and with a fixed query about the user,
   merges both by fact id, and adds the memory blocks of each `agent:<id>` hook scope. All of it is
@@ -112,11 +113,29 @@ CLI, using `MEMORYOS_URL` and `MEMORYOS_API_KEY` (any agent without MCP can use 
 - `hook stop` reads the host's JSON from stdin, prints nothing when `stop_hook_active` is true, and
   otherwise prints the block decision once every 20 turns (`MEMORYOS_HOOK_STOP_EVERY`), counted per
   `session_id` in a state file. It is a fallback to the prompt hook's nudge.
+- `hook session-end` (Claude Code `SessionEnd`) and `hook pre-compact` (`PreCompact`) read
+  `session_id` and `transcript_path` from stdin and stream the transcript from the byte offset where
+  the session's last capture stopped (kept in a state file). When that part has no `tool_use` named
+  `mcp__memoryos__commit_facts` or `mcp__plugin_memoryos_memoryos__commit_facts`, they take the
+  user's typed prompts from it: `user` lines that are not meta, sidechain or compact summaries, with
+  string content or text blocks, skipping lines with tool results, host-injected text and
+  `<system-reminder>`, `<memoryos-memories>` and `<memoryos-unsaved>` blocks. Each prompt has secrets
+  masked by a fixed pattern list, and the session's pending file
+  `pending/<sha256(session_id)>.txt` under the state directory (mode 0600, one JSON string per line)
+  keeps the newest prompts within 4,000 printed characters. They call no server and no model, and
+  print nothing.
+- `hook session-start` also reads every pending file, oldest first, and prints those that fit in
+  4,000 characters after the memories block, inside a `<memoryos-unsaved>` block labelled as data
+  with each prompt escaped like stored facts, followed by one line asking the agent to save any
+  durable fact with `commit_facts` and otherwise ignore them. Printed files are deleted. Files older
+  than 14 days are deleted without being printed. The memories block shrinks so the whole output
+  stays under 9,000 characters.
 - `memoryos mcp` fills an omitted `scopes` argument of `recall`, `recall_candidates` and
   `graph_neighbors` with every hook scope, and an omitted `scope` of `commit_facts` with the first
   one, and its `tools/list` reply marks those fields optional and names the defaults. It never
   changes a value the model sent.
-- Hook commands never fail the host: on any error they log to stderr and exit 0 with no output.
+- Hook commands never fail the host: on any error they log one line to stderr and exit 0 with no
+  output. A host that leaves stdin open is waited on for at most 2 seconds.
 - `hook install` merges into existing settings, keeps other entries, is idempotent, and also
   registers the MCP server. The API key stays in an environment variable reference, never in the file.
 
