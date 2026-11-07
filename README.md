@@ -31,6 +31,11 @@ change and sources that lie.
 | ✍️ **Self-editing agents** | Size-limited, versioned blocks that agents edit through tools, with conflict detection |
 | 🕸️ **Shared knowledge graph** | Every fact is also an edge between entities, shared across agents through scoped access |
 | 🛡️ **Poisoning defense** | Low-trust content is quarantined, and every fact traces back to its source |
+| 🔁 **One-call saving** | A repeated fact is matched on the server and counted as another source, and the response lists `related` facts, so the agent rarely needs a lookup before saving |
+| 🔄 **Values that change** | Predicates such as `lives_in` or `has_nickname` hold one value at a time, so a new value replaces the old one without the agent asking ([`MEMORYOS_SINGLE_VALUED_PREDICATES`](docs/SPEC.md#10-configuration)) |
+| ⏳ **Facts that expire** | A fact can carry `expires_at`, such as "on leave until Friday", and leaves recall after that date while staying in history |
+| 🔐 **Secret redaction** | API keys, tokens and passwords in a commit are stored as `[redacted]`, and the response says when that happened |
+| 🎯 **Reranked recall** | A local cross-encoder reorders the top results, in English and Chinese, with no API call |
 
 ## 🚀 Quickstart
 
@@ -97,6 +102,16 @@ close a detail panel.
 ![The timeline, with one fact's history and source](docs/images/ui-timeline.png)
 
 ![Held-back facts waiting for review](docs/images/ui-review.png)
+
+### Is my agent using it?
+
+```bash
+memoryos stats            # last 14 days of Claude Code sessions; --days N, --json
+```
+
+It reads Claude Code's local transcripts and prints counts only, never their text: how often the
+agent recalled and saved, how many sessions got memories from the hooks, and how much of the input was
+read from the prompt cache.
 
 The page is on your machine only. It never receives an API key: it calls a small local proxy that
 forwards a fixed list of reads plus approve and reject, and it cannot purge, retract or write facts.
