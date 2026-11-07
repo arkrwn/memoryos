@@ -301,6 +301,8 @@ async fn health_ready_and_metrics_are_public_and_carry_no_tenant_labels() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["status"], "ready");
     assert_eq!(body["database"], "ok");
+    // The test embedder turns the reranker off, so no test downloads its model.
+    assert_eq!(body["reranker"], "off");
 
     let tenant = "tenant_for_metrics";
     let key = server.key(tenant, &["*"], Trust::Agent, false).await;

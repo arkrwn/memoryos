@@ -1889,6 +1889,7 @@ dependencies = [
  "async-trait",
  "dirs",
  "fastembed",
+ "hf-hub",
  "memoryos-core",
  "tokio",
  "tracing",
@@ -1955,6 +1956,7 @@ dependencies = [
 name = "memoryos-retrieve"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "futures",
  "memoryos-core",

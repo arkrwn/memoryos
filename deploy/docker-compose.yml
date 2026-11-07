@@ -57,7 +57,8 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
-    mem_limit: ${MEMORYOS_MEM_LIMIT:-1536m}
+    # The embedding model and the reranking model together, see docs/runbook.md.
+    mem_limit: ${MEMORYOS_MEM_LIMIT:-2560m}
     stop_grace_period: 30s
     read_only: true
     tmpfs:
@@ -77,8 +78,11 @@ services:
       MEMORYOS_RATE_LIMIT_RPS: ${MEMORYOS_RATE_LIMIT_RPS:-}
       MEMORYOS_DB_MAX_CONNECTIONS: ${MEMORYOS_DB_MAX_CONNECTIONS:-}
       MEMORYOS_REQUEST_TIMEOUT_SECS: ${MEMORYOS_REQUEST_TIMEOUT_SECS:-}
+      MEMORYOS_RERANKER: ${MEMORYOS_RERANKER:-}
+      MEMORYOS_RERANK_TOP: ${MEMORYOS_RERANK_TOP:-}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
-    # /readyz fails until the model has loaded, up to 15 minutes on a first start.
+    # /readyz fails until the embedding model has loaded, up to 15 minutes on a first start. The
+    # reranking model loads after it and does not hold readiness back.
     healthcheck:
       test: [CMD, /usr/local/bin/memoryos-healthcheck]
       interval: 30s

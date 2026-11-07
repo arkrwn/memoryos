@@ -27,6 +27,7 @@ impl MemoryStore for PgStore
 
 // memoryos-embed, feature `local`, on by default
 LocalEmbedder::new(cache_dir: Option<PathBuf>) -> Result<Self>   // impl Embedder
+LocalReranker::new(cache_dir: Option<PathBuf>) -> Result<Self>   // impl Reranker
 
 // memoryos-ingest
 HostCommitter::new(store: Arc<dyn MemoryStore>, embedder: Arc<dyn Embedder>) -> Self
@@ -35,6 +36,7 @@ HostCommitter::commit(&self, ctx: &RequestContext, req: CommitRequest, max_trust
 
 // memoryos-retrieve
 Retriever::new(store: Arc<dyn MemoryStore>, embedder: Arc<dyn Embedder>) -> Self
+Retriever::with_reranker(self, reranker: Arc<dyn Reranker>, top: usize) -> Self   // recall only
 Retriever::recall(&self, ctx: &RequestContext, req: RecallRequest) -> Result<RecallResponse>
 Retriever::candidates(&self, ctx: &RequestContext, scopes: &[Scope], statement: &str, limit: i64) -> Result<Vec<ScoredFact>>
 Retriever::candidates_with_embedding(&self, ctx: &RequestContext, scopes: &[Scope], statement: &str, embedding: &[f32], limit: i64) -> Result<Vec<ScoredFact>>
@@ -268,13 +270,23 @@ AND (invalidated_at IS NULL OR invalidated_at > K)
    list, and below the 10.9% gap between the best fact found by one list (`1 / 61`) and the worst
    found by two (`2 / 110`), so corroboration breaks ties and nudges but never lifts a fact found by
    one list over a fact found by two.
-6. Near copies: walking down the ranking, drop a fact with the same subject, predicate and object as
+6. Rerank: send the first `min(limit * 2, MEMORYOS_RERANK_TOP)` facts (default top 20) to the local
+   cross-encoder, `BAAI/bge-reranker-v2-m3` in its int8 ONNX export
+   (`onnx-community/bge-reranker-v2-m3-ONNX`, pinned revision), as (query, statement) pairs cut to
+   256 tokens, in one batch on the CPU. Reorder those facts by its score, highest first. The sort is
+   stable, so the order from step 5 breaks exact ties; source count does not otherwise enter the
+   reranked order. Each moved fact takes the step 5 score of the slot it lands on, so scores stay
+   descending and on one scale. Facts past the window keep their order behind it. With the reranker
+   off, not loaded yet, failing, or slower than 2 seconds, recall logs a warning (except when off)
+   and keeps the step 5 order. On a 10 core Apple M-series CPU, 10 pairs took a median 207 ms
+   and 20 pairs of 512 tokens took 8.7 s, which is why pairs are now cut at 256 tokens.
+7. Near copies: walking down the ranking, drop a fact with the same subject, predicate and object as
    a higher ranked one and the same statement once lowercased and reduced to its letter and digit
    words, so the next distinct fact takes the slot. Candidate lists carry no embeddings, so the test
    is textual and needs no extra read. Return the top `limit` (default 10, max 100).
 
 `Retriever::candidates` (and `/v1/candidates`, `recall_candidates`, commit matching) runs steps 1 to
-4 only: no source boost, and near copies are kept, since finding them is its job.
+4 only: no source boost, no reranking, and near copies are kept, since finding them is its job.
 
 ## 8. Blocks
 
@@ -324,8 +336,15 @@ adds a scope rule. A block update that omits `max_chars` keeps its limit.
 | `MEMORYOS_RATE_LIMIT_RPS` | `100` | Per key |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Traces are exported only when set |
 | `MEMORYOS_REQUEST_TIMEOUT_SECS` | `30` | |
-| `MEMORYOS_MODEL_CACHE` | user cache dir | Local model. Leave `HF_HOME` unset, since it overrides this |
+| `MEMORYOS_MODEL_CACHE` | user cache dir | Local models, the embedder's and the reranker's. Leave `HF_HOME` unset, since it overrides this |
 | `MEMORYOS_SINGLE_VALUED_PREDICATES` | the list in section 3, step 6 | Comma list that replaces the default. Names are normalized to lowercase snake case. A value with no names, such as `,`, turns the rule off |
+| `MEMORYOS_RERANKER` | `local` | `local` or `off`. Off saves the 571 MB download and about 1.3 GiB of memory; recall keeps the fused order |
+| `MEMORYOS_RERANK_TOP` | `20` | Most facts one recall sends to the reranker, as `min(limit * 2, this)`. Below 2 nothing is reranked |
+
+The reranker loads after the embedder. It never stops the server from starting: until it has loaded, or
+if it fails, recall keeps the fused order. `/readyz` reports it as `reranker`: `loading`, `ready`,
+`failed` or `off`, without letting it change readiness. A server using the test embedder runs with the
+reranker off.
 
 ## 11. Testing rules
 
@@ -337,7 +356,8 @@ adds a scope rule. A block update that omits `max_chars` keeps its limit.
   needs the 481 MB model. The server selects it when built with that feature and
   `MEMORYOS_TEST_EMBEDDER` holds a delay per call in milliseconds. The release image never has it, since
   the Dockerfile's cargo commands enable no features.
-- `integration-local` on `memoryos-embed` runs the real model. It is off by default.
+- `integration-local` on `memoryos-embed` runs the real models, the embedder and the reranker. It is
+  off by default. Recall's reranking step is tested with fake rerankers.
 - Tenant isolation must be tested with two tenants against real Postgres.
 - Run gates: `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
   `cargo test`, `cargo deny check`.
@@ -371,6 +391,10 @@ to save.
 - `GET /v1/scopes` scans the tenant's facts, so it slows with size. It is for occasional reads. The page
   draws at most the newest 300 facts in Map and Timeline, and says so.
 - `LocalEmbedder` silently truncates inputs over 512 tokens and needs at least 1 GiB of memory.
+- `LocalReranker` adds about 1.3 GiB at its peak (1.26 GiB maximum resident set for load plus 15
+  queries of 10 pairs, 1.64 GiB with 20 pairs of 512 tokens, measured on macOS, not yet in the Linux
+  container). A call that overruns its 2 second timeout keeps running and holds the model, so recalls
+  behind it also fall back to the fused order until it ends.
 - A fact backdated between two facts of a chain ends at the later one but does not close the earlier
   one, so `as_of` in that gap returns both. Backdating before the whole chain is exact.
 - The subject and predicate rule covers `Add` only. A `supersedes` naming a lower-trust fact is checked

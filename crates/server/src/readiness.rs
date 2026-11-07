@@ -1,24 +1,31 @@
-//! Local model warm-up. The server starts first and the model loads behind it, so a stalled
-//! download costs readiness and vector search, never `/healthz` or the API itself.
+//! Local model warm-up. The server starts first and the models load behind it, so a stalled
+//! download costs readiness, vector search and reranking, never `/healthz` or the API itself.
 
+use std::future::Future;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use memoryos_core::Embedder;
+use memoryos_core::{Embedder, Result};
 use tokio_util::sync::CancellationToken;
 
 const LOADING: u8 = 0;
 const READY: u8 = 1;
 const FAILED: u8 = 2;
+const OFF: u8 = 3;
 
 const WARM_UP_INPUT: &str = "warm up";
 
-/// The embedder half of `/readyz`.
+/// The state one model reports on `/readyz`.
 #[derive(Default)]
-pub struct EmbedderReadiness(AtomicU8);
+pub struct ModelReadiness(AtomicU8);
 
-impl EmbedderReadiness {
+impl ModelReadiness {
+    /// For a model the configuration turned off. It never loads.
+    pub fn off() -> Self {
+        Self(AtomicU8::new(OFF))
+    }
+
     pub fn is_ready(&self) -> bool {
         self.0.load(Ordering::Acquire) == READY
     }
@@ -27,8 +34,13 @@ impl EmbedderReadiness {
         match self.0.load(Ordering::Acquire) {
             LOADING => "loading",
             READY => "ready",
+            OFF => "off",
             _ => "failed",
         }
+    }
+
+    pub(crate) fn set_failed(&self) {
+        self.set(FAILED);
     }
 
     fn set(&self, state: u8) {
@@ -54,21 +66,30 @@ impl Default for WarmUpTiming {
     }
 }
 
-/// Makes one embed call, retrying a failure with backoff until it succeeds or `shutdown` fires. A
-/// failed download can recover, for example when the network returns, so it is not fatal.
-pub async fn warm_up(
-    embedder: Arc<dyn Embedder>,
-    readiness: Arc<EmbedderReadiness>,
+/// One embed call, which loads the embedder's model.
+pub async fn warm_up_embedder(embedder: Arc<dyn Embedder>) -> Result<()> {
+    embedder.embed(&[WARM_UP_INPUT.to_owned()]).await.map(drop)
+}
+
+/// Runs `attempt`, retrying a failure with backoff until it succeeds or `shutdown` fires. A failed
+/// download can recover, for example when the network returns, so it is not fatal. `model` names
+/// the model in the logs, such as "local embedding model".
+pub async fn warm_up<F, Fut>(
+    model: &'static str,
+    attempt: F,
+    readiness: Arc<ModelReadiness>,
     timing: WarmUpTiming,
     shutdown: CancellationToken,
-) {
-    let input = [WARM_UP_INPUT.to_owned()];
+) where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
     let mut retry = timing.retry_base;
     let mut ticker = tokio::time::interval(timing.still_loading_every);
     ticker.tick().await;
-    tracing::info!("loading the local embedding model");
+    tracing::info!("loading the {model}");
     loop {
-        let attempt = embedder.embed(&input);
+        let attempt = attempt();
         tokio::pin!(attempt);
         let outcome = loop {
             tokio::select! {
@@ -76,16 +97,16 @@ pub async fn warm_up(
                 outcome = &mut attempt => break outcome,
                 _ = ticker.tick() => {
                     tracing::warn!(
-                        reason = "the first embed call has not returned, the model may still be downloading",
-                        "not ready"
+                        reason = "the first call has not returned, the model may still be downloading",
+                        "not ready: the {model} is still loading"
                     );
                 }
             }
         };
         match outcome {
-            Ok(_) => {
+            Ok(()) => {
                 readiness.set(READY);
-                tracing::info!("local embedding model ready");
+                tracing::info!("{model} ready");
                 return;
             }
             Err(error) => {
@@ -93,7 +114,7 @@ pub async fn warm_up(
                 tracing::warn!(
                     reason = %error,
                     retry_secs = retry.as_secs(),
-                    "not ready: the local embedding model failed to load"
+                    "not ready: the {model} failed to load"
                 );
             }
         }
@@ -110,7 +131,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use async_trait::async_trait;
-    use memoryos_core::{Error, Result};
+    use memoryos_core::Error;
 
     use super::*;
 
@@ -151,21 +172,36 @@ mod tests {
         })
     }
 
+    async fn run(
+        embedder: Arc<FakeEmbedder>,
+        readiness: Arc<ModelReadiness>,
+        shutdown: CancellationToken,
+    ) {
+        let attempt = move || warm_up_embedder(embedder.clone());
+        warm_up("test model", attempt, readiness, timing(), shutdown).await;
+    }
+
     #[test]
     fn a_new_server_is_loading_and_not_ready() {
-        let readiness = EmbedderReadiness::default();
+        let readiness = ModelReadiness::default();
         assert!(!readiness.is_ready());
         assert_eq!(readiness.label(), "loading");
     }
 
+    #[test]
+    fn an_off_model_is_never_ready() {
+        let readiness = ModelReadiness::off();
+        assert!(!readiness.is_ready());
+        assert_eq!(readiness.label(), "off");
+    }
+
     #[tokio::test]
     async fn ready_after_one_successful_call() {
-        let readiness = Arc::new(EmbedderReadiness::default());
+        let readiness = Arc::new(ModelReadiness::default());
         let embedder = fake(0, false);
-        warm_up(
+        run(
             embedder.clone(),
             readiness.clone(),
-            timing(),
             CancellationToken::new(),
         )
         .await;
@@ -175,12 +211,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_failure_is_retried_until_it_succeeds() {
-        let readiness = Arc::new(EmbedderReadiness::default());
+        let readiness = Arc::new(ModelReadiness::default());
         let embedder = fake(3, false);
-        warm_up(
+        run(
             embedder.clone(),
             readiness.clone(),
-            timing(),
             CancellationToken::new(),
         )
         .await;
@@ -190,14 +225,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_stalled_load_stays_not_ready_and_stops_on_shutdown() {
-        let readiness = Arc::new(EmbedderReadiness::default());
+        let readiness = Arc::new(ModelReadiness::default());
         let shutdown = CancellationToken::new();
-        let task = tokio::spawn(warm_up(
-            fake(0, true),
-            readiness.clone(),
-            timing(),
-            shutdown.clone(),
-        ));
+        let task = tokio::spawn(run(fake(0, true), readiness.clone(), shutdown.clone()));
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(!readiness.is_ready());
         assert_eq!(readiness.label(), "loading");

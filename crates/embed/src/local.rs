@@ -33,26 +33,29 @@ impl LocalEmbedder {
     /// Uses `cache_dir`, else `MEMORYOS_MODEL_CACHE`, else `memoryos/models` in the user cache
     /// directory. Creates the directory but loads nothing.
     pub fn new(cache_dir: Option<PathBuf>) -> Result<Self> {
-        let cache_dir = resolve_cache_dir(
-            cache_dir,
-            std::env::var_os(CACHE_DIR_ENV),
-            dirs::cache_dir(),
-        )
+        let cache_dir = model_cache_dir(cache_dir)?;
+        Ok(Self {
+            engine: Engine::new(move || load_model(cache_dir.clone())),
+        })
+    }
+}
+
+/// `explicit`, else `MEMORYOS_MODEL_CACHE`, else `memoryos/models` in the user cache directory,
+/// created if missing. The embedder and the reranker share it.
+pub(crate) fn model_cache_dir(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    let cache_dir = resolve_cache_dir(explicit, std::env::var_os(CACHE_DIR_ENV), dirs::cache_dir())
         .ok_or_else(|| {
             Error::InvalidInput(format!(
                 "no model cache directory: set {CACHE_DIR_ENV} or pass one"
             ))
         })?;
-        std::fs::create_dir_all(&cache_dir).map_err(|e| {
-            Error::Internal(format!(
-                "cannot create model cache directory {}: {e}",
-                cache_dir.display()
-            ))
-        })?;
-        Ok(Self {
-            engine: Engine::new(move || load_model(cache_dir.clone())),
-        })
-    }
+    std::fs::create_dir_all(&cache_dir).map_err(|e| {
+        Error::Internal(format!(
+            "cannot create model cache directory {}: {e}",
+            cache_dir.display()
+        ))
+    })?;
+    Ok(cache_dir)
 }
 
 #[async_trait]
@@ -71,9 +74,17 @@ fn load_model(cache_dir: PathBuf) -> Result<TextEmbedding> {
     TextEmbedding::try_new(options).map_err(|e| provider_error("model load failed", &e))
 }
 
-/// fastembed's error text leaves out the cause, such as the network error behind a failed download.
 fn provider_error(context: &str, error: &(dyn StdError + 'static)) -> Error {
-    let mut message = format!("{PROVIDER} {context}: {error}");
+    provider_error_for(PROVIDER, context, error)
+}
+
+/// fastembed's error text leaves out the cause, such as the network error behind a failed download.
+pub(crate) fn provider_error_for(
+    provider: &str,
+    context: &str,
+    error: &(dyn StdError + 'static),
+) -> Error {
+    let mut message = format!("{provider} {context}: {error}");
     let mut source = error.source();
     while let Some(cause) = source {
         let text = cause.to_string();

@@ -19,6 +19,7 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 memoryos-embed = { workspace = true, features = ["test-embedder"] }
 memoryos-store.workspace = true
 serde_json.workspace = true

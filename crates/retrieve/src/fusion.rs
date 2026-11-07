@@ -64,6 +64,25 @@ fn source_boost(fact: &Fact) -> f64 {
     1.0 + SOURCE_BOOST_PER_EXTRA * extra as f64
 }
 
+/// Reorders the first `scores.len()` facts by `scores`, highest first, and leaves the rest as they
+/// were. The sort is stable, so equal scores keep the order they came in, which is the boosted
+/// fused order. Each moved fact takes the fused score of the position it lands on, so scores stay
+/// descending and on one scale for the whole list.
+pub(crate) fn reordered_by<'a>(
+    ranked: Vec<(&'a Fact, f64)>,
+    scores: &[f32],
+) -> Vec<(&'a Fact, f64)> {
+    let window = scores.len().min(ranked.len());
+    let slot_scores: Vec<f64> = ranked[..window].iter().map(|(_, score)| *score).collect();
+    let mut order: Vec<usize> = (0..window).collect();
+    order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
+    let reordered = order
+        .iter()
+        .zip(slot_scores)
+        .map(|(&index, slot_score)| (ranked[index].0, slot_score));
+    reordered.chain(ranked[window..].iter().copied()).collect()
+}
+
 /// Drops each fact that is a near copy of a higher ranked one, keeping the order, so the next
 /// distinct fact takes its slot. Near copy means the same subject, predicate and object and the
 /// same statement after [`normalize`]. Candidate lists carry no embeddings, so this is the test
@@ -321,6 +340,33 @@ mod tests {
         let order = fused_ids(&boosted);
         let rank = |n: u128| order.iter().position(|&id| id == n).expect("ranked");
         assert!(rank(2) < rank(1));
+    }
+
+    #[test]
+    fn reorder_sorts_the_window_and_keeps_the_slot_scores() {
+        let list = facts(&[1, 2, 3, 4]);
+        let fused = fuse(&[&list]);
+        let reordered = reordered_by(fused, &[0.1, 0.9, 0.5]);
+        assert_eq!(fused_ids(&reordered), [2, 3, 1, 4]);
+        let scores: Vec<f64> = reordered.iter().map(|(_, score)| *score).collect();
+        assert_eq!(scores, [1.0 / 61.0, 1.0 / 62.0, 1.0 / 63.0, 1.0 / 64.0]);
+    }
+
+    #[test]
+    fn reorder_keeps_the_incoming_order_on_equal_scores() {
+        let list = facts(&[1, 2, 3]);
+        let reordered = reordered_by(fuse(&[&list]), &[0.5, 0.7, 0.5]);
+        assert_eq!(fused_ids(&reordered), [2, 1, 3]);
+    }
+
+    #[test]
+    fn reorder_with_more_scores_than_facts_or_none_is_safe() {
+        let list = facts(&[1, 2]);
+        assert_eq!(
+            fused_ids(&reordered_by(fuse(&[&list]), &[0.0, 1.0, 2.0])),
+            [2, 1]
+        );
+        assert_eq!(fused_ids(&reordered_by(fuse(&[&list]), &[])), [1, 2]);
     }
 
     #[test]

@@ -8,10 +8,11 @@ license.workspace = true
 
 [features]
 default = ["local"]
-local = ["dep:dirs", "dep:fastembed"]
+local = ["dep:dirs", "dep:fastembed", "dep:hf-hub"]
 # A deterministic embedder for tests. The release image builds without it, see the Dockerfile.
 test-embedder = []
-# Enables tests/local.rs, which downloads the 481 MB model. Not part of the default test run.
+# Enables tests/local.rs and tests/rerank.rs, which download the 481 MB embedding model and the
+# 571 MB reranking model. Not part of the default test run.
 integration-local = ["local"]
 
 [dependencies]
@@ -19,6 +20,8 @@ memoryos-core.workspace = true
 async-trait.workspace = true
 dirs = { version = "6", optional = true }
 fastembed = { version = "7.6", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"], optional = true }
+# The same version and features fastembed uses, for the reranker download.
+hf-hub = { version = "0.5", default-features = false, features = ["ureq", "rustls-tls"], optional = true }
 tokio.workspace = true
 tracing.workspace = true
 
