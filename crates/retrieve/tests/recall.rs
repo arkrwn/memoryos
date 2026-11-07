@@ -232,6 +232,7 @@ fn new_fact(scope: &Scope, subject: Uuid, statement: &str, degrees: f32) -> NewF
         status: FactStatus::Active,
         valid_from: date(2020),
         valid_to: None,
+        expires_at: None,
     }
 }
 

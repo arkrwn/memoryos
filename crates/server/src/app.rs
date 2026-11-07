@@ -68,7 +68,8 @@ pub async fn serve(
         store: store.clone(),
         pg,
         retriever: Arc::new(Retriever::new(store.clone(), embedder.clone())),
-        committer: HostCommitter::new(store, embedder.clone()),
+        committer: HostCommitter::new(store, embedder.clone())
+            .with_single_valued(config.single_valued.clone()),
         metrics: metrics.clone(),
     };
 

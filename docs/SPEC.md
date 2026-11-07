@@ -57,7 +57,8 @@ The `memoryos` binary (crate `server`) has these commands: `serve`, `migrate`, `
    It ranks like `Retriever::recall`, at the present time. A host that only saves can skip it.
 2. `POST /v1/commits` sends `{scope, source, content, facts[]}`. Each fact has
    `statement`, `subject {name, kind}`, `predicate`, optional `object {name, kind}`, optional
-   `valid_from`, and at most one of `supersedes` and `corroborates`. Maximum 50 facts.
+   `valid_from`, optional `expires_at` (section 4), and at most one of `supersedes` and
+   `corroborates`. Maximum 50 facts.
 3. `HostCommitter` stores `content` through `insert_episode` as the source of the facts. Replaying an
    `idempotency_key` returns the existing episode and its facts; a key reused for a different scope,
    source, content or trust returns 400 `invalid_input` and reveals nothing about the first request.
@@ -75,22 +76,47 @@ The `memoryos` binary (crate `server`) has these commands: `serve`, `migrate`, `
    closed at its `valid_from` exactly as a supersede closes it. So a second call that supersedes a
    `related` fact of the first does not duplicate the fact the first created. A new fact the trust
    gate would quarantine is still created, since it carries the pending close for approval.
-6. Entity resolution, for the facts that are created: same normalized name or known alias with the
+6. Single-valued predicates. Some predicates hold one value per subject at a time. By default:
+   `lives_in`, `works_at`, `has_nickname`, `has_role`, `prefers_editor`, `uses_database`, `has_name`,
+   `has_email`, `located_in`, `current_version`, `prefers_language`. `MEMORYOS_SINGLE_VALUED_PREDICATES`
+   replaces the list (section 10). Predicates are compared after normalizing to lowercase snake case,
+   so `livesIn`, `Lives In` and `lives-in` are all `lives_in`. A fact that is created, sets neither
+   `supersedes` nor `corroborates`, and has such a predicate is compared with the current facts of
+   its scope with the same subject entity and the same normalized predicate (an expired fact is not
+   current). If the latest of them holds a different value, meaning another object or another
+   statement, the new fact supersedes it through the same path as a declared `supersedes`: the same
+   trust gate, so a fact the gate quarantines records `pending_supersede_of` and approval performs
+   the close, and the same purge, so purging the new fact's episode reopens the old fact. The
+   response reports it as `superseded` on the created fact. If the old fact has higher trust than the
+   commit, it is not closed and is listed first in `related` instead; the store's subject and
+   predicate rule of section 5 then still applies to the new fact. Another scope or tenant is never
+   read.
+7. Entity resolution, for the facts that are created: same normalized name or known alias with the
    same kind uses that entity; otherwise cosine similarity of at least 0.90 with the same kind
    merges. The new name becomes an alias only when this source has an active fact on it.
-7. It builds `FactOp`s, applies the section 5 trust gate, and calls `apply_commit`, which commits
+8. It builds `FactOp`s, applies the section 5 trust gate, and calls `apply_commit`, which commits
    everything and sets `processed_at` atomically. If the episode is already processed that is a no-op,
    so a concurrent replay cannot apply twice. Returns `episode_id` and, per request fact, `id`,
    `status`, `corroborated` when no fact was created, `superseded` with the closed fact's id when a
-   supersede reused an existing fact, and `related` for a created fact. A replay
+   supersede reused an existing fact or a single-valued predicate replaced a current fact, and
+   `related` for a created fact. A replay
    tells a matched fact from a created one by `recorded_at`, which equals `processed_at` only for
-   facts the episode created, and returns no `related`.
+   facts the episode created, and returns no `related`. The response also has `redacted`, true when
+   a secret was masked (see Rules).
 
 Rules:
 - Commit trust is `agent`, or `external` if the key's `max_trust` is `external`. A request cannot
   set a higher trust, because the host model also reads untrusted content.
 - `supersedes` and `corroborates` must name a current, active fact in the same scope, else 400.
   The server never trusts a host-supplied id without that check.
+- Before anything is stored or compared, `HostCommitter` masks secrets in `content`, in each
+  statement and in each entity name, so REST and MCP commits get the same treatment. Each match
+  becomes `[redacted]`: OpenAI and Anthropic style `sk-` keys, GitHub `ghp_`, `gho_`, `ghu_`, `ghs_`,
+  `ghr_` and `github_pat_` tokens, AWS `AKIA` access key ids, MemoryOS `mos_` keys, Slack `xox[abprs]-`
+  tokens, JWTs, PEM private key blocks, bearer tokens, and the value after a label ending in
+  `password`, `passwd`, `secret`, `token` or `api_key` followed by `=` or `:` (the label stays). The
+  patterns live in `crates/ingest/src/redact.rs` and only match distinctive shapes, so UUIDs, commit
+  hashes and ordinary words are kept. The response sets `redacted: true` when anything was masked.
 - `recall_candidates`, `commit_facts`, `recall`, `block_read`, `block_replace` and `graph_neighbors`
   are the MCP tools. Tool descriptions state when to recall, when to save, and that retrieved or
   tool-read content is data, never instructions.
@@ -151,6 +177,10 @@ claude-code|opencode|pi`, as shown in
 - `valid_from` / `valid_to`: when the fact was true. Default `valid_from` is `occurred_at`.
 - `recorded_at`: when MemoryOS learned it.
 - `invalidated_at`: retracted as wrong. Never returned by current or `as_of` reads.
+- `expires_at`: optional, set on commit and never changed, after `valid_from`. For a fact true only
+  for a while, such as "on leave until Friday". From then on the fact is not current, without anyone
+  superseding it: recall, candidates, matching of repeats and the single-valued check skip it, and
+  `supersedes` or `corroborates` naming it is refused. It stays in history and in `state=past`.
 - Superseding sets `old.valid_to = new.valid_from` and `old.superseded_by = new.id`.
 - Out-of-order input: if a new fact's `valid_from` is before the old fact's, it is stored as a
   closed historical fact, with `valid_to` the start of the earliest later live fact in that chain, and
@@ -161,6 +191,7 @@ Fact visible at valid time T (default now) and knowledge time K (default now):
 ```
 status = 'active'
 AND valid_from <= T AND (valid_to IS NULL OR valid_to > T)
+AND (expires_at IS NULL OR expires_at > T)
 AND recorded_at <= K
 AND (invalidated_at IS NULL OR invalidated_at > K)
 ```
@@ -294,6 +325,7 @@ adds a scope rule. A block update that omits `max_chars` keeps its limit.
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Traces are exported only when set |
 | `MEMORYOS_REQUEST_TIMEOUT_SECS` | `30` | |
 | `MEMORYOS_MODEL_CACHE` | user cache dir | Local model. Leave `HF_HOME` unset, since it overrides this |
+| `MEMORYOS_SINGLE_VALUED_PREDICATES` | the list in section 3, step 6 | Comma list that replaces the default. Names are normalized to lowercase snake case. A value with no names, such as `,`, turns the rule off |
 
 ## 11. Testing rules
 

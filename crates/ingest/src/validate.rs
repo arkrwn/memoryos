@@ -1,5 +1,7 @@
 //! Text checks and normalization for commits.
 
+use memoryos_core::normalize_name;
+
 /// Maximum episode content, in characters (SPEC section 9).
 pub(crate) const MAX_CONTENT_CHARS: usize = 100_000;
 
@@ -11,6 +13,12 @@ pub(crate) fn is_blank_or_unstorable(value: &str) -> bool {
 /// `Person` and `person` are one kind. The store compares kinds exactly.
 pub(crate) fn normalize_kind(kind: &str) -> String {
     kind.trim().to_lowercase()
+}
+
+/// Statement identity for automatic corroboration: case-insensitive, whitespace runs collapsed,
+/// trailing periods ignored.
+pub(crate) fn normalize_statement(statement: &str) -> String {
+    normalize_name(statement.trim_end().trim_end_matches('.'))
 }
 
 #[cfg(test)]

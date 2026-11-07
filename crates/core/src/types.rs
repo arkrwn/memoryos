@@ -206,6 +206,7 @@ pub struct Entity {
 /// Time semantics (docs/SPEC.md section 4):
 /// - `valid_from`/`valid_to`: when the fact was true in the world. Superseding sets `valid_to`.
 /// - `recorded_at`/`invalidated_at`: when we learned it, and when we retracted it as wrong.
+/// - `expires_at`: when it stops being true with nothing replacing it. From then on it is not current.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Fact {
     pub id: Uuid,
@@ -218,12 +219,22 @@ pub struct Fact {
     pub status: FactStatus,
     pub valid_from: DateTime<Utc>,
     pub valid_to: Option<DateTime<Utc>>,
+    /// Absent in data from before expiry existed, which means no expiry.
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
     pub recorded_at: DateTime<Utc>,
     pub invalidated_at: Option<DateTime<Utc>>,
     pub superseded_by: Option<Uuid>,
     /// Set on a quarantined fact: the fact that approval will close.
     pub pending_supersede_of: Option<Uuid>,
     pub source_episode_ids: Vec<Uuid>,
+}
+
+impl Fact {
+    /// Whether the fact has expired by `at`. A fact with no `expires_at` never expires.
+    pub fn expired_at(&self, at: DateTime<Utc>) -> bool {
+        self.expires_at.is_some_and(|expires| expires <= at)
+    }
 }
 
 /// A fact with the names of what it connects, for listing and drawing.
@@ -280,6 +291,8 @@ pub struct NewFact {
     pub status: FactStatus,
     pub valid_from: DateTime<Utc>,
     pub valid_to: Option<DateTime<Utc>>,
+    /// Must be after `valid_from`.
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// One decision of a commit, applied atomically by `MemoryStore::apply_commit`.

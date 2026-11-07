@@ -16,6 +16,7 @@ use memoryos_core::{
 use memoryos_embed::{vector_for, TestEmbedder};
 use memoryos_ingest::{
     CommitFact, CommitRequest, CommitResponse, CommittedFact, EntityRef, HostCommitter,
+    SingleValued,
 };
 use memoryos_store::PgStore;
 use serde_json::json;
@@ -277,6 +278,7 @@ impl World {
                     status: FactStatus::Active,
                     valid_from: date(2020),
                     valid_to: None,
+                    expires_at: None,
                 })],
             )
             .await
@@ -303,6 +305,7 @@ fn add_fact(text: &str, subject: &str) -> CommitFact {
         predicate: "fact_about".into(),
         object: None,
         valid_from: None,
+        expires_at: None,
         supersedes: None,
         corroborates: None,
     }
@@ -888,6 +891,7 @@ async fn a_current_target_is_accepted_on_a_subject_with_many_facts() {
                 status: FactStatus::Active,
                 valid_from: date(2020),
                 valid_to: None,
+                expires_at: None,
             })
         })
         .collect();
@@ -1843,4 +1847,422 @@ async fn purging_the_reused_facts_source_first_keeps_the_close_until_call_two_go
     w.store.purge_episode(&ctx(), second).await.expect("purge");
     assert_current_alone(&w, old).await;
     assert_eq!(w.count("facts").await, 1);
+}
+
+// ---- Expiry ------------------------------------------------------------------------------------
+
+/// A fact on Ada that started ten days ago and ends at `expires_at`.
+fn expiring_fact(text: &str, expires_at: DateTime<Utc>) -> CommitFact {
+    let mut fact = add_fact(text, "Ada");
+    fact.valid_from = Some(Utc::now() - chrono::Duration::days(10));
+    fact.expires_at = Some(expires_at);
+    fact
+}
+
+async fn recalled(w: &World, scope: &Scope, query: &str) -> Vec<Uuid> {
+    let retriever = memoryos_retrieve::Retriever::new(w.store.clone(), w.embedder.clone());
+    let request = memoryos_retrieve::RecallRequest {
+        scopes: vec![scope.clone()],
+        query: query.into(),
+        limit: 20,
+        as_of: None,
+        known_at: None,
+    };
+    retriever
+        .recall(&ctx(), request)
+        .await
+        .expect("recall")
+        .facts
+        .into_iter()
+        .map(|scored| scored.fact.id)
+        .collect()
+}
+
+async fn text_hits(w: &World, scope: &Scope, query: &str) -> Vec<Uuid> {
+    w.store
+        .search_facts_text(
+            &ctx(),
+            std::slice::from_ref(scope),
+            query,
+            &FactFilter::default(),
+            20,
+        )
+        .await
+        .expect("text search")
+        .into_iter()
+        .map(|scored| scored.fact.id)
+        .collect()
+}
+
+async fn listed(w: &World, scope: &Scope, state: memoryos_core::FactListState) -> Vec<Uuid> {
+    w.store
+        .list_facts(&ctx(), scope, state, 50, None)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|view| view.fact.id)
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expired_fact_leaves_recall_but_stays_in_history() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let response = w
+        .host
+        .commit(
+            &ctx(),
+            commit_request(
+                &scope,
+                "Ada was on leave, and is reviewing until next week",
+                vec![
+                    expiring_fact("Ada is on leave", Utc::now() - chrono::Duration::days(1)),
+                    expiring_fact(
+                        "Ada is reviewing the parser",
+                        Utc::now() + chrono::Duration::days(7),
+                    ),
+                ],
+            ),
+            Trust::Agent,
+        )
+        .await
+        .expect("commit");
+    let (expired, future) = (response.facts[0].id, response.facts[1].id);
+    let stored = w.store.get_fact(&ctx(), expired).await.expect("expired");
+    assert!(stored.expires_at.is_some());
+    assert_eq!((stored.valid_to, stored.superseded_by), (None, None));
+
+    // Neither vector nor text search, nor recall, returns the expired fact. The other one is current.
+    for ids in [
+        w.recall_ids(&scope, "Ada is on leave", None).await,
+        text_hits(&w, &scope, "Ada").await,
+        recalled(&w, &scope, "Ada is on leave").await,
+    ] {
+        assert!(!ids.contains(&expired), "{ids:?}");
+        assert!(ids.contains(&future), "{ids:?}");
+    }
+    // Asked about a time before it expired, it is there.
+    let then = Utc::now() - chrono::Duration::days(5);
+    assert!(w
+        .recall_ids(&scope, "Ada is on leave", Some(then))
+        .await
+        .contains(&expired));
+
+    // History and the past listing keep it.
+    let history = w
+        .store
+        .fact_history(&ctx(), expired)
+        .await
+        .expect("history");
+    assert_eq!(
+        history.iter().map(|fact| fact.id).collect::<Vec<_>>(),
+        [expired]
+    );
+    use memoryos_core::FactListState::{Current, Past};
+    assert_eq!(listed(&w, &scope, Past).await, [expired]);
+    assert_eq!(listed(&w, &scope, Current).await, [future]);
+
+    // Not current: no repeat matches it, and no supersede or corroborate may name it.
+    let again = commit_as(&w, &ctx(), &scope, "Ada is on leave", "Ada").await;
+    assert!(!again.corroborated);
+    assert_ne!(again.id, expired);
+    assert!(again.related.iter().all(|related| related.id != expired));
+    let mut corroborating = add_fact("Ada is away", "Ada");
+    corroborating.corroborates = Some(expired);
+    for named in [
+        supersede_request(&scope, "back", "Ada is back", expired),
+        commit_request(&scope, "away", vec![corroborating]),
+    ] {
+        let message = is_invalid(w.host.commit(&ctx(), named, Trust::Agent).await);
+        assert!(message.contains("not current"), "{message}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fact_drops_out_of_recall_when_its_expiry_passes() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let mut fact = add_fact("Ada is in a meeting", "Ada");
+    fact.expires_at = Some(Utc::now() + chrono::Duration::seconds(2));
+    let response = w
+        .host
+        .commit(
+            &ctx(),
+            commit_request(&scope, "meeting", vec![fact]),
+            Trust::Agent,
+        )
+        .await
+        .expect("commit");
+    let id = response.facts[0].id;
+    assert_eq!(response.facts[0].status, FactStatus::Active);
+    assert!(recalled(&w, &scope, "Ada is in a meeting")
+        .await
+        .contains(&id));
+
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(!recalled(&w, &scope, "Ada is in a meeting")
+        .await
+        .contains(&id));
+    let fact = w.store.get_fact(&ctx(), id).await.expect("fact");
+    assert_eq!((fact.valid_to, fact.superseded_by), (None, None));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expiry_not_after_the_start_is_refused_and_stores_nothing() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let mut fact = add_fact("Ada was away", "Ada");
+    fact.valid_from = Some(date(2024));
+    fact.expires_at = Some(date(2023));
+    let message = is_invalid(
+        w.host
+            .commit(
+                &ctx(),
+                commit_request(&scope, "away", vec![fact]),
+                Trust::Agent,
+            )
+            .await,
+    );
+    assert!(message.contains("expires_at"), "{message}");
+    assert_eq!(w.count("episodes").await, 0);
+    assert_eq!(w.count("facts").await, 0);
+}
+
+// ---- Single-valued predicates ------------------------------------------------------------------
+
+/// Where Ada lives, with the city as the object, as a host would send it.
+fn lives_in(city: &str) -> CommitFact {
+    let mut fact = add_fact(&format!("Ada lives in {city}"), "Ada");
+    fact.predicate = "lives_in".into();
+    fact.object = Some(EntityRef {
+        name: city.into(),
+        kind: "place".into(),
+    });
+    fact
+}
+
+/// Commits one fact under `ctx` as an agent key and returns the response entry and episode.
+async fn commit_fact(
+    host: &HostCommitter,
+    ctx: &RequestContext,
+    scope: &Scope,
+    fact: CommitFact,
+) -> (CommittedFact, Uuid) {
+    let request = commit_request(scope, &format!("source of {}", fact.statement), vec![fact]);
+    let mut response = host
+        .commit(ctx, request, Trust::Agent)
+        .await
+        .expect("commit");
+    (response.facts.remove(0), response.episode_id)
+}
+
+impl World {
+    /// A current `lives_in` fact on Ada at `trust`, stored directly because commits stop at agent.
+    async fn seed_lives_in(&self, scope: &Scope, trust: Trust, city: &str) -> Fact {
+        let statement = format!("Ada lives in {city}");
+        let episode = self
+            .store
+            .insert_episode(
+                &ctx(),
+                NewEpisode {
+                    scope: scope.clone(),
+                    source: "seed".into(),
+                    trust,
+                    content: statement.clone(),
+                    occurred_at: Some(date(2020)),
+                    metadata: json!({}),
+                    idempotency_key: None,
+                },
+            )
+            .await
+            .expect("insert episode");
+        let subject_id = self.seed_entity(scope, "Ada", vector_for("Ada")).await;
+        let ids = self
+            .store
+            .apply_commit(
+                &ctx(),
+                episode.id,
+                vec![FactOp::Add(NewFact {
+                    scope: scope.clone(),
+                    subject_id,
+                    predicate: "lives_in".into(),
+                    object_id: None,
+                    embedding: vector_for(&statement),
+                    statement,
+                    trust,
+                    status: FactStatus::Active,
+                    valid_from: date(2020),
+                    valid_to: None,
+                    expires_at: None,
+                })],
+            )
+            .await
+            .expect("apply");
+        self.store.get_fact(&ctx(), ids[0]).await.expect("fact")
+    }
+
+    async fn is_current(&self, id: Uuid) -> bool {
+        let fact = self.store.get_fact(&ctx(), id).await.expect("fact");
+        fact.status == FactStatus::Active && fact.superseded_by.is_none() && fact.valid_to.is_none()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_value_of_a_single_valued_predicate_closes_the_old_one() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let (old, _) = commit_fact(&w.host, &ctx(), &scope, lives_in("Jakarta")).await;
+    // A multi-valued fact on the same subject is never touched.
+    let (likes, _) = commit_fact(&w.host, &ctx(), &scope, add_fact("Ada likes tea", "Ada")).await;
+
+    let (new, episode) = commit_fact(&w.host, &ctx(), &scope, lives_in("Bandung")).await;
+    assert_eq!(new.status, FactStatus::Active);
+    assert!(!new.corroborated);
+    assert_eq!(new.superseded, Some(old.id));
+    assert!(
+        new.related.iter().all(|r| r.id != old.id),
+        "{:?}",
+        new.related
+    );
+    let closed = w.store.get_fact(&ctx(), old.id).await.expect("old");
+    assert_eq!(closed.superseded_by, Some(new.id));
+    assert!(closed.valid_to.is_some());
+    assert!(w.is_current(new.id).await);
+    assert!(w.is_current(likes.id).await);
+    let now = w.recall_ids(&scope, "Ada lives in", None).await;
+    assert!(now.contains(&new.id) && !now.contains(&old.id), "{now:?}");
+    let history: Vec<Uuid> = w
+        .store
+        .fact_history(&ctx(), new.id)
+        .await
+        .expect("history")
+        .into_iter()
+        .map(|fact| fact.id)
+        .collect();
+    assert_eq!(history, [old.id, new.id]);
+
+    // Purging the commit that closed the old value reopens it, as any supersede purge does.
+    w.store.purge_episode(&ctx(), episode).await.expect("purge");
+    assert!(w.is_current(old.id).await);
+    let reopened = w.store.get_fact(&ctx(), old.id).await.expect("old");
+    assert_eq!(reopened.superseded_by, None);
+
+    // Saying the current value again is a repeat, and closes nothing.
+    let (repeat, _) = commit_fact(&w.host, &ctx(), &scope, lives_in("Jakarta")).await;
+    assert_eq!((repeat.id, repeat.corroborated), (old.id, true));
+    assert_eq!(repeat.superseded, None);
+    assert!(w.is_current(old.id).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_predicate_matches_after_normalizing_to_snake_case() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let mut first = lives_in("Jakarta");
+    first.predicate = "Lives In".into();
+    let (old, _) = commit_fact(&w.host, &ctx(), &scope, first).await;
+    let mut second = lives_in("Bandung");
+    second.predicate = "livesIn".into();
+    let (new, _) = commit_fact(&w.host, &ctx(), &scope, second).await;
+    assert_eq!(new.superseded, Some(old.id));
+    assert!(!w.is_current(old.id).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quarantined_new_value_waits_for_approval_to_close_the_old_one() {
+    let w = world().await;
+    // An agent's commit to a user scope is quarantined whatever it says. The first value is
+    // approved, so the old fact is current at the same trust as the new one.
+    let scope = Scope::user("u1");
+    let (old, _) = commit_fact(&w.host, &ctx(), &scope, lives_in("Jakarta")).await;
+    assert_eq!(
+        (old.status, old.superseded),
+        (FactStatus::Quarantined, None)
+    );
+    w.store
+        .approve_fact(&ctx(), old.id)
+        .await
+        .expect("approve old");
+    let (new, _) = commit_fact(&w.host, &ctx(), &scope, lives_in("Bandung")).await;
+    assert_eq!(new.status, FactStatus::Quarantined);
+    assert_eq!(new.superseded, Some(old.id));
+    let held = w.store.get_fact(&ctx(), new.id).await.expect("new");
+    assert_eq!(held.pending_supersede_of, Some(old.id));
+    assert!(w.is_current(old.id).await);
+
+    w.store.approve_fact(&ctx(), new.id).await.expect("approve");
+    let closed = w.store.get_fact(&ctx(), old.id).await.expect("old");
+    assert_eq!(closed.superseded_by, Some(new.id));
+    assert!(w.is_current(new.id).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_below_the_old_facts_trust_does_not_close_it_and_lists_it() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let old = w.seed_lives_in(&scope, Trust::User, "Jakarta").await;
+    let (new, _) = commit_fact(&w.host, &ctx(), &scope, lives_in("Bandung")).await;
+    assert_eq!(new.superseded, None);
+    assert_eq!(new.related.first().map(|r| r.id), Some(old.id));
+    assert_eq!(new.related[0].statement, "Ada lives in Jakarta");
+    assert!(w.is_current(old.id).await);
+    // The store's subject and predicate rule still holds the lower-trust fact for review.
+    let added = w.store.get_fact(&ctx(), new.id).await.expect("new");
+    assert_eq!(added.pending_supersede_of, None);
+    assert_eq!(new.status, FactStatus::Quarantined);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn another_scope_or_tenant_is_never_touched() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let globex = tenant_ctx("globex");
+    let (other_scope, _) =
+        commit_fact(&w.host, &ctx(), &Scope::agent("a2"), lives_in("Jakarta")).await;
+    let (other_tenant, _) = commit_fact(&w.host, &globex, &scope, lives_in("Jakarta")).await;
+
+    let (mine, _) = commit_fact(&w.host, &ctx(), &scope, lives_in("Bandung")).await;
+    assert_eq!(mine.superseded, None);
+    assert!(w.is_current(other_scope.id).await);
+    let foreign = w
+        .store
+        .get_fact(&globex, other_tenant.id)
+        .await
+        .expect("other tenant");
+    assert_eq!((foreign.superseded_by, foreign.valid_to), (None, None));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expired_value_or_a_turned_off_list_closes_nothing() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let mut leave = lives_in("Jakarta");
+    leave.valid_from = Some(Utc::now() - chrono::Duration::days(10));
+    leave.expires_at = Some(Utc::now() - chrono::Duration::days(1));
+    let (expired, _) = commit_fact(&w.host, &ctx(), &scope, leave).await;
+    let (new, _) = commit_fact(&w.host, &ctx(), &scope, lives_in("Bandung")).await;
+    assert_eq!(new.superseded, None);
+    let untouched = w.store.get_fact(&ctx(), expired.id).await.expect("expired");
+    assert_eq!(untouched.superseded_by, None);
+
+    let off = HostCommitter::new(w.store.clone(), w.embedder.clone())
+        .with_single_valued(SingleValued::parse(","));
+    let (other, _) = commit_fact(&off, &ctx(), &scope, lives_in("Surabaya")).await;
+    assert_eq!(other.superseded, None);
+    assert!(w.is_current(new.id).await);
+    assert!(w.is_current(other.id).await);
+
+    // A configured list replaces the default.
+    let custom = HostCommitter::new(w.store.clone(), w.embedder.clone())
+        .with_single_valued(SingleValued::parse("likes"));
+    let likes = |text: &str| {
+        let mut fact = add_fact(text, "Ada");
+        fact.predicate = "likes".into();
+        fact
+    };
+    let (tea, _) = commit_fact(&custom, &ctx(), &scope, likes("Ada likes tea")).await;
+    let (coffee, _) = commit_fact(&custom, &ctx(), &scope, likes("Ada likes coffee")).await;
+    assert_eq!(coffee.superseded, Some(tea.id));
+    let (medan, _) = commit_fact(&custom, &ctx(), &scope, lives_in("Medan")).await;
+    assert_eq!(medan.superseded, None);
 }

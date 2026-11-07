@@ -542,3 +542,60 @@ async fn errors_take_the_documented_shapes() {
     .await;
     assert_eq!(status, StatusCode::OK);
 }
+
+/// commit_facts masks secrets the same way REST does.
+#[tokio::test(flavor = "multi_thread")]
+async fn commit_facts_masks_secrets_before_storing() {
+    let server = Server::start().await;
+    let key = server.root("mcp-redact").await;
+    let (is_error, committed) = call_tool(
+        &server,
+        &key,
+        "commit_facts",
+        json!({
+            "scope": "agent:a1",
+            "source": "chat",
+            "content": "export SLACK_TOKEN=xoxb-1234567890-abcdefghij",
+            "facts": [{
+                "statement": "The CI bot authenticates with Bearer abcdef0123456789ABCDEF",
+                "subject": {"name": "CI bot", "kind": "service"},
+                "predicate": "authenticates_with",
+            }],
+        }),
+    )
+    .await;
+    assert!(!is_error, "{committed}");
+    assert_eq!(committed["redacted"], true, "{committed}");
+    let fact = server
+        .fact_json(&key, uuid_at(&committed, "/facts/0/id"))
+        .await;
+    assert_eq!(
+        fact["statement"],
+        "The CI bot authenticates with Bearer [redacted]"
+    );
+    let (status, episode) = server
+        .call(
+            "GET",
+            &format!("/v1/episodes/{}", uuid_at(&committed, "/episode_id")),
+            Some(&key),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{episode}");
+    assert_eq!(episode["content"], "export SLACK_TOKEN=[redacted]");
+
+    let (is_error, clean) = call_tool(
+        &server,
+        &key,
+        "commit_facts",
+        json!({
+            "scope": "agent:a1",
+            "source": "chat",
+            "content": "Ada likes tea",
+            "facts": [statement("Ada likes tea", "Ada")],
+        }),
+    )
+    .await;
+    assert!(!is_error, "{clean}");
+    assert_eq!(clean["redacted"], false, "{clean}");
+}

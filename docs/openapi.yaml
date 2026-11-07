@@ -110,9 +110,15 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [episode_id, facts]
+                required: [episode_id, facts, redacted]
                 properties:
                   episode_id: { type: string, format: uuid }
+                  redacted:
+                    type: boolean
+                    description: >-
+                      True when a secret (an API key, token, private key, JWT or a value labelled
+                      password, secret, token or api_key) in content, a statement or an entity
+                      name was replaced by [redacted] before it was stored
                   facts:
                     type: array
                     items:
@@ -136,7 +142,11 @@ paths:
                             Set with corroborated when the request fact named this id in
                             supersedes and a current fact already held its statement: no fact
                             was created, and id became the successor of the superseded fact.
-                            Omitted otherwise
+                            Also set on a created fact whose predicate is single-valued (such as
+                            lives_in or works_at, see MEMORYOS_SINGLE_VALUED_PREDICATES) to the
+                            current fact of the same subject and predicate that it replaced:
+                            closed now when status is active, and when approved when it is
+                            quarantined. Omitted otherwise, and on an idempotency replay
                         related:
                           type: array
                           maxItems: 3
@@ -491,6 +501,13 @@ components:
               predicate: { type: string }
               object: { oneOf: [{ $ref: "#/components/schemas/EntityRef" }, { type: "null" }] }
               valid_from: { type: [string, "null"], format: date-time }
+              expires_at:
+                type: [string, "null"]
+                format: date-time
+                description: >-
+                  When the fact stops being true with nothing replacing it, such as the end of a
+                  leave. Must be after valid_from. From then on it is not current: recall,
+                  candidates and matching skip it, and it stays in history and in state=past
               supersedes: { type: [string, "null"], format: uuid }
               corroborates: { type: [string, "null"], format: uuid }
     Episode:
@@ -529,6 +546,10 @@ components:
         status: { type: string, enum: [active, quarantined, rejected] }
         valid_from: { type: string, format: date-time }
         valid_to: { type: [string, "null"], format: date-time }
+        expires_at:
+          type: [string, "null"]
+          format: date-time
+          description: The commit's own end of the fact. The fact is not current from this time
         recorded_at: { type: string, format: date-time }
         invalidated_at: { type: [string, "null"], format: date-time }
         superseded_by: { type: [string, "null"], format: uuid }

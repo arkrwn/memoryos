@@ -556,3 +556,66 @@ async fn commit_validates_its_limits_and_shape() {
     assert_eq!(status, StatusCode::OK, "{replay}");
     assert_eq!(uuid_at(&replay, "/facts/0/id"), first);
 }
+
+/// Secrets in what a commit stores are masked before storage, and the response says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn rest_commit_masks_secrets_before_storing() {
+    let server = Server::start().await;
+    let root = server.root("redact").await;
+    let mem = server.sdk(&root);
+    let committed = mem
+        .commit(&Commit::new(
+            Scope::agent("a1"),
+            "chat",
+            "Ada pasted password=hunter2 and sk-abcdefghijklmnopqrstuvwxyz",
+            vec![CommitFact::new(
+                "Ada's deploy key is ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789",
+                EntityRef::new("Ada", "person"),
+                "has_deploy_key",
+            )
+            .object(EntityRef::new("AKIAIOSFODNN7EXAMPLE", "credential"))],
+        ))
+        .await
+        .expect("commit");
+    assert!(committed.redacted);
+    let fact = mem.get_fact(committed.facts[0].id).await.expect("fact");
+    assert_eq!(fact.statement, "Ada's deploy key is [redacted]");
+    let episode = mem
+        .get_episode(committed.episode_id)
+        .await
+        .expect("episode");
+    assert_eq!(
+        episode.content,
+        "Ada pasted password=[redacted] and [redacted]"
+    );
+    let (status, body) = server
+        .call(
+            "GET",
+            "/v1/facts?scope=agent:a1&state=all",
+            Some(&root),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let text = body.to_string();
+    assert!(!text.contains("AKIA") && !text.contains("ghp_"), "{text}");
+    assert!(text.contains("[redacted]"), "{text}");
+
+    let hash = "3f2a9c1e8b7d6f5a4c3b2a1908f7e6d5c4b3a291";
+    let clean = mem
+        .commit(&Commit::new(
+            Scope::agent("a1"),
+            "chat",
+            format!("Ada fixed commit {hash}"),
+            vec![CommitFact::new(
+                format!("Ada fixed commit {hash}"),
+                EntityRef::new("Ada", "person"),
+                "fixed",
+            )],
+        ))
+        .await
+        .expect("clean commit");
+    assert!(!clean.redacted);
+    let fact = mem.get_fact(clean.facts[0].id).await.expect("fact");
+    assert_eq!(fact.statement, format!("Ada fixed commit {hash}"));
+}

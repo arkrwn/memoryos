@@ -41,6 +41,9 @@ pub struct CommitFact {
     pub object: Option<EntityRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub valid_from: Option<DateTime<Utc>>,
+    /// When the fact stops being true with nothing replacing it, such as the end of a leave.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -59,6 +62,7 @@ impl CommitFact {
             predicate: predicate.into(),
             object: None,
             valid_from: None,
+            expires_at: None,
             supersedes: None,
             corroborates: None,
         }
@@ -71,6 +75,12 @@ impl CommitFact {
 
     pub fn valid_from(mut self, at: DateTime<Utc>) -> Self {
         self.valid_from = Some(at);
+        self
+    }
+
+    /// After this time the fact is no longer current, though it stays in history.
+    pub fn expires_at(mut self, at: DateTime<Utc>) -> Self {
+        self.expires_at = Some(at);
         self
     }
 
@@ -121,6 +131,10 @@ impl Commit {
 pub struct CommitResponse {
     pub episode_id: Uuid,
     pub facts: Vec<CommittedFact>,
+    /// The server masked a secret in a statement, an entity name or the content before storing it.
+    /// False when absent, as from an older server.
+    #[serde(default)]
+    pub redacted: bool,
 }
 
 /// The fields after `status` default when absent, so a response from an older server still parses.
@@ -135,6 +149,8 @@ pub struct CommittedFact {
     #[serde(default)]
     pub related: Vec<RelatedFact>,
     /// With `corroborated`: the fact this request superseded, now closed with `id` as successor.
+    /// On a created fact with a single-valued predicate, such as `lives_in`: the current fact it
+    /// replaced, closed now if `status` is active and on approval if quarantined.
     #[serde(default)]
     pub superseded: Option<Uuid>,
 }
@@ -219,6 +235,16 @@ mod tests {
                     "predicate": "likes",
                 }],
             })
+        );
+    }
+
+    #[test]
+    fn commit_fact_sends_expires_at_when_set() {
+        let fact = CommitFact::new("Ada is on leave", EntityRef::new("Ada", "person"), "is_on")
+            .expires_at(date(2030, 1, 4));
+        assert_eq!(
+            serde_json::to_value(&fact).expect("serializes")["expires_at"],
+            "2030-01-04T00:00:00Z"
         );
     }
 

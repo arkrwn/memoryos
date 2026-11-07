@@ -13,7 +13,8 @@ pub(crate) const BLOCK_COLS: &str = "id, agent_id, label, content, max_chars, ve
 pub(crate) const API_KEY_COLS: &str = "id, tenant, name, scopes, max_trust, is_admin";
 /// Requires the table alias `f`. The embedding is left out on purpose: it is never returned.
 pub(crate) const FACT_COLS: &str = "f.id, f.scope, f.subject_id, f.predicate, f.object_id, \
-    f.statement, f.trust, f.status, f.valid_from, f.valid_to, f.recorded_at, f.invalidated_at, \
+    f.statement, f.trust, f.status, f.valid_from, f.valid_to, f.expires_at, f.recorded_at, \
+    f.invalidated_at, \
     f.superseded_by, f.pending_supersede_of, ARRAY(SELECT s.episode_id FROM fact_sources s WHERE s.fact_id = f.id \
     ORDER BY s.episode_id) AS source_episode_ids";
 
@@ -36,6 +37,7 @@ fn visible_at(t: &str, k: &str) -> String {
         "f.status = 'active' \
          AND f.valid_from <= {t} \
          AND (f.valid_to IS NULL OR f.valid_to > {t}) \
+         AND (f.expires_at IS NULL OR f.expires_at > {t}) \
          AND f.recorded_at <= {k} \
          AND (f.invalidated_at IS NULL OR f.invalidated_at > {k})"
     )
@@ -91,6 +93,7 @@ pub(crate) fn fact(row: &PgRow) -> Result<Fact> {
         status: parsed(row, "status")?,
         valid_from: get(row, "valid_from")?,
         valid_to: get(row, "valid_to")?,
+        expires_at: get(row, "expires_at")?,
         recorded_at: get(row, "recorded_at")?,
         invalidated_at: get(row, "invalidated_at")?,
         superseded_by: get(row, "superseded_by")?,

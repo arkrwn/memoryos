@@ -1941,6 +1941,7 @@ dependencies = [
  "memoryos-embed",
  "memoryos-retrieve",
  "memoryos-store",
+ "regex",
  "serde",
  "serde_json",
  "sqlx",
