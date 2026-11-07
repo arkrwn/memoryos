@@ -31,6 +31,12 @@ pub(crate) enum Resolution {
     Corroborate {
         fact_id: Uuid,
     },
+    /// A `Supersede` whose statement the current fact `fact_id` already holds. Only built when the
+    /// draft would be active, since only a new quarantined fact can carry the pending close.
+    SupersedeWithExisting {
+        old_fact_id: Uuid,
+        fact_id: Uuid,
+    },
 }
 
 /// SPEC section 5. `contradicted` is the trust of the fact the statement would supersede. An `Add`
@@ -59,6 +65,13 @@ pub(crate) fn build_op(source: &Source<'_>, resolution: Resolution) -> FactOp {
             new: new_fact(source, draft, Some(old_trust)),
         },
         Resolution::Corroborate { fact_id } => FactOp::Corroborate { fact_id },
+        Resolution::SupersedeWithExisting {
+            old_fact_id,
+            fact_id,
+        } => FactOp::SupersedeWithExisting {
+            old_fact_id,
+            fact_id,
+        },
     }
 }
 

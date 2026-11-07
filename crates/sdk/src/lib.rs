@@ -37,4 +37,5 @@ pub use memoryos_core::{
 };
 pub use types::{
     date, Commit, CommitFact, CommitResponse, CommittedFact, EntityRef, PutBlock, RecallResponse,
+    RelatedFact,
 };

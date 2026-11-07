@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::entities::{add_earned_aliases, embed_batch, Merge};
-use crate::gate::{build_op, FactDraft, Resolution, Source};
+use crate::gate::{build_op, status_for, FactDraft, Resolution, Source};
 use crate::validate::{is_blank_or_unstorable, MAX_CONTENT_CHARS};
 
 const MAX_FACTS: usize = 50;
@@ -23,7 +23,7 @@ const MAX_FACTS: usize = 50;
 const MAX_INDEXED_CHARS: usize = 512;
 const MAX_KIND_CHARS: usize = 64;
 const MAX_FUTURE_VALID_FROM_DAYS: i64 = 1;
-/// Current facts compared with each statement that names neither `supersedes` nor `corroborates`.
+/// Current facts compared with each statement that does not name `corroborates`.
 const MATCH_CANDIDATES: i64 = 10;
 /// At most this many `related` facts per created fact: enough to spot an older value, little to read.
 const MAX_RELATED: usize = 3;
@@ -83,6 +83,11 @@ pub struct CommittedFact {
     /// repeats, best first. Empty on a replay.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub related: Vec<RelatedFact>,
+    /// Set with `corroborated` when the request fact named this id in `supersedes` and the
+    /// statement was already a current fact: that fact, `id`, gained this source and became the
+    /// successor of the superseded fact, instead of a duplicate being created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded: Option<Uuid>,
 }
 
 /// `facts` has one entry per request fact, in order, read back from the store. Each status is the
@@ -250,7 +255,17 @@ impl HostCommitter {
                 self.match_existing(ctx, &req.scope, fact, embedding.as_deref(), &superseded)
             })
             .collect();
-        let matches: Vec<Matched> = try_join_all(searches).await?;
+        let mut matches: Vec<Matched> = try_join_all(searches).await?;
+        // A supersede reuses a matching fact only if its new fact would be active. A quarantined
+        // one must be created, since it is what records the close for approval to perform.
+        for ((fact, target), matched) in req.facts.iter().zip(&targets).zip(&mut matches) {
+            if let (Some(_), Some(old)) = (fact.supersedes, target) {
+                if status_for(&episode.scope, episode.trust, Some(old.trust)) != FactStatus::Active
+                {
+                    matched.existing = None;
+                }
+            }
+        }
 
         // Only a fact that is created needs its entities resolved, which may create them.
         let used: Vec<&EntityRef> = req
@@ -272,7 +287,13 @@ impl HostCommitter {
         let mut related = Vec::with_capacity(req.facts.len());
         let decided = req.facts.iter().zip(targets).zip(embeddings).zip(matches);
         for (((fact, target), embedding), matched) in decided {
-            let resolution = if let Some(fact_id) = fact.corroborates.or(matched.existing) {
+            let resolution = if let (Some(fact_id), Some(old)) = (matched.existing, &target) {
+                // Only a supersede has both a target and a match.
+                Resolution::SupersedeWithExisting {
+                    old_fact_id: old.id,
+                    fact_id,
+                }
+            } else if let Some(fact_id) = fact.corroborates.or(matched.existing) {
                 Resolution::Corroborate { fact_id }
             } else {
                 let embedding = embedding
@@ -308,9 +329,10 @@ impl HostCommitter {
         })
     }
 
-    /// Compares a statement that names neither `supersedes` nor `corroborates` with the current
-    /// facts of the commit's scope, through the same search as `recall_candidates`. The caller is
-    /// already allowed that scope, and the search reads no other scope and no other tenant.
+    /// Compares a statement that does not name `corroborates` with the current facts of the
+    /// commit's scope, through the same search as `recall_candidates`. The caller is already
+    /// allowed that scope, and the search reads no other scope and no other tenant. A supersede
+    /// only looks for a repeat, which then takes the place of its new fact, and lists no `related`.
     async fn match_existing(
         &self,
         ctx: &RequestContext,
@@ -319,7 +341,7 @@ impl HostCommitter {
         embedding: Option<&[f32]>,
         superseded: &HashSet<Uuid>,
     ) -> Result<Matched> {
-        let (None, None, Some(embedding)) = (fact.supersedes, fact.corroborates, embedding) else {
+        let (None, Some(embedding)) = (fact.corroborates, embedding) else {
             return Ok(Matched::default());
         };
         let found = self
@@ -332,7 +354,11 @@ impl HostCommitter {
                 MATCH_CANDIDATES,
             )
             .await?;
-        Ok(pick(scope, &fact.statement, found, superseded))
+        let mut matched = pick(scope, &fact.statement, found, superseded);
+        if fact.supersedes.is_some() {
+            matched.related.clear();
+        }
+        Ok(matched)
     }
 
     /// One message for every failure, so a caller cannot probe which ids exist elsewhere. Row-level
@@ -483,9 +509,10 @@ fn require_same_request(episode: &Episode, req: &CommitRequest, trust: Trust) ->
 
 /// Lines the episode's facts up with the request. A request fact that corroborates names its fact.
 /// A fact the episode created was recorded in the transaction that processed it, at
-/// `processed_at`, and one it only linked was recorded earlier. A request fact that names nothing
-/// takes a linked fact with the same normalized statement if there is one, since that is what it
-/// was matched to, and otherwise the next created fact in creation order. With no `processed_at`
+/// `processed_at`, and one it only linked was recorded earlier. A request fact that names nothing,
+/// or only `supersedes`, takes a linked fact with the same normalized statement if there is one,
+/// since that is what it was matched to, and otherwise the next created fact in creation order. A
+/// supersede matched that way reports the fact it closed as `superseded`. With no `processed_at`
 /// every unnamed fact counts as created. The key check does not compare the fact lists, so a
 /// replay may not match: whatever is left over is appended rather than hidden, and a request fact
 /// with no match is skipped. `related` goes onto created facts by request position.
@@ -501,6 +528,7 @@ fn in_request_order(
         status: fact.status,
         corroborated,
         related,
+        superseded: None,
     };
     let (created, linked): (Vec<&Fact>, Vec<&Fact>) = facts
         .iter()
@@ -521,9 +549,12 @@ fn in_request_order(
                 .iter()
                 .find(|fact| fact.id == id)
                 .map(|fact| as_committed(fact, true, Vec::new())),
-            (None, None, Some(fact)) => {
+            (None, supersedes, Some(fact)) => {
                 linked_reported.insert(fact.id);
-                Some(as_committed(fact, true, Vec::new()))
+                Some(CommittedFact {
+                    superseded: supersedes,
+                    ..as_committed(fact, true, Vec::new())
+                })
             }
             (None, _, _) => created
                 .next()
@@ -729,12 +760,14 @@ mod tests {
                     status: FactStatus::Quarantined,
                     corroborated: false,
                     related: Vec::new(),
+                    superseded: None,
                 },
                 CommittedFact {
                     id,
                     status: FactStatus::Active,
                     corroborated: true,
                     related: Vec::new(),
+                    superseded: Some(id),
                 },
                 CommittedFact {
                     id,
@@ -745,15 +778,16 @@ mod tests {
                         statement: "r".into(),
                         score: 0.5,
                     }],
+                    superseded: None,
                 },
             ],
         };
-        // The two optional fields are left out when they say nothing.
+        // The optional fields are left out when they say nothing.
         assert_eq!(
             serde_json::to_value(response).expect("serialize"),
             json!({"episode_id": id, "facts": [
                 {"id": id, "status": "quarantined"},
-                {"id": id, "status": "active", "corroborated": true},
+                {"id": id, "status": "active", "corroborated": true, "superseded": id},
                 {"id": id, "status": "active", "related": [{"id": id, "statement": "r", "score": 0.5}]},
             ]})
         );

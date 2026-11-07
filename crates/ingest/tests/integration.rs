@@ -1523,3 +1523,324 @@ async fn a_replay_reports_a_matched_repeat_in_request_order() {
     assert_eq!(shape(&replay), shape(&first));
     assert_eq!(w.count("facts").await, 3);
 }
+
+// ---- Supersede onto an existing fact ---------------------------------------------------------
+
+/// A one-fact request that supersedes `old` with `text`.
+fn supersede_request(scope: &Scope, content: &str, text: &str, old: Uuid) -> CommitRequest {
+    let mut fact = add_fact(text, "Ada");
+    fact.supersedes = Some(old);
+    commit_request(scope, content, vec![fact])
+}
+
+/// The flow the tool description asks for: a first call creates a fact and lists an older value as
+/// `related`, then a second call sends the same statement superseding it.
+async fn second_call_supersedes(w: &World, statement: &str) -> (Uuid, Uuid, CommittedFact) {
+    let scope = Scope::agent("a1");
+    let old = commit_as(w, &ctx(), &scope, "Ada lives in Jakarta", "Ada").await;
+    let first = commit_as(w, &ctx(), &scope, "Ada lives in Bandung", "Ada").await;
+    assert!(!first.corroborated);
+    assert!(first.related.iter().any(|r| r.id == old.id));
+
+    let mut second = w
+        .host
+        .commit(
+            &ctx(),
+            supersede_request(&scope, "moved", statement, old.id),
+            Trust::Agent,
+        )
+        .await
+        .expect("second call");
+    assert_eq!(second.facts.len(), 1);
+    (old.id, first.id, second.facts.remove(0))
+}
+
+/// Exactly one current fact remains, and it is the one the first call created.
+async fn assert_closed_into(w: &World, old: Uuid, kept: Uuid) {
+    let scope = Scope::agent("a1");
+    assert_eq!(w.count("facts").await, 2);
+    let kept = w.store.get_fact(&ctx(), kept).await.expect("kept");
+    let old = w.store.get_fact(&ctx(), old).await.expect("old");
+    assert_eq!(old.superseded_by, Some(kept.id));
+    assert_eq!(old.valid_to, Some(kept.valid_from));
+    assert_eq!((kept.superseded_by, kept.valid_to), (None, None));
+    assert_eq!(kept.status, FactStatus::Active);
+    assert_eq!(kept.statement, "Ada lives in Bandung");
+    assert_eq!(kept.source_episode_ids.len(), 2);
+    let history: Vec<Uuid> = w
+        .store
+        .fact_history(&ctx(), kept.id)
+        .await
+        .expect("history")
+        .into_iter()
+        .map(|fact| fact.id)
+        .collect();
+    assert_eq!(history, [old.id, kept.id]);
+    assert_eq!(
+        w.recall_ids(&scope, "Ada lives in Jakarta", None).await,
+        [kept.id]
+    );
+    // History is intact: before the move, the old value was the one in effect.
+    let before = kept.valid_from - chrono::Duration::milliseconds(1);
+    assert!(w
+        .recall_ids(&scope, "Ada lives in Jakarta", Some(before))
+        .await
+        .contains(&old.id));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_call_superseding_a_related_fact_creates_no_duplicate() {
+    let w = world().await;
+    let (old, created, second) = second_call_supersedes(&w, "Ada lives in Bandung").await;
+    assert_eq!(second.id, created);
+    assert!(second.corroborated);
+    assert_eq!(second.superseded, Some(old));
+    assert_eq!(second.status, FactStatus::Active);
+    assert!(second.related.is_empty());
+    assert_closed_into(&w, old, created).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_case_and_period_variant_of_the_second_call_also_reuses_the_fact() {
+    let w = world().await;
+    let (old, created, second) = second_call_supersedes(&w, "ada lives in  BANDUNG.").await;
+    assert_eq!(second.id, created);
+    assert!(second.corroborated);
+    assert_eq!(second.superseded, Some(old));
+    assert_closed_into(&w, old, created).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_supersede_with_no_current_repeat_creates_its_fact() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let old = commit_one(&w, &scope, "Ada lives in Rome", "Ada").await;
+    let other = commit_one(&w, &scope, "Ada lives near Rome", "Ada").await;
+
+    let response = w
+        .host
+        .commit(
+            &ctx(),
+            supersede_request(&scope, "moved", "Ada lives in Oslo", old),
+            Trust::Agent,
+        )
+        .await
+        .expect("commit");
+    let new = &response.facts[0];
+    assert!(!new.corroborated);
+    assert_eq!(new.superseded, None);
+    assert!(new.related.is_empty());
+    assert_ne!(new.id, other);
+    assert_eq!(w.count("facts").await, 3);
+    let old = w.store.get_fact(&ctx(), old).await.expect("old");
+    assert_eq!(old.superseded_by, Some(new.id));
+    let other = w.store.get_fact(&ctx(), other).await.expect("other");
+    assert_eq!(
+        (other.superseded_by, other.source_episode_ids.len()),
+        (None, 1)
+    );
+}
+
+/// The new value would be held for review, so it is created as before: only a quarantined new fact
+/// can carry the close until an admin approves it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_supersede_of_higher_trust_still_creates_a_held_fact() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let old = w
+        .seed_fact(
+            &scope,
+            Trust::User,
+            "Ada is vegan",
+            "Ada",
+            vector_for("ada"),
+        )
+        .await;
+    let existing = commit_one(&w, &scope, "Ada eats fish", "Ada").await;
+
+    let response = w
+        .host
+        .commit(
+            &ctx(),
+            supersede_request(&scope, "host words", "Ada eats fish", old.id),
+            Trust::Agent,
+        )
+        .await
+        .expect("commit");
+    let held = &response.facts[0];
+    assert_ne!(held.id, existing);
+    assert!(!held.corroborated);
+    assert_eq!(held.superseded, None);
+    assert_eq!(held.status, FactStatus::Quarantined);
+    let held = w.store.get_fact(&ctx(), held.id).await.expect("held");
+    assert_eq!(held.pending_supersede_of, Some(old.id));
+    let old = w.store.get_fact(&ctx(), old.id).await.expect("old");
+    assert_eq!((old.valid_to, old.superseded_by), (None, None));
+    let existing = w.store.get_fact(&ctx(), existing).await.expect("existing");
+    assert_eq!(existing.source_episode_ids.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replayed_second_call_changes_nothing() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let old = commit_one(&w, &scope, "Ada lives in Jakarta", "Ada").await;
+    let created = commit_one(&w, &scope, "Ada lives in Bandung", "Ada").await;
+    let mut request = supersede_request(&scope, "moved", "Ada lives in Bandung", old);
+    request.idempotency_key = Some("key-move".into());
+
+    let first = w
+        .host
+        .commit(&ctx(), request.clone(), Trust::Agent)
+        .await
+        .expect("first");
+    let counts = (
+        w.count("facts").await,
+        w.count("episodes").await,
+        w.count("fact_sources").await,
+    );
+    let replay = w
+        .host
+        .commit(&ctx(), request, Trust::Agent)
+        .await
+        .expect("replay");
+    assert_eq!(replay.episode_id, first.episode_id);
+    let shape = |r: &CommitResponse| -> Vec<(Uuid, bool, Option<Uuid>)> {
+        r.facts
+            .iter()
+            .map(|f| (f.id, f.corroborated, f.superseded))
+            .collect()
+    };
+    assert_eq!(shape(&first), [(created, true, Some(old))]);
+    assert_eq!(shape(&replay), shape(&first));
+    assert_eq!(
+        (
+            w.count("facts").await,
+            w.count("episodes").await,
+            w.count("fact_sources").await,
+        ),
+        counts
+    );
+    assert_closed_into(&w, old, created).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_supersede_never_reuses_a_fact_of_another_scope_or_tenant() {
+    let w = world().await;
+    let scope = Scope::agent("a1");
+    let globex = tenant_ctx("globex");
+    let other_scope = commit_as(
+        &w,
+        &ctx(),
+        &Scope::agent("a2"),
+        "Ada lives in Bandung",
+        "Ada",
+    )
+    .await;
+    let other_tenant = commit_as(&w, &globex, &scope, "Ada lives in Bandung", "Ada").await;
+    let old = commit_one(&w, &scope, "Ada lives in Jakarta", "Ada").await;
+
+    let response = w
+        .host
+        .commit(
+            &ctx(),
+            supersede_request(&scope, "moved", "Ada lives in Bandung", old),
+            Trust::Agent,
+        )
+        .await
+        .expect("commit");
+    let new = &response.facts[0];
+    assert!(!new.corroborated);
+    assert_ne!(new.id, other_scope.id);
+    assert_ne!(new.id, other_tenant.id);
+    assert_eq!(w.count("facts").await, 4);
+    let old = w.store.get_fact(&ctx(), old).await.expect("old");
+    assert_eq!(old.superseded_by, Some(new.id));
+    for (ctx, foreign) in [(ctx(), other_scope.id), (globex, other_tenant.id)] {
+        let fact = w.store.get_fact(&ctx, foreign).await.expect("fact");
+        assert_eq!(fact.source_episode_ids.len(), 1);
+        assert_eq!(fact.superseded_by, None);
+    }
+}
+
+/// The two-call flow, returning the old fact, the reused fact, its original episode and call 2's.
+async fn two_calls(w: &World) -> (Uuid, Uuid, Uuid, Uuid) {
+    let scope = Scope::agent("a1");
+    let old = commit_one(w, &scope, "Ada lives in Jakarta", "Ada").await;
+    let kept = commit_one(w, &scope, "Ada lives in Bandung", "Ada").await;
+    let original = w
+        .store
+        .get_fact(&ctx(), kept)
+        .await
+        .expect("kept")
+        .source_episode_ids[0];
+    let second = w
+        .host
+        .commit(
+            &ctx(),
+            supersede_request(&scope, "moved", "Ada lives in Bandung", old),
+            Trust::Agent,
+        )
+        .await
+        .expect("second call");
+    assert_eq!(second.facts[0].id, kept);
+    assert_closed_into(w, old, kept).await;
+    (old, kept, original, second.episode_id)
+}
+
+/// The fact is current and alone in its history.
+async fn assert_current_alone(w: &World, id: Uuid) -> Fact {
+    let fact = w.store.get_fact(&ctx(), id).await.expect("fact");
+    assert_eq!((fact.superseded_by, fact.valid_to), (None, None));
+    assert_eq!(fact.status, FactStatus::Active);
+    let history: Vec<Uuid> = w
+        .store
+        .fact_history(&ctx(), id)
+        .await
+        .expect("history")
+        .into_iter()
+        .map(|fact| fact.id)
+        .collect();
+    assert_eq!(history, [id]);
+    fact
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn purging_the_second_call_reopens_the_old_fact() {
+    let w = world().await;
+    let (old, kept, original, second) = two_calls(&w).await;
+
+    w.store.purge_episode(&ctx(), second).await.expect("purge");
+    assert_current_alone(&w, old).await;
+    let kept_fact = assert_current_alone(&w, kept).await;
+    assert_eq!(kept_fact.source_episode_ids, [original]);
+    assert_eq!(w.count("facts").await, 2);
+
+    // Purging the reused fact's original source afterwards removes it and leaves the old one.
+    w.store
+        .purge_episode(&ctx(), original)
+        .await
+        .expect("purge");
+    assert_current_alone(&w, old).await;
+    assert_eq!(w.count("facts").await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn purging_the_reused_facts_source_first_keeps_the_close_until_call_two_goes() {
+    let w = world().await;
+    let (old, kept, original, second) = two_calls(&w).await;
+
+    // Call 2 still supports the reused fact, so it and the close stay.
+    w.store
+        .purge_episode(&ctx(), original)
+        .await
+        .expect("purge");
+    let kept_fact = w.store.get_fact(&ctx(), kept).await.expect("kept");
+    assert_eq!(kept_fact.source_episode_ids, [second]);
+    let old_fact = w.store.get_fact(&ctx(), old).await.expect("old");
+    assert_eq!(old_fact.superseded_by, Some(kept));
+
+    w.store.purge_episode(&ctx(), second).await.expect("purge");
+    assert_current_alone(&w, old).await;
+    assert_eq!(w.count("facts").await, 1);
+}

@@ -123,10 +123,28 @@ pub struct CommitResponse {
     pub facts: Vec<CommittedFact>,
 }
 
+/// The fields after `status` default when absent, so a response from an older server still parses.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CommittedFact {
     pub id: Uuid,
     pub status: FactStatus,
+    /// No fact was created: `id` is an existing fact that gained this source.
+    #[serde(default)]
+    pub corroborated: bool,
+    /// For a created fact, up to three current facts of the scope that resemble it, best first.
+    #[serde(default)]
+    pub related: Vec<RelatedFact>,
+    /// With `corroborated`: the fact this request superseded, now closed with `id` as successor.
+    #[serde(default)]
+    pub superseded: Option<Uuid>,
+}
+
+/// A current fact that resembles a created fact without repeating it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RelatedFact {
+    pub id: Uuid,
+    pub statement: String,
+    pub score: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -201,6 +219,33 @@ mod tests {
                     "predicate": "likes",
                 }],
             })
+        );
+    }
+
+    #[test]
+    fn committed_fact_parses_old_and_new_responses() {
+        let id = Uuid::now_v7();
+        let old: CommittedFact =
+            serde_json::from_value(json!({"id": id, "status": "active"})).expect("old shape");
+        assert!(!old.corroborated && old.related.is_empty() && old.superseded.is_none());
+
+        let new: CommittedFact = serde_json::from_value(json!({
+            "id": id,
+            "status": "active",
+            "corroborated": true,
+            "superseded": id,
+            "related": [{"id": id, "statement": "s", "score": 0.5}],
+        }))
+        .expect("new shape");
+        assert!(new.corroborated);
+        assert_eq!(new.superseded, Some(id));
+        assert_eq!(
+            new.related,
+            [RelatedFact {
+                id,
+                statement: "s".into(),
+                score: 0.5,
+            }]
         );
     }
 }
