@@ -5,6 +5,7 @@ use std::fmt;
 use std::time::Duration;
 
 use memoryos_ingest::SingleValued;
+use memoryos_retrieve::DEFAULT_RERANK_TOP;
 
 #[derive(Clone)]
 pub struct Config {
@@ -65,7 +66,7 @@ impl Config {
                 .map(|list| SingleValued::parse(&list))
                 .unwrap_or_default(),
             reranker: reranker_mode(&get)?,
-            rerank_top: number(&get, "MEMORYOS_RERANK_TOP", 20)?,
+            rerank_top: number(&get, "MEMORYOS_RERANK_TOP", DEFAULT_RERANK_TOP)?,
             #[cfg(feature = "test-embedder")]
             test_embedder_delay: get("MEMORYOS_TEST_EMBEDDER")
                 .map(|millis| {
@@ -178,10 +179,10 @@ mod tests {
     }
 
     #[test]
-    fn the_reranker_is_local_with_a_top_of_20_unless_set() {
+    fn the_reranker_is_local_with_a_top_of_10_unless_set() {
         let config = load(&[DB]).expect("valid");
         assert_eq!(config.reranker, RerankerMode::Local);
-        assert_eq!(config.rerank_top, 20);
+        assert_eq!(config.rerank_top, 10);
         let config = load(&[
             DB,
             ("MEMORYOS_RERANKER", " OFF "),

@@ -28,8 +28,10 @@ const GRAPH_EDGES_PER_SUBJECT: i64 = 50;
 const MAX_GRAPH_CANDIDATES: usize = 50;
 /// A slow embedder must not hold up recall, since text search can answer without it.
 const DEFAULT_EMBED_TIMEOUT: Duration = Duration::from_secs(2);
-/// The most fused facts recall sends to the reranker, unless `with_reranker` says otherwise.
-pub const DEFAULT_RERANK_TOP: usize = 20;
+/// The most fused facts recall sends to the reranker, unless `with_reranker` says otherwise. Each
+/// pair costs about 25 ms on the CPU in the container, and on a 15-question test the right fact
+/// was always in the fused top 10: 20 gave the same answers at about twice the time.
+pub const DEFAULT_RERANK_TOP: usize = 10;
 /// A slow reranker must not hold up recall, since the fused order is a usable answer.
 const DEFAULT_RERANK_TIMEOUT: Duration = Duration::from_secs(2);
 

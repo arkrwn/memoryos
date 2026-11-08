@@ -270,7 +270,7 @@ AND (invalidated_at IS NULL OR invalidated_at > K)
    list, and below the 10.9% gap between the best fact found by one list (`1 / 61`) and the worst
    found by two (`2 / 110`), so corroboration breaks ties and nudges but never lifts a fact found by
    one list over a fact found by two.
-6. Rerank: send the first `min(limit * 2, MEMORYOS_RERANK_TOP)` facts (default top 20) to the local
+6. Rerank: send the first `min(limit * 2, MEMORYOS_RERANK_TOP)` facts (default top 10) to the local
    cross-encoder, `BAAI/bge-reranker-v2-m3` in its int8 ONNX export
    (`onnx-community/bge-reranker-v2-m3-ONNX`, pinned revision), as (query, statement) pairs cut to
    256 tokens, in one batch on the CPU. Reorder those facts by its score, highest first. The sort is
@@ -339,7 +339,7 @@ adds a scope rule. A block update that omits `max_chars` keeps its limit.
 | `MEMORYOS_MODEL_CACHE` | user cache dir | Local models, the embedder's and the reranker's. Leave `HF_HOME` unset, since it overrides this |
 | `MEMORYOS_SINGLE_VALUED_PREDICATES` | the list in section 3, step 6 | Comma list that replaces the default. Names are normalized to lowercase snake case. A value with no names, such as `,`, turns the rule off |
 | `MEMORYOS_RERANKER` | `local` | `local` or `off`. Off saves the 571 MB download and about 1.3 GiB of memory; recall keeps the fused order |
-| `MEMORYOS_RERANK_TOP` | `20` | Most facts one recall sends to the reranker, as `min(limit * 2, this)`. Below 2 nothing is reranked |
+| `MEMORYOS_RERANK_TOP` | `10` | Most facts one recall sends to the reranker, as `min(limit * 2, this)`. Below 2 nothing is reranked |
 
 The reranker loads after the embedder. It never stops the server from starting: until it has loaded, or
 if it fails, recall keeps the fused order. `/readyz` reports it as `reranker`: `loading`, `ready`,

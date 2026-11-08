@@ -27,7 +27,7 @@ const MODEL_FILE: &str = "onnx/model_int8.onnx";
 /// statements, and 512 made a recall of 20 long statements take 8.7 s, past the timeout.
 const MAX_TOKENS: usize = 256;
 /// ONNX Runtime threads for one reranking call, see [`intra_threads`].
-const MAX_THREADS: usize = 4;
+const MAX_THREADS: usize = 8;
 
 /// Reranks on this machine, with no API key. Nothing loads until `warm_up`, which downloads the
 /// model into the embedder's cache directory on the first start. Until it has loaded, `score`
@@ -91,7 +91,8 @@ fn load_model(cache_dir: PathBuf) -> Result<TextRerank> {
 
 /// Every core, as fastembed would use, is slower on a machine with efficiency cores: on a 10 core
 /// Apple M-series CPU, 10 pairs took a median 549 ms with 10 threads, 204 ms with 4 and 179 ms with
-/// 8. Four leaves cores for Postgres and the embedder at little cost.
+/// 8. In the Linux container on that machine, 10 pairs took a median 254 to 279 ms with 8 and 293
+/// to 315 ms with 4, so 8 it is. Recalls rerank one at a time, so this is the most one recall takes.
 fn intra_threads() -> usize {
     std::thread::available_parallelism()
         .map_or(1, |cores| cores.get())

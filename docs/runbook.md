@@ -59,7 +59,7 @@ Chinese test questions, where fused order alone did for 8, at a median 207 ms pe
 - Turn it off with `MEMORYOS_RERANKER=off` in the `.env` next to the Compose file, then
   `dc up -d memoryos`. `/readyz` then shows `"reranker":"off"`. `memoryos setup` rewrites its `.env`
   on every run, so add the line again after one.
-- `MEMORYOS_RERANK_TOP` (default 20) caps how many facts one recall sends to it.
+- `MEMORYOS_RERANK_TOP` (default 10) caps how many facts one recall sends to it.
 - An install made before the reranker keeps its old Compose file and the old `1536m` limit. Run
   `memoryos setup` again, which rewrites the Compose file, or for the stack run by hand set
   `MEMORYOS_MEM_LIMIT=2560m` in `deploy/.env`. Otherwise the reranker load can be OOM killed (exit
