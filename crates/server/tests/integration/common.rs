@@ -306,6 +306,43 @@ pub struct Server {
     http: reqwest::Client,
     shutdown: CancellationToken,
     task: JoinHandle<Result<(), String>>,
+    _database: DropDatabase,
+}
+
+/// Drops a test server's database when the test ends. The container keeps its data in memory, in
+/// a Docker VM that other containers share, and each database is about 8 MB: kept to the end, a
+/// run's databases fill the VM's memory and new connections stall. A field rather than a `Drop` on
+/// `Server`, because `Server::stop` moves fields out of the server.
+struct DropDatabase(String);
+
+impl Drop for DropDatabase {
+    fn drop(&mut self) {
+        let name = self.0.clone();
+        // On a thread with its own runtime, because a drop cannot await.
+        let dropped = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(async {
+                    let admin = connect_admin(&containers().postgres_url).await;
+                    let result =
+                        sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+                            .execute(&admin)
+                            .await;
+                    admin.close().await;
+                    result
+                })
+        })
+        .join();
+        // A test that already failed must keep its own message, so this never panics while
+        // unwinding. A database left behind costs memory, not correctness.
+        if !std::thread::panicking() {
+            dropped
+                .expect("drop thread")
+                .expect("drop the test database");
+        }
+    }
 }
 
 impl Server {
@@ -332,8 +369,10 @@ impl Server {
         let store = PgStore::connect(&database_url, 3)
             .await
             .expect("test store");
+        let name = database_url.rsplit('/').next().expect("database name");
         let server = Self {
             url: format!("http://{address}"),
+            _database: DropDatabase(name.to_owned()),
             database_url,
             store: Arc::new(store),
             http: reqwest::Client::new(),
