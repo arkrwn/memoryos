@@ -154,6 +154,38 @@ struct Db {
     store: Arc<PgStore>,
     admin: PgPool,
     url: String,
+    name: String,
+}
+
+/// Drops the test's database when the test ends. The container keeps its data in memory, in a
+/// Docker VM that other containers share, and each database is about 8 MB: kept to the end, the
+/// run's databases came to about 900 MB, pushed the VM into swap, and new connections took over
+/// 20 s. On a thread with its own runtime, because a drop cannot await.
+impl Drop for Db {
+    fn drop(&mut self) {
+        let admin = format!("{}/postgres", server_url());
+        let sql = format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", self.name);
+        let dropped = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(async {
+                    let pool = connect_with_retry(&admin).await;
+                    let result = sqlx::query(&sql).execute(&pool).await;
+                    pool.close().await;
+                    result
+                })
+        })
+        .join();
+        // A test that already failed must keep its own message, so this never panics while
+        // unwinding. A database left behind costs memory, not correctness.
+        if !std::thread::panicking() {
+            dropped
+                .expect("drop thread")
+                .expect("drop the test database");
+        }
+    }
 }
 
 async fn db() -> Db {
@@ -179,6 +211,7 @@ async fn db_with_pool(max_connections: u32) -> Db {
         ),
         admin: connect_with_retry(&url).await,
         url,
+        name,
     }
 }
 

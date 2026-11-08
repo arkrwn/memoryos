@@ -5,7 +5,7 @@
 #![cfg(feature = "integration")]
 
 use std::fs;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -158,33 +158,87 @@ fn free_port() -> u16 {
     listener.local_addr().expect("address").port()
 }
 
+/// `free_port` closes its listener before the server binds, so another listener can take the port
+/// in between and the server exits with "cannot bind". Then it starts again on another port.
 fn start_server(database_url: &str) -> (Child, String) {
+    const ATTEMPTS: usize = 5;
+    for attempt in 1..=ATTEMPTS {
+        match try_start_server(database_url) {
+            Ok(started) => return started,
+            Err((url, problem, output)) => {
+                let lost_the_port = output.contains("cannot bind");
+                if lost_the_port && attempt < ATTEMPTS {
+                    continue;
+                }
+                let lines: Vec<&str> = output.lines().collect();
+                let tail = lines[lines.len().saturating_sub(20)..].join("\n");
+                panic!(
+                    "the server on {url} did not answer /healthz (attempt {attempt}): {problem}\n\
+                     its last output:\n{tail}"
+                );
+            }
+        }
+    }
+    unreachable!("the last attempt returns or panics")
+}
+
+/// The started server and its URL, or its URL, why it is not healthy, and everything it printed.
+fn try_start_server(database_url: &str) -> Result<(Child, String), (String, String, String)> {
     let port = free_port();
-    let child = server_command(database_url, Some(&format!("127.0.0.1:{port}")))
+    // The server's output goes to a file, not a pipe nobody reads, so it can never block on a full
+    // pipe, and a server that does not come up can say why.
+    let log_path =
+        std::env::temp_dir().join(format!("memoryos-hooks-test-server-{}.log", unique("")));
+    let log = fs::File::create(&log_path).expect("server log");
+    let mut child = server_command(database_url, Some(&format!("127.0.0.1:{port}")))
         .arg("serve")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(log.try_clone().expect("server log"))
+        .stderr(log)
         .spawn()
         .expect("start the server");
     let url = format!("http://127.0.0.1:{port}");
-    wait_healthy(&url);
-    (child, url)
+    let healthy = wait_healthy(&url, &mut child);
+    let output = fs::read_to_string(&log_path).unwrap_or_default();
+    // The open file outlives its name, so a running server keeps logging after this.
+    let _ = fs::remove_file(&log_path);
+    match healthy {
+        Ok(()) => Ok((child, url)),
+        Err(problem) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err((url, problem, output))
+        }
+    }
 }
 
-fn wait_healthy(url: &str) {
+/// Healthy, or why not: the server exited, or it still did not answer at the deadline.
+fn wait_healthy(url: &str, child: &mut Child) -> Result<(), String> {
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     runtime.block_on(async {
         let http = reqwest::Client::new();
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while Instant::now() < deadline {
-            let health = http.get(format!("{url}/healthz")).send().await;
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(60);
+        loop {
+            let health = http
+                .get(format!("{url}/healthz"))
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await;
             if health.is_ok_and(|response| response.status().is_success()) {
-                return;
+                return Ok(());
+            }
+            if let Some(status) = child.try_wait().expect("server status") {
+                return Err(format!(
+                    "it exited with {status} after {:?}",
+                    started.elapsed()
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("it still ran after {:?}", started.elapsed()));
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        panic!("the server did not answer /healthz");
-    });
+    })
 }
 
 fn create_key(admin: bool) -> String {
@@ -272,16 +326,18 @@ impl Sandbox {
         command
     }
 
+    /// Stdin is a file holding the whole input, so it is complete before the command starts. Written
+    /// to a pipe after the spawn, it could arrive after the hooks' 2 s stdin wait on a loaded machine,
+    /// and the hook would run as if the host had sent nothing.
     fn run(&self, args: &[&str], stdin: &str) -> Run {
-        let mut child = self
+        let mut input = tempfile::tempfile().expect("stdin file");
+        input.write_all(stdin.as_bytes()).expect("write stdin");
+        input.seek(SeekFrom::Start(0)).expect("rewind stdin");
+        let child = self
             .command(args)
-            .stdin(Stdio::piped())
+            .stdin(input)
             .spawn()
             .expect("run the binary");
-        let mut pipe = child.stdin.take().expect("stdin");
-        // A command may exit without reading, which is not this write's problem.
-        let _ = pipe.write_all(stdin.as_bytes());
-        drop(pipe);
         Run::from(child.wait_with_output().expect("wait"))
     }
 
