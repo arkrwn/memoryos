@@ -47,6 +47,10 @@ async fn start_wiremock() -> Wiremock {
         .with_exposed_port(8080.tcp())
         .with_wait_for(WaitFor::message_on_stdout("port:"))
         .with_startup_timeout(Duration::from_secs(120))
+        // Without a limit the JVM takes a quarter of the Docker VM, and two of these grew to about
+        // 860 MB each. That pushed a VM other containers share into swap, WireMock stalled for
+        // over 30 s, and the harness's requests timed out as case errors.
+        .with_env_var("JAVA_OPTS", "-Xmx256m -XX:+UseSerialGC")
         .start()
         .await
         .expect("wiremock starts");
