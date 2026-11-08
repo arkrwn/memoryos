@@ -60,6 +60,10 @@ The server container needs up to 2.5 GiB of memory with both models (`MEMORYOS_M
 `setup` starts Postgres and the server through Compose, creates two keys, and connects the agent over
 `memoryos mcp`, a local stdio proxy. Agent configuration holds no key and no reference to one.
 
+To upgrade after pulling new code, run `make upgrade` (or just `make`) in the checkout. It reinstalls
+the `memoryos` binary, rebuilds the server image and restarts it, waits until the server is healthy,
+and then runs `cargo clean`. Data and keys are kept.
+
 | | |
 |---|---|
 | 📁 **Where things live** | `~/.config/memoryos`: `credentials.json` (mode 0600), the database and the generated password |
@@ -115,8 +119,7 @@ read from the prompt cache.
 
 The page is on your machine only. It never receives an API key: it calls a small local proxy that
 forwards a fixed list of reads plus approve and reject, and it cannot purge, retract or write facts.
-After upgrading from an older install, update the server with
-`docker compose -f ~/.config/memoryos/docker-compose.yml up -d --build`.
+After upgrading from an older install, update the server with `make upgrade`.
 
 ## 🔍 Example
 
