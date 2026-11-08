@@ -198,7 +198,7 @@ fn token_matches(state: &UiState, headers: &HeaderMap) -> bool {
 /// The server path for a page request, or `None` when the page has no business making it. Purge,
 /// user deletion, retraction, commits and block edits are not here on purpose. `target` is already
 /// percent-decoded, so every variable segment is checked before it goes into a URL.
-fn upstream_path(method: &Method, target: &str) -> Option<String> {
+pub(crate) fn upstream_path(method: &Method, target: &str) -> Option<String> {
     let segments: Vec<&str> = target.split('/').collect();
     let id = |text: &str| text.parse::<Uuid>().is_ok();
     match (method.as_str(), segments.as_slice()) {

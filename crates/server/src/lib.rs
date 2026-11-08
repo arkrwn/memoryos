@@ -13,4 +13,5 @@ mod readiness;
 pub mod routes;
 mod service;
 pub mod telemetry;
+pub mod tui;
 pub mod ui;

@@ -9,4 +9,5 @@ mod contract;
 mod limits;
 mod mcp;
 mod process;
+mod tui;
 mod ui;

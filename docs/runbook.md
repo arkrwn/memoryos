@@ -95,7 +95,8 @@ Then point `DATABASE_URL` at that login and run `memoryos migrate`. What the dri
 
 ## Seeing what is stored
 
-`memoryos ui` opens a local page with facts, a map, a timeline and the review queue. Use `--port` to
+`memoryos ui` opens a local page with facts, a map, a timeline and the review queue. `memoryos tui`
+shows the same views except the map in the terminal. For the page, use `--port` to
 choose the port, and `--no-open` to only print the address. Restarting it makes a new address, because
 the address holds a token for that run. If the page says the server is older than the page, update the
 server as described below.

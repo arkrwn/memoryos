@@ -107,6 +107,11 @@ close a detail panel.
 
 ![Held-back facts waiting for review](docs/images/ui-review.png)
 
+In a terminal, or over SSH with no browser, run `memoryos tui` instead. It has the Facts, Review, Ask
+and Timeline views, but no Map. Keys: `1` to `4` switch views, `[` and `]` switch scope, `Enter` opens
+a fact, `/` filters or asks, `a` and `r` approve or reject in Review, and `q` quits. It makes only the
+requests the page can make, so it can read and review but never delete or write facts.
+
 ### Is my agent using it?
 
 ```bash

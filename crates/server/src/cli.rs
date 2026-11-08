@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::auth::{generate_token, hash_token, validate_pattern};
 use crate::config::{database_url_from_env, Config};
-use crate::{app, telemetry, ui};
+use crate::{app, telemetry, tui, ui};
 
 const ADMIN_DB_CONNECTIONS: u32 = 2;
 /// Blocking tasks cannot be cancelled, and a stalled model download is one. Past this the process
@@ -49,6 +49,8 @@ pub enum Command {
         #[arg(long)]
         no_open: bool,
     },
+    /// The same views as `ui` in this terminal: facts, review, ask and timeline. `q` quits.
+    Tui,
     #[command(flatten)]
     Client(memoryos_hooks::Command),
 }
@@ -88,6 +90,7 @@ pub fn dispatch(cli: Cli) -> Result<(), String> {
         }) => block_on(create_key(tenant, name, scopes, max_trust, admin)),
         Command::Key(KeyCommand::Revoke { id }) => block_on(revoke_key(id)),
         Command::Ui { port, no_open } => block_on(ui::run(port, !no_open)),
+        Command::Tui => tui::run(),
         Command::Client(command) => memoryos_hooks::run(command),
     }
 }
