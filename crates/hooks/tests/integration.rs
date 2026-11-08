@@ -5,7 +5,7 @@
 #![cfg(feature = "integration")]
 
 use std::fs;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -326,16 +326,18 @@ impl Sandbox {
         command
     }
 
+    /// Stdin is a file holding the whole input, so it is complete before the command starts. Written
+    /// to a pipe after the spawn, it could arrive after the hooks' 2 s stdin wait on a loaded machine,
+    /// and the hook would run as if the host had sent nothing.
     fn run(&self, args: &[&str], stdin: &str) -> Run {
-        let mut child = self
+        let mut input = tempfile::tempfile().expect("stdin file");
+        input.write_all(stdin.as_bytes()).expect("write stdin");
+        input.seek(SeekFrom::Start(0)).expect("rewind stdin");
+        let child = self
             .command(args)
-            .stdin(Stdio::piped())
+            .stdin(input)
             .spawn()
             .expect("run the binary");
-        let mut pipe = child.stdin.take().expect("stdin");
-        // A command may exit without reading, which is not this write's problem.
-        let _ = pipe.write_all(stdin.as_bytes());
-        drop(pipe);
         Run::from(child.wait_with_output().expect("wait"))
     }
 
