@@ -6,9 +6,10 @@ use memoryos_core::{Episode, Fact, FactStatus, FactView, ScopeSummary, ScoredFac
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
-use ratatui::text::{Line, Span, Text};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,10 +74,12 @@ pub struct Detail {
 }
 
 /// A fact as one tab shows it.
-struct Row {
-    id: Uuid,
-    title: String,
-    meta: String,
+struct Row<'a> {
+    fact: &'a Fact,
+    /// The subject heading it sits under, on views grouped by subject.
+    subject: Option<&'a str>,
+    /// Its place in recall's answer, on Ask.
+    rank: Option<usize>,
 }
 
 #[derive(Default)]
@@ -260,94 +263,57 @@ impl App {
     }
 
     fn chosen(&self) -> Option<Uuid> {
-        self.rows().get(self.selected).map(|row| row.id)
+        self.rows().get(self.selected).map(|row| row.fact.id)
     }
 
-    fn rows(&self) -> Vec<Row> {
-        let now = Utc::now();
+    fn rows<'a>(&'a self) -> Vec<Row<'a>> {
         let needle = self.filter.to_lowercase();
         let keep = |fact: &Fact, subject: &str| {
             needle.is_empty()
                 || fact.statement.to_lowercase().contains(&needle)
                 || subject.to_lowercase().contains(&needle)
         };
+        let grouped = |views: &'a [FactView]| -> Vec<Row<'a>> {
+            views
+                .iter()
+                .filter(|view| keep(&view.fact, &view.subject_name))
+                .map(|view| Row {
+                    fact: &view.fact,
+                    subject: Some(view.subject_name.as_str()),
+                    rank: None,
+                })
+                .collect()
+        };
         match self.tab() {
             Tab::Facts => {
-                let mut facts: Vec<&FactView> = self
-                    .facts
-                    .iter()
-                    .filter(|view| keep(&view.fact, &view.subject_name))
-                    .collect();
-                facts.sort_by(|a, b| {
-                    a.subject_name
-                        .cmp(&b.subject_name)
+                let mut rows = grouped(&self.facts);
+                // Subjects in name order, each subject's newest fact first.
+                rows.sort_by(|a, b| {
+                    a.subject
+                        .cmp(&b.subject)
                         .then(b.fact.valid_from.cmp(&a.fact.valid_from))
                 });
-                facts
-                    .into_iter()
-                    .map(|view| Row {
-                        id: view.fact.id,
-                        title: clean(&view.fact.statement),
-                        meta: format!(
-                            "{} · {} · since {} · {}",
-                            clean(&view.subject_name),
-                            humanize(&view.fact.predicate),
-                            date(view.fact.valid_from),
-                            trust(view.fact.trust)
-                        ),
-                    })
-                    .collect()
+                rows
             }
             Tab::Timeline => {
-                let mut facts: Vec<&FactView> = self
-                    .timeline
-                    .iter()
-                    .filter(|view| keep(&view.fact, &view.subject_name))
-                    .collect();
-                facts.sort_by(|a, b| {
-                    (&a.subject_name, &a.fact.predicate, a.fact.valid_from).cmp(&(
-                        &b.subject_name,
+                let mut rows = grouped(&self.timeline);
+                rows.sort_by(|a, b| {
+                    (a.subject, &a.fact.predicate, a.fact.valid_from).cmp(&(
+                        b.subject,
                         &b.fact.predicate,
                         b.fact.valid_from,
                     ))
                 });
-                facts
-                    .into_iter()
-                    .map(|view| Row {
-                        id: view.fact.id,
-                        title: clean(&view.fact.statement),
-                        meta: format!(
-                            "{} · {} · {} to {} · {}",
-                            clean(&view.subject_name),
-                            humanize(&view.fact.predicate),
-                            date(view.fact.valid_from),
-                            view.fact
-                                .valid_to
-                                .or(view.fact.invalidated_at)
-                                .map_or("now".to_owned(), date),
-                            status(&view.fact, now)
-                        ),
-                    })
-                    .collect()
+                rows
             }
             Tab::Review => self
                 .review
                 .iter()
                 .filter(|fact| keep(fact, ""))
                 .map(|fact| Row {
-                    id: fact.id,
-                    title: clean(&fact.statement),
-                    meta: format!(
-                        "{} · {} · added {}{}",
-                        humanize(&fact.predicate),
-                        trust(fact.trust),
-                        date(fact.recorded_at),
-                        if fact.pending_supersede_of.is_some() {
-                            " · would replace a fact, Enter to see it"
-                        } else {
-                            ""
-                        }
-                    ),
+                    fact,
+                    subject: None,
+                    rank: None,
                 })
                 .collect(),
             Tab::Ask => self
@@ -355,14 +321,9 @@ impl App {
                 .iter()
                 .enumerate()
                 .map(|(rank, scored)| Row {
-                    id: scored.fact.id,
-                    title: format!("{}. {}", rank + 1, clean(&scored.fact.statement)),
-                    meta: format!(
-                        "{} · since {} · {}",
-                        humanize(&scored.fact.predicate),
-                        date(scored.fact.valid_from),
-                        trust(scored.fact.trust)
-                    ),
+                    fact: &scored.fact,
+                    subject: None,
+                    rank: Some(rank + 1),
                 })
                 .collect(),
         }
@@ -370,13 +331,22 @@ impl App {
 
     pub fn draw(&self, frame: &mut Frame) {
         let [header, body, footer] = Layout::vertical([
-            Constraint::Length(1),
+            Constraint::Length(2),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
         .areas(frame.area());
         self.draw_header(frame, header);
-        self.draw_body(frame, body);
+        let rows = self.rows();
+        if body.width >= PREVIEW_MIN_WIDTH && !rows.is_empty() {
+            let [list, preview] =
+                Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
+                    .areas(body);
+            self.draw_list(frame, list, &rows);
+            draw_preview(frame, preview, &rows[self.selected.min(rows.len() - 1)]);
+        } else {
+            self.draw_list(frame, body, &rows);
+        }
         self.draw_footer(frame, footer);
         if let Some(detail) = &self.detail {
             draw_detail(frame, detail, self.detail_scroll);
@@ -384,156 +354,333 @@ impl App {
     }
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
-        let scope = match self.scope() {
-            Some(scope) => format!(
-                "[ {} ({}/{}) ] ",
-                clean(&scope),
-                self.scope + 1,
-                self.scopes.len()
-            ),
-            None => "no scopes ".to_owned(),
-        };
-        let [tabs, scope_area] = Layout::horizontal([
-            Constraint::Min(0),
-            Constraint::Length(scope.chars().count() as u16),
-        ])
-        .areas(area);
-        let titles = Tab::ALL
-            .iter()
-            .enumerate()
-            .map(|(at, tab)| format!("{} {}", at + 1, tab.title()));
+        let summary = self.scopes.get(self.scope);
+        let count = |pick: fn(&ScopeSummary) -> i64| summary.map(|s| format!(" {}", pick(s)));
+        let titles = [
+            (Tab::Facts, count(|s| s.current)),
+            (Tab::Review, count(|s| s.quarantined)),
+            (Tab::Ask, None),
+            (Tab::Timeline, count(|s| s.current + s.past)),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(at, (tab, count))| {
+            let selected = tab == self.tab();
+            let name = if selected {
+                Style::new().fg(ACCENT).bold()
+            } else {
+                Style::new()
+            };
+            Line::from(vec![
+                Span::styled(format!("{} ", at + 1), Style::new().fg(MUTED)),
+                Span::styled(tab.title(), name),
+                Span::styled(count.unwrap_or_default(), Style::new().fg(MUTED)),
+            ])
+        });
+        let [line, rule] =
+            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+        let [brand, tabs] =
+            Layout::horizontal([Constraint::Length(11), Constraint::Min(0)]).areas(line);
+        frame.render_widget(Paragraph::new(" MemoryOS").bold(), brand);
         frame.render_widget(
             Tabs::new(titles)
                 .select(self.tab().index())
-                .highlight_style(Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED)),
+                .divider(Span::styled(" │ ", Style::new().fg(MUTED)))
+                .highlight_style(Style::new().add_modifier(Modifier::UNDERLINED)),
             tabs,
         );
-        frame.render_widget(Paragraph::new(scope).dim(), scope_area);
+        frame.render_widget(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::new().fg(MUTED)),
+            rule,
+        );
     }
 
-    fn draw_body(&self, frame: &mut Frame, area: Rect) {
-        let rows = self.rows();
+    /// The scope and where it sits in the list, for the list frame's top right corner.
+    fn scope_line(&self) -> Line<'static> {
+        match self.scope() {
+            Some(scope) => Line::from(vec![
+                Span::styled(" scope ", Style::new().fg(MUTED)),
+                Span::styled(clean(&scope), Style::new().fg(ACCENT)),
+                Span::styled(
+                    format!(" {}/{} ", self.scope + 1, self.scopes.len()),
+                    Style::new().fg(MUTED),
+                ),
+            ]),
+            None => Line::from(" no scopes ").fg(MUTED),
+        }
+        .right_aligned()
+    }
+
+    fn draw_list(&self, frame: &mut Frame, area: Rect, rows: &[Row]) {
         let mut title = match self.tab() {
-            Tab::Facts => format!(" True now · {} ", rows.len()),
-            Tab::Review => format!(" Waiting for review · {} ", rows.len()),
+            Tab::Facts => " True now ".to_owned(),
+            Tab::Review => " Waiting for review ".to_owned(),
             Tab::Ask => match self.question.as_str() {
-                "" => " Ask: press / and type a question ".to_owned(),
+                "" => " Ask ".to_owned(),
                 question => format!(" Ask: {} ", clean(question)),
             },
-            Tab::Timeline => format!(" Everything, oldest first per subject · {} ", rows.len()),
+            Tab::Timeline => " Everything, oldest first ".to_owned(),
         };
         if !self.filter.is_empty() {
             title.push_str(&format!("· filter \"{}\" ", clean(&self.filter)));
         }
-        let block = Block::default().borders(Borders::ALL).title(title);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(MUTED))
+            .title(Span::styled(title, Style::new().bold()))
+            .title_top(self.scope_line());
         if rows.is_empty() {
             let empty = match (self.scope(), self.tab()) {
                 (None, _) => "Nothing is remembered yet.",
-                (_, Tab::Ask) if self.question.is_empty() => "The facts your agent would get.",
+                (_, Tab::Ask) if self.question.is_empty() => {
+                    "Press / and type a question to see the facts your agent would get."
+                }
                 (_, Tab::Review) => "Nothing is waiting for review.",
+                _ if !self.filter.is_empty() => "Nothing matches the filter. Esc clears it.",
                 _ => "Nothing here.",
             };
-            frame.render_widget(Paragraph::new(empty).dim().block(block), area);
+            frame.render_widget(
+                Paragraph::new(format!("\n  {empty}"))
+                    .fg(MUTED)
+                    .block(block),
+                area,
+            );
             return;
         }
-        let items: Vec<ListItem> = rows
-            .into_iter()
-            .map(|row| {
-                ListItem::new(Text::from(vec![
-                    Line::from(row.title),
-                    Line::from(Span::styled(
-                        format!("   {}", row.meta),
-                        Style::new().fg(Color::DarkGray),
-                    )),
-                ]))
-            })
-            .collect();
-        let mut state = ListState::default().with_selected(Some(self.selected));
+        // Inside the borders, less the selection marker.
+        let width = area.width.saturating_sub(4) as usize;
+        let mut items = Vec::new();
+        let mut selected_item = 0;
+        let mut group: Option<&str> = None;
+        for (at, row) in rows.iter().enumerate() {
+            if row.subject.is_some() && row.subject != group {
+                group = row.subject;
+                if !items.is_empty() {
+                    items.push(ListItem::new(""));
+                }
+                let size = rows.iter().filter(|r| r.subject == group).count();
+                items.push(ListItem::new(Line::from(vec![
+                    Span::styled(
+                        clean(group.unwrap_or_default()),
+                        Style::new().fg(ACCENT).bold(),
+                    ),
+                    Span::styled(format!("  {size}"), Style::new().fg(MUTED)),
+                ])));
+            }
+            if at == self.selected {
+                selected_item = items.len();
+            }
+            items.push(ListItem::new(self.row_line(row, width)));
+        }
+        let mut state = ListState::default().with_selected(Some(selected_item));
         frame.render_stateful_widget(
             List::new(items)
                 .block(block)
-                .highlight_style(Style::new().add_modifier(Modifier::BOLD))
-                .highlight_symbol("> "),
+                .highlight_style(Style::new().bg(SELECTED).bold())
+                .highlight_symbol("▌ ")
+                .highlight_spacing(ratatui::widgets::HighlightSpacing::Always),
             area,
             &mut state,
         );
     }
 
+    /// One line per fact: the statement, cut to fit, and a short column on the right.
+    fn row_line(&self, row: &Row, width: usize) -> Line<'static> {
+        let now = Utc::now();
+        let prefix = match (row.rank, row.subject) {
+            (Some(rank), _) => format!("{rank:>2}. "),
+            (None, Some(_)) => "  ".to_owned(),
+            (None, None) => String::new(),
+        };
+        let (right, right_style) = match self.tab() {
+            Tab::Timeline => {
+                let (word, color) = status(row.fact, now);
+                let until = row
+                    .fact
+                    .valid_to
+                    .or(row.fact.invalidated_at)
+                    .map_or("now".to_owned(), date);
+                (
+                    format!("{} → {until}  {word:<9}", date(row.fact.valid_from)),
+                    Style::new().fg(color),
+                )
+            }
+            Tab::Review => (
+                format!("{}  {}", trust(row.fact.trust), date(row.fact.recorded_at)),
+                Style::new().fg(MUTED),
+            ),
+            Tab::Facts | Tab::Ask => (date(row.fact.valid_from), Style::new().fg(MUTED)),
+        };
+        let room = width.saturating_sub(prefix.width() + right.width() + 2);
+        let text = fit(&clean(&row.fact.statement), room);
+        let gap = width.saturating_sub(prefix.width() + text.width() + right.width());
+        Line::from(vec![
+            Span::styled(prefix, Style::new().fg(MUTED)),
+            Span::raw(text),
+            Span::raw(" ".repeat(gap)),
+            Span::styled(right, right_style),
+        ])
+    }
+
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
         let line = if let Some(input) = &self.input {
             let label = if self.tab() == Tab::Ask {
-                "Question"
+                " Question: "
             } else {
-                "Filter"
+                " Filter: "
             };
-            Line::from(format!("{label}: {}_", clean(input)))
+            Line::from(vec![
+                Span::styled(label, Style::new().fg(ACCENT).bold()),
+                Span::raw(clean(input)),
+                Span::styled("▏", Style::new().fg(ACCENT)),
+                Span::styled("   Enter done · Esc cancel", Style::new().fg(MUTED)),
+            ])
         } else if let Some(message) = &self.message {
             Line::from(Span::styled(
-                message.clone(),
+                format!(" {message}"),
                 Style::new().fg(Color::Yellow),
             ))
         } else if self.detail.is_some() {
-            Line::from("↑↓ scroll · Esc close").dim()
+            hints(&[("↑↓", "scroll"), ("Esc", "close")])
         } else {
-            let review = if self.tab() == Tab::Review {
-                " · a approve · r reject"
+            let slash = if self.tab() == Tab::Ask {
+                "ask"
             } else {
-                ""
+                "filter"
             };
-            Line::from(format!(
-                "1-4 view · [ ] scope · ↑↓ move · Enter open · / {}{review} · R reload · q quit",
-                if self.tab() == Tab::Ask {
-                    "ask"
-                } else {
-                    "filter"
-                }
-            ))
-            .dim()
+            let mut keys = vec![
+                ("1-4", "view"),
+                ("[ ]", "scope"),
+                ("↑↓", "move"),
+                ("Enter", "open"),
+                ("/", slash),
+            ];
+            if self.tab() == Tab::Review {
+                keys.extend([("a", "approve"), ("r", "reject")]);
+            }
+            keys.extend([("R", "reload"), ("q", "quit")]);
+            hints(&keys)
         };
         frame.render_widget(Paragraph::new(line), area);
     }
 }
 
-fn draw_detail(frame: &mut Frame, detail: &Detail, scroll: u16) {
-    let area = centered(frame.area(), 80, 80);
-    let fact = &detail.fact;
-    let now = Utc::now();
-    let field = |name: &str, value: String| {
+/// Lines terminals below this width give the list alone, without the preview.
+const PREVIEW_MIN_WIDTH: u16 = 110;
+const ACCENT: Color = Color::Cyan;
+const MUTED: Color = Color::DarkGray;
+const SELECTED: Color = Color::Indexed(237);
+
+fn hints(keys: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")];
+    for (at, (key, what)) in keys.iter().enumerate() {
+        if at > 0 {
+            spans.push(Span::styled("  ", Style::new()));
+        }
+        spans.push(Span::styled(
+            key.to_string(),
+            Style::new().fg(ACCENT).bold(),
+        ));
+        spans.push(Span::styled(format!(" {what}"), Style::new().fg(MUTED)));
+    }
+    Line::from(spans)
+}
+
+/// `text` cut to `room` columns, with an ellipsis when cut. Wide characters count as two.
+fn fit(text: &str, room: usize) -> String {
+    if text.width() <= room {
+        return text.to_owned();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w + 1 > room {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
+/// The fields of one fact, shared by the preview pane and the detail panel.
+fn fact_lines(fact: &Fact, subject: Option<&str>, rank: Option<usize>) -> Vec<Line<'static>> {
+    let field = |name: &str, value: Span<'static>| {
         Line::from(vec![
-            Span::styled(format!("{name:<12}"), Style::new().fg(Color::DarkGray)),
-            Span::raw(value),
+            Span::styled(format!("{name:<12}"), Style::new().fg(MUTED)),
+            value,
         ])
     };
-    let mut lines = vec![
-        Line::from(clean(&fact.statement)).bold(),
-        Line::default(),
-        field("Status", status(fact, now).to_owned()),
-        field("Means", humanize(&fact.predicate)),
-        field("True from", date(fact.valid_from)),
+    let (word, color) = status(fact, Utc::now());
+    let mut lines = vec![Line::from(clean(&fact.statement)).bold(), Line::default()];
+    if let Some(rank) = rank {
+        lines.push(field("Rank", Span::raw(rank.to_string())));
+    }
+    if let Some(subject) = subject {
+        lines.push(field(
+            "About",
+            Span::styled(clean(subject), Style::new().fg(ACCENT)),
+        ));
+    }
+    lines.extend([
+        field("Means", Span::raw(humanize(&fact.predicate))),
+        field("Status", Span::styled(word, Style::new().fg(color))),
+        field("True from", Span::raw(date(fact.valid_from))),
         field(
             "True until",
-            fact.valid_to.map_or("not set".to_owned(), date),
+            Span::raw(fact.valid_to.map_or("not set".to_owned(), date)),
         ),
-        field("Learned", date(fact.recorded_at)),
-        field("Trust", trust(fact.trust).to_owned()),
-        field("Scope", clean(&fact.scope.to_string())),
-        field("Id", fact.id.to_string()),
-    ];
+        field("Learned", Span::raw(date(fact.recorded_at))),
+        field("Trust", Span::raw(trust(fact.trust))),
+        field("Scope", Span::raw(clean(&fact.scope.to_string()))),
+    ]);
+    lines
+}
+
+fn draw_preview(frame: &mut Frame, area: Rect, row: &Row) {
+    let mut lines = fact_lines(row.fact, row.subject, row.rank);
+    lines.push(Line::default());
+    lines.push(Line::from("Enter shows history and sources").fg(MUTED));
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(MUTED))
+                .padding(ratatui::widgets::Padding::horizontal(1))
+                .title(" Selected "),
+        ),
+        area,
+    );
+}
+
+fn draw_detail(frame: &mut Frame, detail: &Detail, scroll: u16) {
+    let area = centered(frame.area(), 80, 80);
+    let mut lines = fact_lines(&detail.fact, None, None);
+    lines.push(field_line("Id", detail.fact.id.to_string()));
     if detail.history.len() > 1 {
         lines.push(Line::default());
-        lines.push(Line::from("History").bold());
+        lines.push(Line::from("History").fg(ACCENT).bold());
         for item in &detail.history {
-            lines.push(Line::from(format!(
-                "  {} to {}  {}",
-                date(item.valid_from),
-                item.valid_to.map_or("now".to_owned(), date),
-                clean(&item.statement)
-            )));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(
+                        "  {} → {}  ",
+                        date(item.valid_from),
+                        item.valid_to.map_or("now".to_owned(), date)
+                    ),
+                    Style::new().fg(MUTED),
+                ),
+                Span::raw(clean(&item.statement)),
+            ]));
         }
     }
     if !detail.sources.is_empty() {
         lines.push(Line::default());
-        lines.push(Line::from("Where it came from").bold());
+        lines.push(Line::from("Where it came from").fg(ACCENT).bold());
         for episode in &detail.sources {
             lines.push(
                 Line::from(format!(
@@ -541,7 +688,7 @@ fn draw_detail(frame: &mut Frame, detail: &Detail, scroll: u16) {
                     clean(&episode.source),
                     date(episode.occurred_at)
                 ))
-                .dim(),
+                .fg(MUTED),
             );
             for text in episode.content.lines() {
                 lines.push(Line::from(format!("  {}", clean(text))));
@@ -553,9 +700,22 @@ fn draw_detail(frame: &mut Frame, detail: &Detail, scroll: u16) {
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0))
-            .block(Block::default().borders(Borders::ALL).title(" Fact ")),
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::new().fg(ACCENT))
+                    .padding(ratatui::widgets::Padding::horizontal(1))
+                    .title(" Fact "),
+            ),
         area,
     );
+}
+
+fn field_line(name: &str, value: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{name:<12}"), Style::new().fg(MUTED)),
+        Span::raw(value),
+    ])
 }
 
 fn centered(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
@@ -595,27 +755,27 @@ fn trust(trust: Trust) -> &'static str {
     }
 }
 
-/// The same states the web page shows, in the same order of precedence.
-fn status(fact: &Fact, now: DateTime<Utc>) -> &'static str {
+/// The same states the web page shows, in the same order of precedence, with a color for each.
+fn status(fact: &Fact, now: DateTime<Utc>) -> (&'static str, Color) {
     match fact.status {
-        FactStatus::Quarantined => return "waiting for review",
-        FactStatus::Rejected => return "rejected",
+        FactStatus::Quarantined => return ("waiting", Color::Yellow),
+        FactStatus::Rejected => return ("rejected", Color::Red),
         FactStatus::Active => {}
     }
     if fact.invalidated_at.is_some_and(|at| at <= now) {
-        "retracted"
+        ("retracted", Color::Red)
     } else if fact.valid_from > now {
-        "starts later"
+        ("later", MUTED)
     } else if fact.valid_to.is_some_and(|at| at <= now) {
         if fact.superseded_by.is_some() {
-            "replaced"
+            ("replaced", MUTED)
         } else {
-            "ended"
+            ("ended", MUTED)
         }
     } else if fact.expired_at(now) {
-        "expired"
+        ("expired", MUTED)
     } else {
-        "true now"
+        ("true now", Color::Green)
     }
 }
 
@@ -682,8 +842,8 @@ mod tests {
         }
     }
 
-    fn screen(app: &App) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(100, 20)).expect("terminal");
+    fn screen(app: &App, width: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).expect("terminal");
         terminal.draw(|frame| app.draw(frame)).expect("draw");
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)
@@ -746,7 +906,7 @@ mod tests {
     fn enter_opens_the_selected_fact_and_review_keys_decide_it() {
         let mut app = with_facts();
         press(&mut app, KeyCode::Down);
-        let second = app.rows()[1].id;
+        let second = app.rows()[1].fact.id;
         assert_eq!(press(&mut app, KeyCode::Enter), Effect::Open(second));
 
         press(&mut app, KeyCode::Char('2'));
@@ -784,13 +944,46 @@ mod tests {
     }
 
     #[test]
-    fn the_screen_shows_views_scope_and_facts() {
+    fn the_screen_shows_views_scope_and_facts_under_their_subject() {
         let app = with_facts();
-        let text = screen(&app);
-        assert!(text.contains("1 Facts"), "{text}");
-        assert!(text.contains("agent:coding-agent (1/2)"), "{text}");
-        assert!(text.contains("Ada lives in Bandung"), "{text}");
-        assert!(text.contains("since 2026-11-01"), "{text}");
+        let text = screen(&app, 100);
+        assert!(text.contains("1 Facts 1"), "{text}");
+        assert!(text.contains("scope agent:coding-agent 1/2"), "{text}");
+        let lines: Vec<&str> = text.lines().collect();
+        let heading = lines
+            .iter()
+            .position(|line| line.contains("Ada  1"))
+            .expect("subject heading");
+        assert!(
+            lines[heading + 1].contains("Ada lives in Bandung"),
+            "{text}"
+        );
+        assert!(lines[heading + 1].contains("2026-11-01"), "{text}");
+        assert!(text.contains("CI  1"), "{text}");
+    }
+
+    #[test]
+    fn a_wide_terminal_shows_the_selected_fact_in_full_beside_the_list() {
+        let mut app = with_facts();
+        let long = format!("Ada keeps notes {}", "about many things ".repeat(12));
+        app.facts = vec![view(&long, "Ada")];
+        let text = screen(&app, 140);
+        assert!(text.contains("Selected"), "{text}");
+        assert!(text.contains('…'), "the list line is cut: {text}");
+        assert!(text.contains("About       Ada"), "{text}");
+        assert!(
+            !screen(&app, 90).contains("Selected"),
+            "no room for it at 90 columns"
+        );
+    }
+
+    #[test]
+    fn fit_cuts_by_display_width_with_an_ellipsis() {
+        assert_eq!(fit("short", 10), "short");
+        assert_eq!(fit("abcdefghij", 5), "abcd…");
+        // Each of these characters takes two columns.
+        assert_eq!(fit("兴来大人兴来大人", 7), "兴来大…");
+        assert!(fit("兴来大人兴来大人", 7).width() <= 7);
     }
 
     #[test]
@@ -803,7 +996,7 @@ mod tests {
             history: vec![old, current],
             sources: vec![],
         });
-        let text = screen(&app);
+        let text = screen(&app, 100);
         assert!(text.contains("History"), "{text}");
         assert!(text.contains("Ada lives in Jakarta"), "{text}");
         assert_eq!(press(&mut app, KeyCode::Esc), Effect::None);
@@ -815,6 +1008,6 @@ mod tests {
         assert_eq!(clean("a\u{1b}]0;owned\u{7}b\nc"), "a ]0;owned b c");
         let mut app = with_facts();
         app.facts = vec![view("evil\u{1b}[2J text", "x")];
-        assert!(!screen(&app).contains('\u{1b}'));
+        assert!(!screen(&app, 100).contains('\u{1b}'));
     }
 }
