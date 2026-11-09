@@ -10,7 +10,7 @@ use memoryos_core::{
 };
 use serde_json::{json, Value};
 use sqlx::postgres::PgRow;
-use sqlx::{PgConnection, Row};
+use sqlx::{AssertSqlSafe, PgConnection, Row};
 use uuid::Uuid;
 
 use crate::{db, validate};
@@ -207,7 +207,7 @@ async fn outranked_by_current(conn: &mut PgConnection, new: &NewFact) -> Result<
         "SELECT EXISTS (SELECT 1 FROM facts f WHERE f.scope = $1 AND f.subject_id = $2 \
          AND f.predicate = $3 AND f.trust = ANY($4) AND {filter})"
     );
-    sqlx::query_scalar(&sql)
+    sqlx::query_scalar(AssertSqlSafe(sql))
         .bind(new.scope.to_string())
         .bind(new.subject_id)
         .bind(&new.predicate)

@@ -174,6 +174,42 @@ docker volume rm memoryos_pgdata
 
 Then continue from `dc up -d postgres` above, without setting `COMPOSE_PROJECT_NAME`.
 
+## SQLite backup and restore
+
+For a manual SQLite install, use SQLite's online backup command while the server is running; do not
+copy a live database and its WAL independently:
+
+```bash
+sqlite3 /absolute/path/memoryos.db ".backup '/absolute/path/memoryos-backup.db'"
+```
+
+For the SQLite Compose stack, take a cold backup after a clean stop so the WAL is checkpointed:
+
+```bash
+docker compose -f deploy/docker-compose.sqlite.yml stop memoryos
+docker compose -f deploy/docker-compose.sqlite.yml cp memoryos:/var/lib/memoryos/data/memoryos.db ./memoryos-backup.db
+docker compose -f deploy/docker-compose.sqlite.yml start memoryos
+```
+
+Restore only after stopping the server, then copy the backup into place. `docker compose cp` makes
+the restored file root-owned, so restore ownership to the container user before restarting. The
+one-off command needs only the capabilities required to fix that file; the server still runs with
+all capabilities dropped:
+
+```bash
+docker compose -f deploy/docker-compose.sqlite.yml stop memoryos
+docker compose -f deploy/docker-compose.sqlite.yml cp ./memoryos-backup.db memoryos:/var/lib/memoryos/data/memoryos.db
+docker compose -f deploy/docker-compose.sqlite.yml run --rm --no-deps --user root \
+  --cap-add CHOWN --cap-add FOWNER --entrypoint sh memoryos -c \
+  'chown 10001:10001 /var/lib/memoryos/data/memoryos.db && chmod 0600 /var/lib/memoryos/data/memoryos.db'
+docker compose -f deploy/docker-compose.sqlite.yml start memoryos
+```
+
+Verify a restore by running a recall and checking that a pre-backup API token still works. The
+container drill restored the pre-backup fact and token, and the fact committed after the backup was
+absent. To roll back an SQLite trial, stop the SQLite stack and start the unchanged PostgreSQL
+stack; there is no automatic data migration between backends.
+
 ## API keys
 
 ```bash

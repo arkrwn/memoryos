@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put, MethodRouter};
 use axum::{Extension, Json, Router};
 use chrono::{DateTime, Utc};
-use memoryos_core::{FactListState, Scope};
+use memoryos_core::{FactListState, MemoryStore, Scope};
 use memoryos_ingest::CommitRequest;
 use memoryos_retrieve::RecallRequest;
 use serde::de::DeserializeOwned;

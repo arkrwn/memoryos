@@ -1,6 +1,6 @@
 //! The API end to end, through the SDK where the SDK has the call.
 
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{Duration as ChronoDuration, SubsecRound, Utc};
 use memoryos_core::{Scope, Trust};
 use memoryos_sdk::{Commit, CommitFact, EntityRef, Error, FactStatus, MemoryOs, PutBlock};
 use reqwest::StatusCode;
@@ -46,7 +46,9 @@ async fn candidates_commit_and_supersede_with_as_of() {
         .expect("candidates");
     assert_eq!(candidates[0].fact.id, first.facts[0].id);
 
-    let moved = Utc::now() - ChronoDuration::days(10);
+    // Stored timestamps keep microseconds. Linux clocks also give nanoseconds, which would
+    // make the exact `valid_to` comparison below fail there.
+    let moved = (Utc::now() - ChronoDuration::days(10)).trunc_subsecs(6);
     let second = mem
         .commit(&Commit::new(
             scope.clone(),

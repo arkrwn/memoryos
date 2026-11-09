@@ -5,7 +5,7 @@
 # - the runtime needs glibc 2.38 or newer, so bookworm and alpine do not work;
 # - build and runtime stay on the same Debian release.
 
-FROM rust:1.92-slim-trixie AS chef
+FROM rust:1.94-slim-trixie AS chef
 RUN apt-get update \
     && apt-get install -y --no-install-recommends g++ \
     && rm -rf /var/lib/apt/lists/*
@@ -32,7 +32,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 # The cache directory exists in the image, so a named volume mounted there inherits its owner.
 RUN useradd --system --uid 10001 --user-group --home-dir /var/lib/memoryos --shell /usr/sbin/nologin memoryos \
-    && mkdir -p /var/lib/memoryos/models \
+    && mkdir -p /var/lib/memoryos/models /var/lib/memoryos/data \
     && chown -R memoryos:memoryos /var/lib/memoryos
 COPY --from=builder /app/target/release/memoryos /usr/local/bin/memoryos
 COPY --chmod=0755 deploy/healthcheck.sh /usr/local/bin/memoryos-healthcheck

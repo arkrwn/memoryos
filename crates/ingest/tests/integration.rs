@@ -3,6 +3,8 @@
 
 #![cfg(feature = "integration")]
 
+mod common;
+
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -21,7 +23,7 @@ use memoryos_ingest::{
 use memoryos_store::PgStore;
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
@@ -88,7 +90,7 @@ async fn start_postgres() -> String {
 
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}");
     let admin = connect_with_retry(&format!("{url}/postgres")).await;
-    sqlx::query(&format!("CREATE DATABASE {TEMPLATE_DB}"))
+    sqlx::query(AssertSqlSafe(format!("CREATE DATABASE {TEMPLATE_DB}")))
         .execute(&admin)
         .await
         .expect("create template");
@@ -173,7 +175,7 @@ impl Drop for World {
                 .expect("runtime")
                 .block_on(async {
                     let pool = connect_with_retry(&format!("{server}/postgres")).await;
-                    let result = sqlx::query(&sql).execute(&pool).await;
+                    let result = sqlx::query(AssertSqlSafe(sql)).execute(&pool).await;
                     pool.close().await;
                     result
                 })
@@ -195,10 +197,12 @@ async fn world() -> World {
     let name = format!("t{}", NEXT.fetch_add(1, Ordering::SeqCst));
 
     let bootstrap = connect_with_retry(&format!("{server}/postgres")).await;
-    sqlx::query(&format!("CREATE DATABASE {name} TEMPLATE {TEMPLATE_DB}"))
-        .execute(&bootstrap)
-        .await
-        .expect("clone template");
+    sqlx::query(AssertSqlSafe(format!(
+        "CREATE DATABASE {name} TEMPLATE {TEMPLATE_DB}"
+    )))
+    .execute(&bootstrap)
+    .await
+    .expect("clone template");
     bootstrap.close().await;
     let url = format!("{server}/{name}");
     let store = Arc::new(PgStore::connect(&url, 8).await.expect("connect"));
@@ -238,7 +242,7 @@ fn sparse(values: &[f32]) -> Vec<f32> {
 
 impl World {
     async fn count(&self, table: &str) -> i64 {
-        sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+        sqlx::query_scalar(AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
             .fetch_one(&self.admin)
             .await
             .expect("count")
@@ -380,61 +384,9 @@ async fn commit_one(w: &World, scope: &Scope, text: &str, subject: &str) -> Uuid
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn host_commit_adds_facts_in_one_embedding_batch() {
     let w = world().await;
-    let scope = Scope::agent("a1");
-    let mut knows = add_fact("Ada knows Bob", "Ada");
-    knows.object = Some(EntityRef {
-        name: "Bob".into(),
-        kind: "person".into(),
-    });
-    let mut tea = add_fact("Ada likes tea", "ada");
-    tea.valid_from = Some(date(2020));
-    let response = w
-        .host
-        .commit(
-            &ctx(),
-            commit_request(&scope, "chat text", vec![knows, tea]),
-            Trust::Agent,
-        )
-        .await
-        .expect("commit");
-
-    assert_eq!(response.facts.len(), 2);
-    assert!(response
-        .facts
-        .iter()
-        .all(|f| f.status == FactStatus::Active));
-    let episode = w
-        .store
-        .get_episode(&ctx(), response.episode_id)
-        .await
-        .expect("episode");
-    assert_eq!(
-        (episode.trust, episode.content.as_str()),
-        (Trust::Agent, "chat text")
-    );
-    assert!(episode.processed_at.is_some());
+    common::host_commit_adds_facts_in_one_embedding_batch(w.store.clone(), &w.host, &w.embedder)
+        .await;
     assert_eq!(w.count("entities").await, 2);
-
-    let knows = w
-        .store
-        .get_fact(&ctx(), response.facts[0].id)
-        .await
-        .expect("fact");
-    assert_eq!(knows.valid_from, episode.occurred_at);
-    assert!(knows.object_id.is_some());
-    let tea = w
-        .store
-        .get_fact(&ctx(), response.facts[1].id)
-        .await
-        .expect("fact");
-    assert_eq!(tea.valid_from, date(2020));
-    assert_eq!(tea.subject_id, knows.subject_id);
-
-    // One provider call, statements first, then each distinct entity.
-    assert_eq!(
-        w.embedder.batches(),
-        [["Ada knows Bob", "Ada likes tea", "ada", "bob"]]
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -495,29 +447,7 @@ async fn host_trust_is_clamped_and_gated() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn host_supersede_closes_the_old_fact() {
     let w = world().await;
-    let scope = Scope::agent("a1");
-    let old_id = commit_one(&w, &scope, "Ada lives in Rome", "Ada").await;
-
-    let mut fact = add_fact("Ada lives in Oslo", "Ada");
-    fact.supersedes = Some(old_id);
-    let response = w
-        .host
-        .commit(
-            &ctx(),
-            commit_request(&scope, "moved", vec![fact]),
-            Trust::Agent,
-        )
-        .await
-        .expect("commit");
-    assert_eq!(response.facts[0].status, FactStatus::Active);
-
-    let old = w.store.get_fact(&ctx(), old_id).await.expect("old");
-    assert_eq!(old.superseded_by, Some(response.facts[0].id));
-    assert!(old.valid_to.is_some());
-    assert_eq!(
-        w.recall_ids(&scope, "Ada lives in Rome", None).await,
-        vec![response.facts[0].id]
-    );
+    common::host_supersede_closes_the_old_fact(w.store.clone(), &w.host).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1489,21 +1419,8 @@ async fn a_different_statement_is_created_and_lists_the_similar_fact() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn matching_never_crosses_scopes_or_tenants() {
     let w = world().await;
-    let scope = Scope::agent("a1");
-    let globex = tenant_ctx("globex");
-    let other_scope = commit_as(&w, &ctx(), &Scope::agent("a2"), "Ada plays go", "Ada").await;
-    let other_tenant = commit_as(&w, &globex, &scope, "Ada plays go", "Ada").await;
-
-    let mine = commit_as(&w, &ctx(), &scope, "Ada plays go", "Ada").await;
-    assert!(!mine.corroborated);
-    assert_ne!(mine.id, other_scope.id);
-    assert_ne!(mine.id, other_tenant.id);
-    assert!(mine.related.is_empty(), "{:?}", mine.related);
+    common::matching_never_crosses_scopes_or_tenants(w.store.clone(), &w.host).await;
     assert_eq!(w.count("facts").await, 3);
-    for (ctx, foreign) in [(ctx(), other_scope.id), (globex, other_tenant.id)] {
-        let fact = w.store.get_fact(&ctx, foreign).await.expect("fact");
-        assert_eq!(fact.source_episode_ids.len(), 1);
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

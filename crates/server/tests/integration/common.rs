@@ -19,7 +19,7 @@ use memoryos_store::PgStore;
 use reqwest::{Method, StatusCode};
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
@@ -85,7 +85,7 @@ async fn start_postgres() -> String {
 
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}");
     let admin = connect_admin(&url).await;
-    sqlx::query(&format!("CREATE DATABASE {TEMPLATE_DB}"))
+    sqlx::query(AssertSqlSafe(format!("CREATE DATABASE {TEMPLATE_DB}")))
         .execute(&admin)
         .await
         .expect("create template");
@@ -151,10 +151,12 @@ pub async fn fresh_database() -> String {
     let base = &containers().postgres_url;
     let name = unique("db");
     let admin = connect_admin(base).await;
-    sqlx::query(&format!("CREATE DATABASE {name} TEMPLATE {TEMPLATE_DB}"))
-        .execute(&admin)
-        .await
-        .expect("clone template");
+    sqlx::query(AssertSqlSafe(format!(
+        "CREATE DATABASE {name} TEMPLATE {TEMPLATE_DB}"
+    )))
+    .execute(&admin)
+    .await
+    .expect("clone template");
     admin.close().await;
     format!("{base}/{name}")
 }
@@ -164,7 +166,7 @@ pub async fn empty_database() -> String {
     let base = &containers().postgres_url;
     let name = unique("empty");
     let admin = connect_admin(base).await;
-    sqlx::query(&format!("CREATE DATABASE {name}"))
+    sqlx::query(AssertSqlSafe(format!("CREATE DATABASE {name}")))
         .execute(&admin)
         .await
         .expect("create database");
@@ -176,7 +178,7 @@ pub async fn drop_database(url: &str) {
     let base = &containers().postgres_url;
     let name = url.rsplit('/').next().expect("database name");
     let admin = connect_admin(base).await;
-    sqlx::query(&format!("DROP DATABASE {name} WITH (FORCE)"))
+    sqlx::query(AssertSqlSafe(format!("DROP DATABASE {name} WITH (FORCE)")))
         .execute(&admin)
         .await
         .expect("drop database");
@@ -326,10 +328,11 @@ impl Drop for DropDatabase {
                 .expect("runtime")
                 .block_on(async {
                     let admin = connect_admin(&containers().postgres_url).await;
-                    let result =
-                        sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
-                            .execute(&admin)
-                            .await;
+                    let result = sqlx::query(AssertSqlSafe(format!(
+                        "DROP DATABASE IF EXISTS {name} WITH (FORCE)"
+                    )))
+                    .execute(&admin)
+                    .await;
                     admin.close().await;
                     result
                 })

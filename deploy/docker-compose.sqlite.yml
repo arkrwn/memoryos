@@ -1,0 +1,72 @@
+# SQLite + sqlite-vec, without a PostgreSQL container.
+# By hand: docker compose -f deploy/docker-compose.sqlite.yml up -d --build
+
+name: memoryos-sqlite
+
+x-image: &image
+  image: ${MEMORYOS_IMAGE:-memoryos:local}
+  build:
+    context: ${MEMORYOS_BUILD_CONTEXT:-..}
+    dockerfile: Dockerfile
+
+x-environment: &environment
+  MEMORYOS_STORE: sqlite
+  DATABASE_URL: sqlite:///var/lib/memoryos/data/memoryos.db
+  RUST_LOG: ${RUST_LOG:-info,opentelemetry=warn,opentelemetry_sdk=warn,hyper=warn}
+  MEMORYOS_RATE_LIMIT_RPS: ${MEMORYOS_RATE_LIMIT_RPS:-}
+  MEMORYOS_REQUEST_TIMEOUT_SECS: ${MEMORYOS_REQUEST_TIMEOUT_SECS:-}
+  MEMORYOS_RERANKER: ${MEMORYOS_RERANKER:-}
+  MEMORYOS_RERANK_TOP: ${MEMORYOS_RERANK_TOP:-}
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+
+services:
+  migrate:
+    <<: *image
+    command: [migrate]
+    restart: "no"
+    environment: *environment
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - sqlite-data:/var/lib/memoryos/data
+    healthcheck:
+      disable: true
+
+  memoryos:
+    <<: *image
+    command: [serve]
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment: *environment
+    mem_limit: ${MEMORYOS_MEM_LIMIT:-2560m}
+    stop_grace_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - ${MEMORYOS_PUBLISH:-127.0.0.1:8080}:8080
+    volumes:
+      - sqlite-data:/var/lib/memoryos/data
+      - model-cache:/var/lib/memoryos/models
+    healthcheck:
+      test: [CMD, /usr/local/bin/memoryos-healthcheck]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15m
+      start_interval: 5s
+
+volumes:
+  sqlite-data:
+  model-cache:

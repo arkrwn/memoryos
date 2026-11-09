@@ -21,7 +21,7 @@ use memoryos_store::PgStore;
 use pgvector::Vector;
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Row};
+use sqlx::{AssertSqlSafe, PgPool, Row};
 use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
@@ -91,7 +91,7 @@ async fn start_server() -> String {
 
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}");
     let admin = connect_with_retry(&format!("{url}/postgres")).await;
-    sqlx::query(&format!("CREATE DATABASE {TEMPLATE_DB}"))
+    sqlx::query(AssertSqlSafe(format!("CREATE DATABASE {TEMPLATE_DB}")))
         .execute(&admin)
         .await
         .expect("create template");
@@ -172,7 +172,7 @@ impl Drop for Db {
                 .expect("runtime")
                 .block_on(async {
                     let pool = connect_with_retry(&admin).await;
-                    let result = sqlx::query(&sql).execute(&pool).await;
+                    let result = sqlx::query(AssertSqlSafe(sql)).execute(&pool).await;
                     pool.close().await;
                     result
                 })
@@ -197,10 +197,12 @@ async fn db_with_pool(max_connections: u32) -> Db {
     let server = server_url();
     let name = format!("t{}", NEXT.fetch_add(1, Ordering::SeqCst));
     let bootstrap = connect_with_retry(&format!("{server}/postgres")).await;
-    sqlx::query(&format!("CREATE DATABASE {name} TEMPLATE {TEMPLATE_DB}"))
-        .execute(&bootstrap)
-        .await
-        .expect("clone template");
+    sqlx::query(AssertSqlSafe(format!(
+        "CREATE DATABASE {name} TEMPLATE {TEMPLATE_DB}"
+    )))
+    .execute(&bootstrap)
+    .await
+    .expect("clone template");
     bootstrap.close().await;
     let url = format!("{server}/{name}");
     Db {
@@ -316,7 +318,9 @@ async fn supersede(db: &Db, c: &RequestContext, old_fact_id: Uuid, new: NewFact)
 }
 
 async fn count(db: &Db, sql: &str) -> Res<i64> {
-    Ok(sqlx::query_scalar(sql).fetch_one(&db.admin).await?)
+    Ok(sqlx::query_scalar(AssertSqlSafe(sql))
+        .fetch_one(&db.admin)
+        .await?)
 }
 
 fn at(as_of: DateTime<Utc>) -> FactFilter {
@@ -1431,14 +1435,14 @@ async fn vector_search_returns_full_limit_under_a_selective_filter_on_the_hnsw_i
         "SET LOCAL enable_sort = off",
         "SET LOCAL enable_seqscan = off",
     ] {
-        sqlx::query(sql).execute(&mut *tx).await?;
+        sqlx::query(AssertSqlSafe(sql)).execute(&mut *tx).await?;
     }
     sqlx::query("SELECT set_config('app.tenant', 't1', true)")
         .execute(&mut *tx)
         .await?;
     let control = "SELECT id FROM facts WHERE scope = 'user:rare' \
                    ORDER BY embedding <=> $1 LIMIT 5";
-    let plan = sqlx::query(&format!("EXPLAIN {control}"))
+    let plan = sqlx::query(AssertSqlSafe(format!("EXPLAIN {control}")))
         .bind(Vector::from(axis(0)))
         .fetch_all(&mut *tx)
         .await?;
@@ -3078,7 +3082,9 @@ async fn row_level_security_holds_under_the_superuser_login() -> TestResult {
     for table in tables {
         let select = format!("SELECT count(*) FROM {table}");
         // The superuser login sees the row: the data exists and the tests below are not vacuous.
-        let total: i64 = sqlx::query_scalar(&select).fetch_one(&db.admin).await?;
+        let total: i64 = sqlx::query_scalar(AssertSqlSafe(select.as_str()))
+            .fetch_one(&db.admin)
+            .await?;
         assert!(total >= 1, "{table} is empty");
 
         for (tenant, expected) in [(Some("tenant-b"), 0), (None, 0), (Some("tenant-a"), total)] {
@@ -3092,7 +3098,9 @@ async fn row_level_security_holds_under_the_superuser_login() -> TestResult {
                     .execute(&mut *tx)
                     .await?;
             }
-            let seen: i64 = sqlx::query_scalar(&select).fetch_one(&mut *tx).await?;
+            let seen: i64 = sqlx::query_scalar(AssertSqlSafe(select.as_str()))
+                .fetch_one(&mut *tx)
+                .await?;
             assert_eq!(seen, expected, "{table} as {tenant:?}");
             tx.rollback().await?;
         }
@@ -3288,7 +3296,7 @@ async fn non_superuser_owner_login_runs_migration_tenancy_and_search() -> TestRe
         "GRANT memoryos_app TO svc",
         "CREATE DATABASE owned OWNER svc",
     ] {
-        sqlx::query(sql).execute(&bootstrap).await?;
+        sqlx::query(AssertSqlSafe(sql)).execute(&bootstrap).await?;
     }
     bootstrap.close().await;
     let superuser = connect_with_retry(&format!("{server}/owned")).await;

@@ -1,4 +1,4 @@
-//! PostgreSQL implementation of `MemoryStore`. See docs/SPEC.md section 2 for the public API.
+//! PostgreSQL and SQLite implementations of `MemoryStore`. See docs/SPEC.md section 2 for the public API.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -7,13 +7,18 @@ use memoryos_core::{
     Error, Fact, FactListState, FactView, RequestContext, Result, Scope, ScopeSummary, Trust,
 };
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx::{AssertSqlSafe, PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
+mod backend;
 mod facts;
 mod rows;
+mod sqlite;
 mod store_impl;
 mod validate;
+
+pub use backend::{Backend, Store};
+pub use sqlite::SqliteStore;
 
 use rows::FACT_COLS;
 
@@ -60,7 +65,7 @@ impl PgStore {
                  SELECT 1 FROM unnest($2::text[]) AS p(prefix) WHERE starts_with(f.scope, p.prefix))) \
              ORDER BY f.recorded_at, f.id LIMIT $3"
         );
-        let found = sqlx::query(&sql)
+        let found = sqlx::query(AssertSqlSafe(sql))
             .bind(validate::scope_strings(exact))
             .bind(prefixes)
             .bind(limit)
@@ -85,7 +90,10 @@ impl PgStore {
                  max(f.recorded_at) AS last_recorded_at \
              FROM facts f GROUP BY f.scope"
         );
-        let facts = sqlx::query(&sql).fetch_all(&mut *tx).await.map_err(db)?;
+        let facts = sqlx::query(AssertSqlSafe(sql))
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db)?;
         let entities: Vec<(String, i64)> =
             sqlx::query_as("SELECT scope, count(*) FROM entities GROUP BY scope")
                 .fetch_all(&mut *tx)
@@ -161,7 +169,7 @@ impl PgStore {
              ORDER BY f.id DESC LIMIT $3"
         );
         let mut tx = self.tenant_tx(ctx).await?;
-        let found = sqlx::query(&sql)
+        let found = sqlx::query(AssertSqlSafe(sql))
             .bind(scope.to_string())
             .bind(before)
             .bind(limit)
@@ -204,7 +212,7 @@ impl PgStore {
     }
 
     pub async fn migrate(&self) -> Result<()> {
-        sqlx::migrate!("../../migrations")
+        sqlx::migrate!("../../migrations/postgres")
             .run(&self.pool)
             .await
             .map_err(|e| Error::Storage(e.to_string()))

@@ -12,7 +12,7 @@ use memoryos_core::{
 };
 use pgvector::Vector;
 use serde_json::{json, Value};
-use sqlx::{PgConnection, Row};
+use sqlx::{AssertSqlSafe, PgConnection, Row};
 use uuid::Uuid;
 
 use crate::rows::{self, visible, API_KEY_COLS, BLOCK_COLS, ENTITY_COLS, EPISODE_COLS, FACT_COLS};
@@ -44,7 +44,7 @@ async fn tune_vector_scan(conn: &mut PgConnection, limit: i64) -> Result<()> {
 
 async fn load_fact(conn: &mut PgConnection, id: Uuid) -> Result<Fact> {
     let sql = format!("SELECT {FACT_COLS} FROM facts f WHERE f.id = $1");
-    let row = sqlx::query(&sql)
+    let row = sqlx::query(AssertSqlSafe(sql))
         .bind(id)
         .fetch_optional(conn)
         .await
@@ -112,7 +112,7 @@ impl MemoryStore for PgStore {
              VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8::timestamptz, now()), $9) \
              ON CONFLICT (tenant, idempotency_key) DO NOTHING RETURNING {EPISODE_COLS}"
         );
-        let inserted = sqlx::query(&sql)
+        let inserted = sqlx::query(AssertSqlSafe(sql))
             .bind(Uuid::now_v7())
             .bind(&ctx.tenant)
             .bind(episode.scope.to_string())
@@ -134,7 +134,7 @@ impl MemoryStore for PgStore {
                 let sql = format!(
                     "SELECT {EPISODE_COLS} FROM episodes WHERE tenant = $1 AND idempotency_key = $2"
                 );
-                sqlx::query(&sql)
+                sqlx::query(AssertSqlSafe(sql))
                     .bind(&ctx.tenant)
                     .bind(&episode.idempotency_key)
                     .fetch_one(&mut *tx)
@@ -168,7 +168,7 @@ impl MemoryStore for PgStore {
     async fn get_episode(&self, ctx: &RequestContext, id: Uuid) -> Result<Episode> {
         let mut tx = self.tenant_tx(ctx).await?;
         let sql = format!("SELECT {EPISODE_COLS} FROM episodes WHERE id = $1");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(AssertSqlSafe(sql))
             .bind(id)
             .fetch_optional(&mut *tx)
             .await
@@ -267,7 +267,7 @@ impl MemoryStore for PgStore {
              ON CONFLICT (tenant, scope, kind, normalized_name) DO NOTHING \
              RETURNING {ENTITY_COLS}"
         );
-        let inserted = sqlx::query(&sql)
+        let inserted = sqlx::query(AssertSqlSafe(sql))
             .bind(Uuid::now_v7())
             .bind(&ctx.tenant)
             .bind(&scope)
@@ -287,7 +287,7 @@ impl MemoryStore for PgStore {
                     "SELECT {ENTITY_COLS} FROM entities \
                      WHERE scope = $1 AND kind = $2 AND normalized_name = $3"
                 );
-                sqlx::query(&sql)
+                sqlx::query(AssertSqlSafe(sql))
                     .bind(&scope)
                     .bind(&entity.kind)
                     .bind(&normalized)
@@ -304,7 +304,7 @@ impl MemoryStore for PgStore {
     async fn get_entity(&self, ctx: &RequestContext, id: Uuid) -> Result<Entity> {
         let mut tx = self.tenant_tx(ctx).await?;
         let sql = format!("SELECT {ENTITY_COLS} FROM entities WHERE id = $1");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(AssertSqlSafe(sql))
             .bind(id)
             .fetch_optional(&mut *tx)
             .await
@@ -332,7 +332,7 @@ impl MemoryStore for PgStore {
                  WHERE scope = $2 ORDER BY distance LIMIT $3) \
              SELECT * FROM r ORDER BY distance + 0, id"
         );
-        let found = sqlx::query(&sql)
+        let found = sqlx::query(AssertSqlSafe(sql))
             .bind(query)
             .bind(scope.to_string())
             .bind(limit)
@@ -416,7 +416,7 @@ impl MemoryStore for PgStore {
         );
         let mut found = None;
         for sql in [&by_name, &by_alias] {
-            found = sqlx::query(sql)
+            found = sqlx::query(AssertSqlSafe(sql.as_str()))
                 .bind(&scope)
                 .bind(kind)
                 .bind(&normalized)
@@ -453,7 +453,7 @@ impl MemoryStore for PgStore {
              WHERE f.id IN (SELECT l.fact_id FROM fact_sources l WHERE l.episode_id = $1) \
              ORDER BY f.id"
         );
-        let found = sqlx::query(&sql)
+        let found = sqlx::query(AssertSqlSafe(sql))
             .bind(episode_id)
             .fetch_all(&mut *tx)
             .await
@@ -478,7 +478,7 @@ impl MemoryStore for PgStore {
              SELECT {FACT_COLS} FROM facts f JOIN chain c ON c.id = f.id \
              ORDER BY f.valid_from, f.recorded_at, f.id"
         );
-        let found = sqlx::query(&sql)
+        let found = sqlx::query(AssertSqlSafe(sql))
             .bind(id)
             .fetch_all(&mut *tx)
             .await
@@ -529,7 +529,7 @@ impl MemoryStore for PgStore {
         let sql = format!(
             "SELECT {FACT_COLS} FROM facts f WHERE f.id = $1 AND f.scope = $2 AND {filter}"
         );
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(AssertSqlSafe(sql))
             .bind(id)
             .bind(scope.to_string())
             .bind(None::<DateTime<Utc>>)
@@ -555,7 +555,7 @@ impl MemoryStore for PgStore {
              WHERE f.scope = $1 AND f.subject_id = $2 AND {filter} \
              ORDER BY f.valid_from DESC, f.id DESC LIMIT $5"
         );
-        let found = sqlx::query(&sql)
+        let found = sqlx::query(AssertSqlSafe(sql))
             .bind(scope.to_string())
             .bind(subject_id)
             .bind(None::<DateTime<Utc>>)
@@ -597,7 +597,7 @@ impl MemoryStore for PgStore {
              FROM r JOIN facts f ON f.id = r.rid \
              ORDER BY r.distance + 0, f.id"
         );
-        let found = sqlx::query(&sql)
+        let found = sqlx::query(AssertSqlSafe(sql))
             .bind(query)
             .bind(validate::scope_strings(scopes))
             .bind(filter.as_of)
@@ -634,7 +634,7 @@ impl MemoryStore for PgStore {
              JOIN facts f ON f.id = s.hit_id \
              ORDER BY s.hit_rank DESC, f.id"
         );
-        let found = sqlx::query(&sql)
+        let found = sqlx::query(AssertSqlSafe(sql))
             .bind(query)
             .bind(validate::scope_strings(scopes))
             .bind(filter.as_of)
@@ -664,7 +664,7 @@ impl MemoryStore for PgStore {
              WHERE f.scope = ANY($1) AND f.status = 'quarantined' \
              ORDER BY f.recorded_at, f.id LIMIT $2"
         );
-        let found = sqlx::query(&sql)
+        let found = sqlx::query(AssertSqlSafe(sql))
             .bind(validate::scope_strings(scopes))
             .bind(limit)
             .fetch_all(&mut *tx)
@@ -827,7 +827,7 @@ impl MemoryStore for PgStore {
                 tracing::debug!(%root, depth, edge_limit, "graph walk stopped at the edge limit");
                 break;
             }
-            let found = sqlx::query(&sql)
+            let found = sqlx::query(AssertSqlSafe(sql.as_str()))
                 .bind(&scope_texts)
                 .bind(&frontier)
                 .bind(filter.as_of)
@@ -853,7 +853,7 @@ impl MemoryStore for PgStore {
 
         let ids: Vec<Uuid> = seen.into_iter().collect();
         let sql = format!("SELECT {ENTITY_COLS} FROM entities WHERE id = ANY($1) ORDER BY id");
-        let found = sqlx::query(&sql)
+        let found = sqlx::query(AssertSqlSafe(sql))
             .bind(&ids)
             .fetch_all(&mut *tx)
             .await
@@ -870,7 +870,7 @@ impl MemoryStore for PgStore {
     async fn list_blocks(&self, ctx: &RequestContext, agent_id: &str) -> Result<Vec<Block>> {
         let mut tx = self.tenant_tx(ctx).await?;
         let sql = format!("SELECT {BLOCK_COLS} FROM blocks WHERE agent_id = $1 ORDER BY label");
-        let found = sqlx::query(&sql)
+        let found = sqlx::query(AssertSqlSafe(sql))
             .bind(agent_id)
             .fetch_all(&mut *tx)
             .await
@@ -883,7 +883,7 @@ impl MemoryStore for PgStore {
     async fn get_block(&self, ctx: &RequestContext, agent_id: &str, label: &str) -> Result<Block> {
         let mut tx = self.tenant_tx(ctx).await?;
         let sql = format!("SELECT {BLOCK_COLS} FROM blocks WHERE agent_id = $1 AND label = $2");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(AssertSqlSafe(sql))
             .bind(agent_id)
             .bind(label)
             .fetch_optional(&mut *tx)
@@ -924,7 +924,7 @@ impl MemoryStore for PgStore {
                      VALUES ($1, $2, $3, $4, $5, $6, 1) \
                      ON CONFLICT (tenant, agent_id, label) DO NOTHING RETURNING {BLOCK_COLS}"
                 );
-                sqlx::query(&sql)
+                sqlx::query(AssertSqlSafe(sql))
                     .bind(Uuid::now_v7())
                     .bind(&ctx.tenant)
                     .bind(agent_id)
@@ -943,7 +943,7 @@ impl MemoryStore for PgStore {
                      updated_at = now() \
                      WHERE agent_id = $3 AND label = $4 AND version = $5 RETURNING {BLOCK_COLS}"
                 );
-                sqlx::query(&sql)
+                sqlx::query(AssertSqlSafe(sql))
                     .bind(content)
                     .bind(max_chars)
                     .bind(agent_id)
@@ -1029,7 +1029,7 @@ impl MemoryStore for PgStore {
         let sql = format!(
             "SELECT {API_KEY_COLS} FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL"
         );
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(AssertSqlSafe(sql))
             .bind(key_hash)
             .fetch_optional(&self.pool)
             .await
@@ -1053,7 +1053,7 @@ impl MemoryStore for PgStore {
             "INSERT INTO api_keys (id, tenant, name, key_hash, scopes, max_trust, is_admin) \
              VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING {API_KEY_COLS}"
         );
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(AssertSqlSafe(sql))
             .bind(Uuid::now_v7())
             .bind(tenant)
             .bind(name)

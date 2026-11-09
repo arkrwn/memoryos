@@ -4,9 +4,10 @@ Goal: production-grade and ready to use. `docs/SPEC.md` section 12 defines done.
 
 ## Rules for every agent
 
-1. Read `docs/SPEC.md`, `crates/core/src/*` and `migrations/0001_init.sql` before writing code.
+1. Read `docs/SPEC.md`, `crates/core/src/*` and the backend schemas under `migrations/` before
+   writing code.
 2. Change only the paths your task owns. Add dependencies in your own crate's `Cargo.toml`, not
-   the workspace root. Do not edit `core`, the migration, the OpenAPI file or `PROGRESS.md`.
+   the workspace root. Do not edit `core`, the migrations, the OpenAPI file or `PROGRESS.md`.
 3. If a contract is wrong, do not work around it silently. Report it in your final message.
 4. Prove your work: run the gates from SPEC section 11 for your crate and report the actual output.
 5. Commit to your worktree branch with a `feat: <crate> | <what>` message. Never merge or push.

@@ -37,7 +37,7 @@ jobs:
       - name: Test
         run: >-
           cargo test --workspace --locked --no-fail-fast
-          --features memoryos-store/integration,memoryos-ingest/integration,memoryos-retrieve/integration,memoryos-eval/integration,memoryos-server/integration,memoryos-hooks/integration
+          --features memoryos-store/integration,memoryos-store/integration-sqlite,memoryos-ingest/integration,memoryos-ingest/integration-sqlite,memoryos-retrieve/integration,memoryos-retrieve/integration-sqlite,memoryos-eval/integration,memoryos-server/integration,memoryos-server/integration-sqlite,memoryos-hooks/integration
 
   deny:
     runs-on: ubuntu-24.04

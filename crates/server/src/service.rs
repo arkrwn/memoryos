@@ -11,7 +11,7 @@ use memoryos_core::{
 };
 use memoryos_ingest::{CommitRequest, CommitResponse, HostCommitter};
 use memoryos_retrieve::{RecallRequest, RecallResponse, Retriever};
-use memoryos_store::PgStore;
+use memoryos_store::Store;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -52,9 +52,7 @@ pub struct PutBlockRequest {
 }
 
 pub struct Services {
-    pub store: Arc<dyn MemoryStore>,
-    /// The same database as `store`. Prefix listing is not part of `MemoryStore`.
-    pub pg: PgStore,
+    pub store: Arc<Store>,
     pub retriever: Arc<Retriever>,
     pub committer: HostCommitter,
     pub metrics: Metrics,
@@ -125,7 +123,7 @@ impl Services {
     /// The scopes this key may read, most recently written first, and whether the list was cut.
     /// Only an admin can list quarantined facts, so only an admin sees how many there are.
     pub async fn list_scopes(&self, caller: &Caller) -> ApiResult<(Vec<ScopeSummary>, bool)> {
-        let mut scopes = self.pg.scope_summaries(&caller.ctx).await?;
+        let mut scopes = self.store.scope_summaries(&caller.ctx).await?;
         scopes.retain(|summary| caller.may_read(&summary.scope));
         scopes.sort_by_key(|summary| std::cmp::Reverse(summary.last_recorded_at));
         let truncated = scopes.len() > MAX_SCOPE_SUMMARIES;
@@ -155,7 +153,7 @@ impl Services {
         }
         let state = state.unwrap_or(FactListState::Current);
         Ok(self
-            .pg
+            .store
             .list_facts(&caller.ctx, scope, state, limit, before)
             .await?)
     }
@@ -234,7 +232,7 @@ impl Services {
             )));
         }
         let mut facts = self
-            .pg
+            .store
             .list_quarantined_matching(&caller.ctx, &selection.exact, &selection.prefixes, limit)
             .await?;
         // `select_scopes` already narrowed the query. This holds even if that logic is ever wrong.
@@ -346,7 +344,11 @@ impl Services {
         caller.require_admin()?;
         let scope = parse_scope("user", user_id)?;
         caller.require_scope(&scope)?;
-        if let Some(highest) = self.pg.highest_trust_in_scope(&caller.ctx, &scope).await? {
+        if let Some(highest) = self
+            .store
+            .highest_trust_in_scope(&caller.ctx, &scope)
+            .await?
+        {
             require_trust(caller, "stored memory", highest)?;
         }
         Ok(self.store.purge_scope(&caller.ctx, &scope).await?)
