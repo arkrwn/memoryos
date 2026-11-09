@@ -294,6 +294,19 @@ async fn sqlite_creates_private_files_without_changing_existing_parent_directori
     Ok(())
 }
 
+#[tokio::test]
+async fn in_memory_databases_are_refused() {
+    for url in [
+        "sqlite::memory:",
+        ":memory:",
+        "sqlite://:memory:",
+        "SQLITE::MEMORY:",
+        "sqlite:file:memoryos?mode=memory&cache=shared",
+    ] {
+        assert!(is_invalid(SqliteStore::connect(url).await), "{url}");
+    }
+}
+
 // ---- Episodes and atomic commits --------------------------------------------------------------
 
 #[tokio::test]
@@ -1282,8 +1295,10 @@ async fn purging_the_last_alias_source_removes_only_that_alias() -> TestResult {
     Ok(())
 }
 
+/// Matches PostgreSQL: discard drops the alias provenance by cascade but keeps the alias itself.
+/// Through ingest an unprocessed episode has earned no alias, so this only shows via the store API.
 #[tokio::test]
-async fn discarding_an_unprocessed_episode_removes_its_alias_provenance() -> TestResult {
+async fn discarding_an_unprocessed_episode_keeps_its_aliases_as_postgres_does() -> TestResult {
     let db = db().await?;
     let c = ctx("t1");
     let scope = user("u1");
@@ -1294,18 +1309,20 @@ async fn discarding_an_unprocessed_episode_removes_its_alias_provenance() -> Tes
         .await?;
 
     assert!(db.store.discard_unprocessed_episode(&c, source).await?);
-    assert!(db.store.get_entity(&c, subject).await?.aliases.is_empty());
+    assert_eq!(db.store.get_entity(&c, subject).await?.aliases, ["Bob"]);
     assert!(db
         .store
         .find_entity(&c, &scope, "thing", "bob")
         .await?
-        .is_none());
+        .is_some());
     assert!(is_not_found(db.store.get_episode(&c, source).await));
     Ok(())
 }
 
+/// Matches PostgreSQL: purge_scope leaves aliases on entities outside the scope. Through ingest an
+/// alias is only earned on an entity in the episode's own scope, so this only shows via the store API.
 #[tokio::test]
-async fn purging_a_scope_removes_aliases_it_earned_in_other_scopes() -> TestResult {
+async fn purging_a_scope_keeps_aliases_it_earned_in_other_scopes_as_postgres_does() -> TestResult {
     let db = db().await?;
     let c = ctx("t1");
     let source_scope = user("source");
@@ -1317,12 +1334,12 @@ async fn purging_a_scope_removes_aliases_it_earned_in_other_scopes() -> TestResu
         .await?;
 
     db.store.purge_scope(&c, &source_scope).await?;
-    assert!(db.store.get_entity(&c, subject).await?.aliases.is_empty());
+    assert_eq!(db.store.get_entity(&c, subject).await?.aliases, ["Bob"]);
     assert!(db
         .store
         .find_entity(&c, &entity_scope, "thing", "bob")
         .await?
-        .is_none());
+        .is_some());
     Ok(())
 }
 
@@ -1520,6 +1537,35 @@ async fn text_search_ranks_filters_scope_and_treats_punctuation_as_data() -> Tes
             .await?;
         assert!(result.is_empty(), "{hostile}");
     }
+
+    // A punctuation-only word is dropped, as PostgreSQL drops it, instead of matching nothing.
+    let punctuated = db
+        .store
+        .search_facts_text(
+            &c,
+            std::slice::from_ref(&scope),
+            "rust & nothing --",
+            &filter,
+            10,
+        )
+        .await?;
+    assert_eq!(scored_ids(punctuated), vec![weak]);
+    // `or` between terms is OR, as in PostgreSQL websearch syntax.
+    let either = db
+        .store
+        .search_facts_text(
+            &c,
+            std::slice::from_ref(&scope),
+            "\"rust rust\" or nothing",
+            &filter,
+            10,
+        )
+        .await?;
+    let mut either = scored_ids(either);
+    either.sort();
+    let mut both = vec![strong, weak];
+    both.sort();
+    assert_eq!(either, both);
     assert_eq!(
         db.store
             .list_facts(&c, &scope, FactListState::All, 10, None)

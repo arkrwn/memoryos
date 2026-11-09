@@ -161,7 +161,6 @@ impl MemoryStore for SqliteStore {
             tx.commit().await.map_err(db)?;
             return Ok(false);
         }
-        facts::remove_aliases_only_from(&mut tx, ctx, id).await?;
         sqlx::query("DELETE FROM episodes WHERE tenant = ?1 AND id = ?2")
             .bind(&ctx.tenant)
             .bind(id.to_string())
@@ -1240,11 +1239,22 @@ fn decode_json<T: serde::de::DeserializeOwned>(row: &SqliteRow, column: &str) ->
         .map_err(|e| Error::Storage(format!("column {column} holds invalid JSON: {e}")))
 }
 
-/// Builds an FTS5 expression from literal quoted terms. Quoted phrases and a leading `-` are
-/// recognized, but every piece of user text is escaped and bound; FTS operators are never injected.
+/// Builds an FTS5 expression from literal quoted terms, following PostgreSQL
+/// `websearch_to_tsquery`: quoted phrases, a leading `-` for negation, and `or` between two terms
+/// as OR, with AND binding tighter. Every piece of user text is escaped and quoted, so FTS
+/// operators are never injected. Terms with no letter or digit are dropped, as PostgreSQL drops
+/// them, because FTS5 would read them as a phrase that matches no row. FTS5 has no standalone NOT,
+/// so an OR group made only of negated terms is dropped; a query of only such groups matches
+/// nothing.
 fn safe_match_query(input: &str) -> Option<String> {
+    struct Term {
+        negated: bool,
+        quoted: bool,
+        text: String,
+    }
+
     let mut chars = input.chars().peekable();
-    let mut terms: Vec<(bool, String)> = Vec::new();
+    let mut terms: Vec<Term> = Vec::new();
     while chars.peek().is_some() {
         while chars.peek().is_some_and(|c| c.is_whitespace()) {
             chars.next();
@@ -1268,57 +1278,90 @@ fn safe_match_query(input: &str) -> Option<String> {
             chars.next();
         }
         let quoted = chars.next_if_eq(&'"').is_some();
-        let mut term = String::new();
+        let mut text = String::new();
         if quoted {
             let mut closed = false;
             while let Some(c) = chars.next() {
                 if c == '"' {
                     if chars.next_if_eq(&'"').is_some() {
-                        term.push('"');
+                        text.push('"');
                     } else {
                         closed = true;
                         break;
                     }
                 } else {
-                    term.push(c);
+                    text.push(c);
                 }
             }
             if !closed {
                 // Treat an unmatched quote as literal content rather than FTS syntax.
-                term.insert(0, '"');
+                text.insert(0, '"');
             }
         } else {
             for c in chars.by_ref() {
                 if c.is_whitespace() {
                     break;
                 }
-                term.push(c);
+                text.push(c);
             }
         }
-        if !term.is_empty() {
-            terms.push((negated, term));
+        if text.chars().any(char::is_alphanumeric) {
+            terms.push(Term {
+                negated,
+                quoted,
+                text,
+            });
         }
     }
-    if !terms.iter().any(|(negated, _)| !negated) {
-        return None;
+
+    // A bare `or` is an operator only between two terms. PostgreSQL reads a leading, trailing or
+    // repeated `or` as a word.
+    let mut groups: Vec<Vec<Term>> = vec![Vec::new()];
+    let mut previous_was_or = false;
+    let count = terms.len();
+    for (index, term) in terms.into_iter().enumerate() {
+        let is_or = !term.negated && !term.quoted && term.text.eq_ignore_ascii_case("or");
+        let current_has_term = groups.last().is_some_and(|group| !group.is_empty());
+        if is_or && !previous_was_or && current_has_term && index + 1 < count {
+            groups.push(Vec::new());
+            previous_was_or = true;
+            continue;
+        }
+        previous_was_or = false;
+        if let Some(group) = groups.last_mut() {
+            group.push(term);
+        }
     }
-    // Positive terms must precede NOT in FTS5. Reordering conjunctions does not change the match.
-    terms.sort_by_key(|(negated, _)| *negated);
-    let expression = terms
+
+    let quote = |text: &str| format!("\"{}\"", text.replace('"', "\"\""));
+    let groups: Vec<String> = groups
         .into_iter()
-        .enumerate()
-        .map(|(index, (negated, term))| {
-            let quoted = format!("\"{}\"", term.replace('"', "\"\""));
-            if index == 0 {
-                quoted
-            } else if negated {
-                format!(" NOT {quoted}")
-            } else {
-                format!(" AND {quoted}")
+        .filter(|group| group.iter().any(|term| !term.negated))
+        .map(|mut group| {
+            // Positive terms must precede NOT in FTS5. Reordering conjunctions does not change
+            // the match.
+            group.sort_by_key(|term| term.negated);
+            let mut expression = String::new();
+            for (index, term) in group.iter().enumerate() {
+                if index > 0 {
+                    expression.push_str(if term.negated { " NOT " } else { " AND " });
+                }
+                expression.push_str(&quote(&term.text));
             }
+            expression
         })
         .collect();
-    Some(expression)
+    match groups.len() {
+        0 => None,
+        1 => groups.into_iter().next(),
+        _ => Some(
+            groups
+                .iter()
+                .map(|group| format!("({group})"))
+                .collect::<Vec<_>>()
+                .join(" OR "),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1334,9 +1377,57 @@ mod tests {
         );
         assert_eq!(
             safe_match_query("'; DROP TABLE facts; --"),
-            Some("\"';\" AND \"DROP\" AND \"TABLE\" AND \"facts;\" AND \"--\"".into())
+            Some("\"DROP\" AND \"TABLE\" AND \"facts;\"".into())
         );
         assert_eq!(safe_match_query(""), None);
         assert_eq!(safe_match_query("-secret"), None);
+    }
+
+    #[test]
+    fn terms_without_letters_or_digits_are_dropped() {
+        assert_eq!(
+            safe_match_query("rust & go"),
+            Some("\"rust\" AND \"go\"".into())
+        );
+        assert_eq!(
+            safe_match_query("deploy -- staging / \"--\""),
+            Some("\"deploy\" AND \"staging\"".into())
+        );
+        assert_eq!(safe_match_query("& -- /"), None);
+    }
+
+    #[test]
+    fn or_between_terms_is_an_operator() {
+        assert_eq!(
+            safe_match_query("rust or go"),
+            Some("(\"rust\") OR (\"go\")".into())
+        );
+        assert_eq!(
+            safe_match_query("rust OR go"),
+            Some("(\"rust\") OR (\"go\")".into())
+        );
+        assert_eq!(
+            safe_match_query("a -b or c d"),
+            Some("(\"a\" NOT \"b\") OR (\"c\" AND \"d\")".into())
+        );
+        // Leading, trailing, repeated and quoted `or` stay words, as in PostgreSQL.
+        assert_eq!(
+            safe_match_query("or rust"),
+            Some("\"or\" AND \"rust\"".into())
+        );
+        assert_eq!(
+            safe_match_query("rust or"),
+            Some("\"rust\" AND \"or\"".into())
+        );
+        assert_eq!(
+            safe_match_query("rust or or go"),
+            Some("(\"rust\") OR (\"or\" AND \"go\")".into())
+        );
+        assert_eq!(
+            safe_match_query("\"or\" go"),
+            Some("\"or\" AND \"go\"".into())
+        );
+        // A group of only negated terms has no FTS5 form and is dropped.
+        assert_eq!(safe_match_query("a or -b"), Some("\"a\"".into()));
     }
 }

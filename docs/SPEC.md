@@ -388,8 +388,11 @@ to save.
 ## 13. Known limits
 
 - Text search uses the `simple` configuration on PostgreSQL and FTS5 on SQLite, with no stemming and
-  weak CJK tokenization. Their ranking scores and query languages are not identical. Vector search
-  covers those cases when embeddings are available.
+  weak CJK tokenization. Their ranking scores are not identical. SQLite follows PostgreSQL's
+  `websearch_to_tsquery` syntax (quoted phrases, `-` negation, `or` between terms), except that FTS5
+  has no standalone NOT: a query, or an `or` branch, made only of negated terms matches nothing on
+  SQLite, while PostgreSQL matches every fact without those words. Vector search covers those cases
+  when embeddings are available.
 - SQLite is a single-process embedded backend with one writer connection and exact cosine scans,
   not a multi-instance or HNSW-performance equivalent of PostgreSQL.
 - Embedding width is fixed at 384. Changing model needs re-embedding.

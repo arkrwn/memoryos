@@ -21,26 +21,29 @@ mod store_impl;
 
 use rows::FACT_COLS;
 
-/// SQLite-backed store. A single pooled connection serializes writers within this process and
-/// also keeps in-memory databases stable for the pool's lifetime.
+/// SQLite-backed store. A single pooled connection serializes writers within this process.
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
     pool: SqlitePool,
 }
 
 impl SqliteStore {
+    /// Opens a file database. In-memory databases are refused: `migrate` and `serve` run as
+    /// separate processes, so `serve` would start on an empty database with no tables.
     pub async fn connect(database_url: &str) -> Result<Self> {
+        if is_memory_url(database_url) {
+            return Err(Error::InvalidInput(
+                "SQLite needs a database file; in-memory databases are not supported".into(),
+            ));
+        }
         register_sqlite_vec()?;
-        let memory = is_memory_url(database_url);
-        let mut options = SqliteConnectOptions::from_str(database_url)
+        let options = SqliteConnectOptions::from_str(database_url)
             .map_err(db)?
             .create_if_missing(true)
             .foreign_keys(true)
-            .busy_timeout(Duration::from_secs(10));
-        if !memory {
-            options = options.journal_mode(SqliteJournalMode::Wal);
-        }
-        prepare_database_file(&options, memory)?;
+            .busy_timeout(Duration::from_secs(10))
+            .journal_mode(SqliteJournalMode::Wal);
+        prepare_database_file(&options)?;
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .acquire_timeout(Duration::from_secs(10))
@@ -52,7 +55,7 @@ impl SqliteStore {
             .fetch_one(&pool)
             .await
             .map_err(db)?;
-        restrict_database_files(&options, memory)?;
+        restrict_database_files(&options)?;
         Ok(Self { pool })
     }
 
@@ -271,12 +274,9 @@ impl SqliteStore {
 }
 
 #[cfg(unix)]
-fn prepare_database_file(options: &SqliteConnectOptions, memory: bool) -> Result<()> {
+fn prepare_database_file(options: &SqliteConnectOptions) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
-    if memory {
-        return Ok(());
-    }
     let path = options.get_filename();
     if let Some(parent) = path
         .parent()
@@ -302,17 +302,14 @@ fn prepare_database_file(options: &SqliteConnectOptions, memory: bool) -> Result
 }
 
 #[cfg(not(unix))]
-fn prepare_database_file(_options: &SqliteConnectOptions, _memory: bool) -> Result<()> {
+fn prepare_database_file(_options: &SqliteConnectOptions) -> Result<()> {
     Ok(())
 }
 
 #[cfg(unix)]
-fn restrict_database_files(options: &SqliteConnectOptions, memory: bool) -> Result<()> {
+fn restrict_database_files(options: &SqliteConnectOptions) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    if memory {
-        return Ok(());
-    }
     let path = options.get_filename();
     for suffix in ["", "-wal", "-shm"] {
         let mut name = path.as_os_str().to_os_string();
@@ -332,10 +329,11 @@ fn restrict_database_files(options: &SqliteConnectOptions, memory: bool) -> Resu
 }
 
 #[cfg(not(unix))]
-fn restrict_database_files(_options: &SqliteConnectOptions, _memory: bool) -> Result<()> {
+fn restrict_database_files(_options: &SqliteConnectOptions) -> Result<()> {
     Ok(())
 }
 
+/// `sqlite::memory:` and its spellings, and any URL opened with `mode=memory`.
 fn is_memory_url(database_url: &str) -> bool {
     let lower = database_url.trim().to_ascii_lowercase();
     lower.contains("mode=memory")

@@ -983,18 +983,6 @@ pub(super) async fn purge_scope(
     scope: &Scope,
 ) -> Result<PurgeReport> {
     let scope_text = scope.to_string();
-    let episode_ids: Vec<String> =
-        sqlx::query_scalar("SELECT id FROM episodes WHERE tenant = ?1 AND scope = ?2 ORDER BY id")
-            .bind(&ctx.tenant)
-            .bind(&scope_text)
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(db)?;
-    for episode_id in episode_ids {
-        let episode_id = Uuid::parse_str(&episode_id)
-            .map_err(|e| Error::Storage(format!("invalid episode UUID: {e}")))?;
-        remove_aliases_only_from(conn, ctx, episode_id).await?;
-    }
     sqlx::query(
         "DELETE FROM fact_embeddings WHERE rowid IN (\
              SELECT rowid FROM facts WHERE tenant = ?1 AND scope = ?2)",
