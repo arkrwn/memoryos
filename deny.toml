@@ -47,3 +47,5 @@ wildcards = "warn"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Pinned above 0.9.0 solely for the libsqlite3-sys 0.39 compatibility commit; remove after release.
+allow-git = ["https://github.com/launchbadge/sqlx"]

@@ -5,8 +5,9 @@
 **Long-term memory for AI agents that stays current, traceable and hard to poison.**
 
 ![Status: pre-release](https://img.shields.io/badge/status-pre--release-orange)
-![Rust 1.92+](https://img.shields.io/badge/rust-1.92%2B-b7410e?logo=rust)
+![Rust 1.94+](https://img.shields.io/badge/rust-1.94%2B-b7410e?logo=rust)
 ![Postgres + pgvector](https://img.shields.io/badge/postgres-pgvector-336791?logo=postgresql&logoColor=white)
+![SQLite + sqlite-vec](https://img.shields.io/badge/sqlite-sqlite--vec-003b57?logo=sqlite&logoColor=white)
 ![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)
 
 [Why MemoryOS](#-why-memoryos) · [Quickstart](#-quickstart) · [How it works](#-how-it-works) · [Security](#-security) · [Agent hooks](#-agent-hooks) · [Roadmap](#-roadmap) · [Docs](#-documentation)
@@ -85,6 +86,27 @@ memoryos quarantine approve <fact-id>
 
 Backups, upgrades and incidents are in the [runbook](docs/runbook.md).
 
+### SQLite embedded backend
+
+`memoryos setup` remains PostgreSQL-based. For a local SQLite database without a PostgreSQL server:
+
+```bash
+mkdir -p data
+export MEMORYOS_STORE=sqlite
+export DATABASE_URL="sqlite://$PWD/data/memoryos.db"
+cargo run --package memoryos-server -- migrate
+cargo run --package memoryos-server -- serve
+```
+
+Or use the isolated Compose stack, which persists the database in the `sqlite-data` volume:
+
+```bash
+docker compose -f deploy/docker-compose.sqlite.yml up -d --build
+```
+
+SQLite uses one writer connection, FTS5 and exact sqlite-vec cosine scans. It is intended for a
+single server process, not a multi-instance or HNSW-scale deployment.
+
 ## 👀 See your memory
 
 ```bash
@@ -154,7 +176,7 @@ flowchart TD
     A[Agents and apps] -->|REST or MCP| S[memoryos-server<br/>auth, scopes, limits, telemetry]
     S -->|commit| G[Trust gate]
     S -->|read| R[Hybrid retrieval<br/>vector + text + graph,<br/>then a local reranker]
-    G --> DB[(Postgres + pgvector)]
+    G --> DB[(Postgres + pgvector<br/>or SQLite + sqlite-vec)]
     R --> DB
 ```
 
@@ -178,8 +200,9 @@ Research shows a poisoned memory survives across sessions, unlike ordinary promp
 | Lower-trust statement contradicting higher-trust fact | Quarantined, and the original stays in place |
 | `user` or `system` statements otherwise | Active |
 
-- **Tenant isolation:** Postgres row-level security enforces it, so a missed filter in the code
-  cannot leak another tenant's data.
+- **Tenant isolation:** Postgres row-level security enforces it independently of query filters. The
+  embedded SQLite backend uses explicit tenant predicates and tenant-aware foreign keys, covered by
+  two-tenant integration tests; it does not claim RLS.
 - **Purging:** removing one bad source deletes what was derived only from it and restores any fact
   it had replaced.
 - **Audit trail:** approvals, rejections, retractions and purges are all recorded.
@@ -384,14 +407,14 @@ These are goals, not measured results:
 
 ## 🧪 Development
 
-Requires Rust 1.92+ and Docker. Integration tests start real Postgres containers. Do not
-use `cargo test --all-features`, which downloads the embedding model. The test feature list is in
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+Requires Rust 1.94+ and Docker for PostgreSQL integration tests. SQLite integration tests use local
+temporary files and need no Docker. Do not use `cargo test --all-features`, which downloads the
+embedding model. The test feature list is in [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --features memoryos-store/integration,memoryos-ingest/integration,memoryos-retrieve/integration,memoryos-eval/integration,memoryos-server/integration,memoryos-hooks/integration
+cargo test --workspace --features memoryos-store/integration,memoryos-store/integration-sqlite,memoryos-ingest/integration,memoryos-ingest/integration-sqlite,memoryos-retrieve/integration,memoryos-retrieve/integration-sqlite,memoryos-eval/integration,memoryos-server/integration,memoryos-server/integration-sqlite,memoryos-hooks/integration
 cargo deny check
 ```
 

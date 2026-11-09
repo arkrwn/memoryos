@@ -6,7 +6,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use memoryos_core::{ApiKey, RequestContext, Scope};
+use memoryos_core::{ApiKey, MemoryStore, RequestContext, Scope};
 use sha2::{Digest, Sha256};
 
 use crate::app::AppState;

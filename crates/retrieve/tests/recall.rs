@@ -6,6 +6,8 @@
 
 #![cfg(feature = "integration")]
 
+mod common;
+
 use std::collections::BTreeSet;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,7 +25,7 @@ use memoryos_retrieve::{RecallRequest, RecallResponse, Retriever};
 use memoryos_store::PgStore;
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
@@ -98,7 +100,7 @@ async fn start_postgres() -> String {
 
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}");
     let admin = connect_with_retry(&format!("{url}/postgres")).await;
-    sqlx::query(&format!("CREATE DATABASE {TEMPLATE_DB}"))
+    sqlx::query(AssertSqlSafe(format!("CREATE DATABASE {TEMPLATE_DB}")))
         .execute(&admin)
         .await
         .expect("create template");
@@ -183,7 +185,7 @@ impl Drop for Fixture {
                 .expect("runtime")
                 .block_on(async {
                     let pool = connect_with_retry(&format!("{server}/postgres")).await;
-                    let result = sqlx::query(&sql).execute(&pool).await;
+                    let result = sqlx::query(AssertSqlSafe(sql)).execute(&pool).await;
                     pool.close().await;
                     result
                 })
@@ -204,10 +206,12 @@ async fn fixture() -> Fixture {
     let server = postgres_url();
     let name = format!("recall_{}", NEXT_DB.fetch_add(1, Ordering::Relaxed));
     let admin = connect_with_retry(&format!("{}/postgres", server)).await;
-    sqlx::query(&format!("CREATE DATABASE {name} TEMPLATE {TEMPLATE_DB}"))
-        .execute(&admin)
-        .await
-        .expect("clone template");
+    sqlx::query(AssertSqlSafe(format!(
+        "CREATE DATABASE {name} TEMPLATE {TEMPLATE_DB}"
+    )))
+    .execute(&admin)
+    .await
+    .expect("clone template");
     admin.close().await;
 
     let url = format!("{}/{name}", server);
@@ -411,16 +415,14 @@ fn is_invalid<T>(result: memoryos_core::Result<T>) -> bool {
 #[tokio::test]
 async fn finds_a_fact_only_by_vector() {
     let f = fixture().await;
-    let subject = f.entity("a").await;
-    let target = f
-        .add(subject, "nothing in common with the query", 1.0)
-        .await;
-
-    let filter = FactFilter::default();
-    assert!(f.vector_hits(&filter).await.contains(&target));
-    assert!(!f.text_hits(&filter).await.contains(&target));
-
-    assert!(ids(&f.recall(QUERY).await.facts).contains(&target));
+    common::Scenario::new(
+        f.store.clone(),
+        f.embedder.clone(),
+        f.ctx.clone(),
+        f.scope.clone(),
+    )
+    .finds_a_fact_only_by_vector()
+    .await;
 }
 
 #[tokio::test]
@@ -717,24 +719,14 @@ async fn a_slow_reranker_times_out_and_recall_keeps_the_fused_order() {
 #[tokio::test]
 async fn superseded_fact_is_absent_now_and_present_with_as_of() {
     let f = fixture().await;
-    let subject = f.entity("a").await;
-    let old = f.add(subject, "the zebra lives in Paris", 1.0).await;
-    let mut replacement = new_fact(&f.scope, subject, "the zebra lives in Rome", 1.0);
-    replacement.valid_from = date(2022);
-    let op = FactOp::Supersede {
-        old_fact_id: old,
-        new: replacement,
-    };
-    let new = f.apply_in(&f.ctx, &f.scope, Trust::User, vec![op]).await[0];
-
-    let now = ids(&f.recall(QUERY).await.facts);
-    assert!(now.contains(&new) && !now.contains(&old));
-
-    let mut past = f.request(QUERY);
-    past.as_of = Some(date(2021));
-    let then = f.retriever.recall(&f.ctx, past).await.expect("recall");
-    let then = ids(&then.facts);
-    assert!(then.contains(&old) && !then.contains(&new));
+    common::Scenario::new(
+        f.store.clone(),
+        f.embedder.clone(),
+        f.ctx.clone(),
+        f.scope.clone(),
+    )
+    .superseded_fact_is_absent_now_and_present_with_as_of()
+    .await;
 }
 
 #[tokio::test]
@@ -807,23 +799,14 @@ async fn quarantined_and_rejected_facts_are_absent_from_every_list() {
 #[tokio::test]
 async fn other_tenant_is_absent() {
     let f = fixture().await;
-    let other = tenant("tenant-b");
-    let mine = f.add(f.entity("a").await, "a zebra was seen", 1.0).await;
-    let subject = f.entity_in(&other, &f.scope, "a").await;
-    let fact = new_fact(&f.scope, subject, "a zebra was seen", 1.0);
-    let theirs = f
-        .apply_in(&other, &f.scope, Trust::User, vec![FactOp::Add(fact)])
-        .await[0];
-
-    let response = f.recall(QUERY).await;
-    assert_eq!(ids(&response.facts), BTreeSet::from([mine]));
-
-    let response = f
-        .retriever
-        .recall(&other, f.request(QUERY))
-        .await
-        .expect("recall");
-    assert_eq!(ids(&response.facts), BTreeSet::from([theirs]));
+    common::Scenario::new(
+        f.store.clone(),
+        f.embedder.clone(),
+        f.ctx.clone(),
+        f.scope.clone(),
+    )
+    .other_tenant_is_absent()
+    .await;
 }
 
 #[tokio::test]

@@ -6,8 +6,9 @@ use crate::types::*;
 
 /// Persistence contract. Frozen after Wave 0: changes need an entry in docs/PROGRESS.md.
 ///
-/// Every `ctx` method must run in a transaction with row-level security applied for
-/// `ctx.tenant` (see docs/SPEC.md section 6). Reads never return another tenant's rows.
+/// Every `ctx` method must run in a transaction with tenant isolation applied for `ctx.tenant`
+/// (see docs/SPEC.md section 6). Reads never return another tenant's rows. Backends use row-level
+/// security where available and explicit tenant predicates otherwise.
 #[async_trait]
 pub trait MemoryStore: Send + Sync {
     // Episodes
@@ -97,7 +98,7 @@ pub trait MemoryStore: Send + Sync {
         subject_id: Uuid,
     ) -> Result<Vec<Fact>>;
     /// Vector search over active facts passing `filter`. Must still return up to `limit`
-    /// rows under selective filters (use pgvector iterative scan).
+    /// rows under selective filters.
     async fn search_facts_vector(
         &self,
         ctx: &RequestContext,

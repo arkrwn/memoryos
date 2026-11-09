@@ -1,5 +1,5 @@
 //! Creates one database and fills it through COPY, then builds the migration's indexes. All indexes
-//! come from `pg_indexes` after migrating, so they cannot drift from `migrations/0001_init.sql`.
+//! come from `pg_indexes` after migrating, so they cannot drift from `migrations/postgres/`.
 
 use std::fmt::Write as _;
 use std::time::Instant;

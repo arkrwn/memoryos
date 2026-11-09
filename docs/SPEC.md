@@ -1,10 +1,10 @@
 # MemoryOS specification
 
-MemoryOS is a memory service for AI agents: one Rust service on Postgres + pgvector, with one
-data model behind four capabilities. It never calls an LLM and needs no provider key: the agent's own
+MemoryOS is a memory service for AI agents: one Rust service on Postgres + pgvector or
+SQLite + sqlite-vec, with one data model behind four capabilities. It never calls an LLM and needs no provider key: the agent's own
 model, the host, decides what to remember and calls MemoryOS. MemoryOS never calls the host. The
-contracts are `crates/core/src/{types,store,embedder}.rs`, `migrations/0001_init.sql` and
-`docs/openapi.yaml`. If this file disagrees with them, stop and record it in `docs/PROGRESS.md`.
+contracts are `crates/core/src/{types,store,embedder}.rs`, `migrations/postgres/0001_init.sql`,
+`migrations/sqlite/0001_init.sql` and `docs/openapi.yaml`. If this file disagrees with them, stop and record it in `docs/PROGRESS.md`.
 
 ## 1. Capabilities
 
@@ -242,6 +242,10 @@ AND (invalidated_at IS NULL OR invalidated_at > K)
 - Only `*_api_key` and `ping` run outside that role. A non-superuser login needs
   `GRANT memoryos_app TO <login>`. Fact text search goes through the `SECURITY DEFINER` function in
   the migration, because GIN indexes are unusable under RLS.
+- SQLite has no RLS. Every tenant operation includes an explicit tenant predicate, tenant-aware
+  foreign keys reject cross-tenant references, and two-tenant integration tests cover every table
+  family. SQLite runs one connection to serialize writers; API keys remain cross-tenant because
+  authentication happens before the tenant is known.
 - API keys: bearer tokens `mos_<43 url-safe chars>` from 32 random bytes. Only the SHA-256 hex is
   stored. Each key has a tenant, scope patterns, `max_trust` and `is_admin`.
 - `server` must check `scope` against the key's patterns on every request, including reads by id,
@@ -330,9 +334,10 @@ adds a scope rule. A block update that omits `max_chars` keeps its limit.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `DATABASE_URL` | required | |
+| `MEMORYOS_STORE` | `postgres` | `postgres` or `sqlite` |
+| `DATABASE_URL` | required | PostgreSQL URL, or a `sqlite:` URL such as `sqlite:///absolute/path/memoryos.db` |
 | `MEMORYOS_BIND` | `0.0.0.0:8080` | |
-| `MEMORYOS_DB_MAX_CONNECTIONS` | `20` | |
+| `MEMORYOS_DB_MAX_CONNECTIONS` | `20` | PostgreSQL only; SQLite uses one connection |
 | `MEMORYOS_RATE_LIMIT_RPS` | `100` | Per key |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Traces are exported only when set |
 | `MEMORYOS_REQUEST_TIMEOUT_SECS` | `30` | |
@@ -348,9 +353,11 @@ reranker off.
 
 ## 11. Testing rules
 
-- Integration tests live in each crate's `tests/`, gated behind a cargo feature `integration`.
-  Run them with `cargo test -p <crate> --features integration`.
-- Integration tests use a real `pgvector/pgvector:pg17` container through `testcontainers`. The eval
+- PostgreSQL integration tests live in each crate's `tests/`, gated behind `integration`. Run them
+  with `cargo test -p <crate> --features integration`.
+- SQLite store, ingest, retrieval and server tests use `integration-sqlite` and temporary local
+  database files: `cargo test -p <crate> --features integration-sqlite`. They need no Docker.
+- PostgreSQL tests use a real `pgvector/pgvector:pg17` container through `testcontainers`. The eval
   harness also starts `wiremock/wiremock:3.3.1`, as a fake MemoryOS server.
 - Embeddings in tests come from `TestEmbedder` in `memoryos-embed`, feature `test-embedder`, so no test
   needs the 481 MB model. The server selects it when built with that feature and
@@ -358,7 +365,7 @@ reranker off.
   the Dockerfile's cargo commands enable no features.
 - `integration-local` on `memoryos-embed` runs the real models, the embedder and the reranker. It is
   off by default. Recall's reranking step is tested with fake rerankers.
-- Tenant isolation must be tested with two tenants against real Postgres.
+- Tenant isolation must be tested with two tenants against real Postgres and real SQLite files.
 - Run gates: `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
   `cargo test`, `cargo deny check`.
 
@@ -380,8 +387,11 @@ to save.
 
 ## 13. Known limits
 
-- Text search uses the `simple` configuration, with no stemming and weak CJK tokenization. Vector
-  search covers those cases when embeddings are available.
+- Text search uses the `simple` configuration on PostgreSQL and FTS5 on SQLite, with no stemming and
+  weak CJK tokenization. Their ranking scores and query languages are not identical. Vector search
+  covers those cases when embeddings are available.
+- SQLite is a single-process embedded backend with one writer connection and exact cosine scans,
+  not a multi-instance or HNSW-performance equivalent of PostgreSQL.
 - Embedding width is fixed at 384. Changing model needs re-embedding.
 - The rate limiter is in-process, so the limit applies per server instance.
 - Embedder errors log only the text before the first colon, because the rest can quote content. This

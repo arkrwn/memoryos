@@ -15,6 +15,8 @@ path = "src/main.rs"
 test-embedder = ["memoryos-embed/test-embedder"]
 # Enables tests/integration, which needs Docker with pgvector/pgvector:pg17.
 integration = ["test-embedder"]
+# Enables SQLite process/API tests using local temporary databases.
+integration-sqlite = ["test-embedder"]
 
 [dependencies]
 memoryos-core.workspace = true
@@ -50,7 +52,8 @@ uuid.workspace = true
 memoryos-sdk.workspace = true
 async-trait.workspace = true
 serde_yaml_ng = "0.10"
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio"] }
+sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio"] }
+tempfile = "3"
 testcontainers = "0.28"
 
 [lints]

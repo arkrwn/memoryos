@@ -11,7 +11,7 @@ use memoryos_core::{Embedder, MemoryStore, Reranker};
 use memoryos_embed::{LocalEmbedder, LocalReranker};
 use memoryos_ingest::HostCommitter;
 use memoryos_retrieve::Retriever;
-use memoryos_store::PgStore;
+use memoryos_store::Store;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tower_http::catch_panic::CatchPanicLayer;
@@ -81,22 +81,27 @@ pub async fn serve(
     listener: TcpListener,
     shutdown: CancellationToken,
 ) -> Result<(), String> {
-    let pg = PgStore::connect(&config.database_url, config.db_max_connections)
+    let store = Arc::new(
+        Store::connect(
+            config.store_backend,
+            &config.database_url,
+            config.db_max_connections,
+        )
         .await
-        .map_err(|e| format!("cannot connect to the database: {e}"))?;
-    let store: Arc<dyn MemoryStore> = Arc::new(pg.clone());
+        .map_err(|e| format!("cannot connect to the database: {e}"))?,
+    );
+    let memory_store: Arc<dyn MemoryStore> = store.clone();
     let embedder = build_embedder(&config)?;
     let (reranker, reranker_readiness) = build_reranker(&config);
-    let mut retriever = Retriever::new(store.clone(), embedder.clone());
+    let mut retriever = Retriever::new(memory_store.clone(), embedder.clone());
     if let Some(reranker) = &reranker {
         retriever = retriever.with_reranker(reranker.clone(), config.rerank_top);
     }
     let metrics = Metrics::new().map_err(|e| format!("cannot create metrics: {e}"))?;
     let services = Services {
-        store: store.clone(),
-        pg,
+        store,
         retriever: Arc::new(retriever),
-        committer: HostCommitter::new(store, embedder.clone())
+        committer: HostCommitter::new(memory_store, embedder.clone())
             .with_single_valued(config.single_valued.clone()),
         metrics: metrics.clone(),
     };

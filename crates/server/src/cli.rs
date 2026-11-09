@@ -10,13 +10,13 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use memoryos_core::{MemoryStore, Trust};
-use memoryos_store::PgStore;
+use memoryos_store::Store;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::auth::{generate_token, hash_token, validate_pattern};
-use crate::config::{database_url_from_env, Config};
+use crate::config::{database_from_env, Config};
 use crate::{app, telemetry, tui, ui};
 
 const ADMIN_DB_CONNECTIONS: u32 = 2;
@@ -154,9 +154,9 @@ async fn wait_for_signal() {
     }
 }
 
-async fn admin_store() -> Result<Arc<PgStore>, String> {
-    let url = database_url_from_env()?;
-    PgStore::connect(&url, ADMIN_DB_CONNECTIONS)
+async fn admin_store() -> Result<Arc<Store>, String> {
+    let (backend, url) = database_from_env()?;
+    Store::connect(backend, &url, ADMIN_DB_CONNECTIONS)
         .await
         .map(Arc::new)
         .map_err(|e| format!("cannot connect to the database: {e}"))

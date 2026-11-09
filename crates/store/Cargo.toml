@@ -8,16 +8,22 @@ license.workspace = true
 [features]
 # Enables tests/integration.rs, which needs Docker and the pgvector/pgvector:pg17 image.
 integration = []
+# Enables tests/sqlite.rs, which uses local temporary databases and needs no Docker.
+integration-sqlite = []
 
 [dependencies]
 memoryos-core.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
-# Pinned: later 0.4.x releases implement the sqlx traits for sqlx 0.9, not 0.8.
-pgvector = { version = "=0.4.1", features = ["sqlx"] }
+pgvector = { version = "=0.4.2", features = ["sqlx"] }
+serde.workspace = true
 serde_json.workspace = true
-sqlx = { version = "0.8", default-features = false, features = [
+# 0.1.10-alpha.4 omits sqlite-vec-diskann.c from its crates.io package and does not build.
+sqlite-vec = "=0.1.9"
+libsqlite3-sys = { version = "0.39.1", features = ["bundled"] }
+sqlx = { version = "0.9", default-features = false, features = [
     "postgres",
+    "sqlite",
     "runtime-tokio",
     "tls-rustls",
     "uuid",
@@ -31,6 +37,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 futures = "0.3"
+tempfile = "3"
 testcontainers = "0.28"
 tokio.workspace = true
 

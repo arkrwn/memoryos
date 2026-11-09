@@ -12,5 +12,5 @@ pub use reranker::Reranker;
 pub use store::MemoryStore;
 pub use types::*;
 
-/// Embedding width fixed by `migrations/0001_init.sql`. See ADR 0003.
+/// Embedding width fixed by both backend schemas. See ADR 0003.
 pub const EMBEDDING_DIMS: usize = 384;

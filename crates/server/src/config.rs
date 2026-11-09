@@ -6,9 +6,11 @@ use std::time::Duration;
 
 use memoryos_ingest::SingleValued;
 use memoryos_retrieve::DEFAULT_RERANK_TOP;
+use memoryos_store::Backend;
 
 #[derive(Clone)]
 pub struct Config {
+    pub store_backend: Backend,
     pub database_url: String,
     pub bind: String,
     pub db_max_connections: u32,
@@ -36,6 +38,7 @@ impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
             .field("bind", &self.bind)
+            .field("store_backend", &self.store_backend)
             .field("database_url", &"[REDACTED]")
             .finish_non_exhaustive()
     }
@@ -51,9 +54,11 @@ impl Config {
     /// An empty variable counts as unset, as it does for most tools reading the same environment.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> ConfigResult<Self> {
         let get = |name: &str| lookup(name).filter(|value| !value.trim().is_empty());
+        let (store_backend, database_url) = database_from(&get)?;
 
         Ok(Self {
-            database_url: database_url_from(&get)?,
+            store_backend,
+            database_url,
             bind: get("MEMORYOS_BIND").unwrap_or_else(|| "0.0.0.0:8080".into()),
             db_max_connections: number(&get, "MEMORYOS_DB_MAX_CONNECTIONS", 20)?,
             rate_limit_rps: number(&get, "MEMORYOS_RATE_LIMIT_RPS", 100)?,
@@ -82,12 +87,20 @@ impl Config {
 }
 
 /// For the commands that only touch the database.
-pub fn database_url_from_env() -> ConfigResult<String> {
-    database_url_from(&|name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty()))
+pub fn database_from_env() -> ConfigResult<(Backend, String)> {
+    database_from(&|name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty()))
 }
 
-fn database_url_from(get: &impl Fn(&str) -> Option<String>) -> ConfigResult<String> {
-    get("DATABASE_URL").ok_or_else(|| "DATABASE_URL is required".to_owned())
+fn database_from(get: &impl Fn(&str) -> Option<String>) -> ConfigResult<(Backend, String)> {
+    let backend = get("MEMORYOS_STORE")
+        .map(|value| value.parse())
+        .transpose()?
+        .unwrap_or(Backend::Postgres);
+    let url = get("DATABASE_URL").ok_or_else(|| "DATABASE_URL is required".to_owned())?;
+    if backend == Backend::Sqlite && !url.starts_with("sqlite:") {
+        return Err("DATABASE_URL must be a sqlite URL when MEMORYOS_STORE=sqlite".into());
+    }
+    Ok((backend, url))
 }
 
 fn reranker_mode(get: &impl Fn(&str) -> Option<String>) -> ConfigResult<RerankerMode> {
@@ -141,6 +154,7 @@ mod tests {
     #[test]
     fn only_the_database_is_required() {
         let config = load(&[DB]).expect("valid");
+        assert_eq!(config.store_backend, Backend::Postgres);
         assert_eq!(config.rate_limit_rps, 100);
         assert_eq!(config.bind, "0.0.0.0:8080");
     }
@@ -156,6 +170,22 @@ mod tests {
     fn bad_values_name_the_variable() {
         let bad_rate = load(&[DB, ("MEMORYOS_RATE_LIMIT_RPS", "0")]);
         assert!(message(bad_rate).contains("MEMORYOS_RATE_LIMIT_RPS"));
+    }
+
+    #[test]
+    fn sqlite_backend_requires_a_sqlite_url() {
+        let config = load(&[
+            ("MEMORYOS_STORE", "sqlite"),
+            ("DATABASE_URL", "sqlite:///tmp/memoryos.db"),
+        ])
+        .expect("valid sqlite config");
+        assert_eq!(config.store_backend, Backend::Sqlite);
+        assert!(message(load(&[
+            ("MEMORYOS_STORE", "sqlite"),
+            ("DATABASE_URL", "postgres://x"),
+        ]))
+        .contains("sqlite URL"));
+        assert!(message(load(&[("MEMORYOS_STORE", "mysql"), DB])).contains("MEMORYOS_STORE"));
     }
 
     #[test]
