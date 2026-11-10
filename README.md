@@ -78,8 +78,8 @@ make local-setup local-import local-start
 
 It copies every fact, episode, entity, API key and audit event, prints how many facts it copied, and
 starts the local server on the same address, so hooks, MCP and `credentials.json` keep working
-unchanged. The Docker containers are stopped and their volumes kept, so you can go back with
-`make docker-upgrade`.
+unchanged. The Docker containers are stopped and their volumes kept as they were at the move;
+nothing saved after it goes back to Docker.
 
 | | |
 |---|---|
