@@ -3,7 +3,8 @@
 #   make setup              once per machine: Postgres, the database and the binary
 #   make import-docker      once, to copy the data of a Docker install (Docker must be running)
 #   make start              start Postgres and the server, also after a reboot
-#   make / make upgrade     after pulling new code
+#   make / make upgrade     after pulling new code; on a machine still on Docker (no native
+#                           cluster yet) it rebuilds and restarts the Docker server instead
 #
 # Postgres listens on localhost only and trusts local connections, so no password is needed.
 
@@ -13,6 +14,7 @@ PGDATA := $(DIR)/postgres
 PORT ?= 6432
 BIN := $(HOME)/.cargo/bin/memoryos
 PSQL_ARGS := -h localhost -p $(PORT) -U memoryos
+COMPOSE := docker compose -f $(HOME)/.config/memoryos/docker-compose.yml
 
 export DATABASE_URL := postgres://memoryos@localhost:$(PORT)/memoryos
 export MEMORYOS_BIND ?= 127.0.0.1:8080
@@ -20,10 +22,16 @@ export RUST_LOG ?= info,opentelemetry=warn,opentelemetry_sdk=warn,hyper=warn
 
 .PHONY: upgrade setup import-docker start start-db install
 
+ifneq ($(wildcard $(PGDATA)/PG_VERSION),)
 upgrade: install start-db
 	$(BIN) migrate
 	$(MAKE) start
 	cargo clean
+else
+upgrade: install
+	$(COMPOSE) up -d --build --wait memoryos
+	cargo clean
+endif
 
 setup: install
 	brew install postgresql@18 pgvector
