@@ -70,6 +70,17 @@ list them.
 | Start, also after a reboot | Docker restarts it | `make local-start` |
 | After pulling new code | `make docker-upgrade` | `make local-upgrade` |
 
+To move a Docker install to local with its data, run this with Docker running:
+
+```bash
+make local-setup local-import local-start
+```
+
+It copies every fact, episode, entity, API key and audit event, prints how many facts it copied, and
+starts the local server on the same address, so hooks, MCP and `credentials.json` keep working
+unchanged. The Docker containers are stopped and their volumes kept, so you can go back with
+`make docker-upgrade`.
+
 | | |
 |---|---|
 | 📁 **Where things live** | `~/.config/memoryos`: `credentials.json` (mode 0600), the database and the generated password |
