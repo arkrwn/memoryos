@@ -61,14 +61,14 @@ The server container needs up to 2.5 GiB of memory with both models (`MEMORYOS_M
 `setup` starts Postgres and the server through Compose, creates two keys, and connects the agent over
 `memoryos mcp`, a local stdio proxy. Agent configuration holds no key and no reference to one.
 
-To run natively on macOS instead of in Docker, run `make setup import-docker start` in the checkout
-once: `setup` installs the binary and Homebrew Postgres 18 + pgvector and creates the database on
-localhost:6432, `import-docker` copies the data and keys of the Docker install (leave it out on a new
-machine), and `start` starts the server. After a reboot, run `make start`.
+The checkout's Makefile has one set of commands for each way of running it on macOS. Run `make` to
+list them.
 
-To upgrade after pulling new code, run `make upgrade` (or just `make`) in the checkout. It reinstalls
-the `memoryos` binary, applies migrations, restarts the server, and then runs `cargo clean`. Data and
-keys are kept.
+| | Docker | Local (Homebrew Postgres on localhost:6432, no Docker) |
+|---|---|---|
+| Once per machine | `make docker-setup` | `make local-setup`, then `make local-import` to copy a Docker install's data and keys |
+| Start, also after a reboot | Docker restarts it | `make local-start` |
+| After pulling new code | `make docker-upgrade` | `make local-upgrade` |
 
 | | |
 |---|---|
@@ -151,7 +151,7 @@ read from the prompt cache.
 
 The page is on your machine only. It never receives an API key: it calls a small local proxy that
 forwards a fixed list of reads plus approve and reject, and it cannot purge, retract or write facts.
-After upgrading from an older install, update the server with `make upgrade`.
+After upgrading from an older install, update the server with `make docker-upgrade` or `make local-upgrade`.
 
 ## 🔍 Example
 
