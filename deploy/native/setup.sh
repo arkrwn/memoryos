@@ -35,6 +35,12 @@ has_docker_pg() {
 	command -v docker >/dev/null && docker inspect "$DOCKER_PG" >/dev/null 2>&1
 }
 
+# With Docker installed but not running, `docker inspect` fails and the Docker data would be silently
+# skipped. Ask for Docker before anything is created.
+if command -v docker >/dev/null && ! docker info >/dev/null 2>&1; then
+	fail "Docker is installed but not running. Start Docker Desktop so the data of a Docker install can be copied, then run \`make setup\` again"
+fi
+
 # --- Postgres 18 and pgvector -------------------------------------------------------------------
 for formula in postgresql@18 pgvector; do
 	brew list --versions "$formula" >/dev/null || { say "installing $formula"; brew install "$formula"; }
@@ -57,6 +63,9 @@ fi
 mkdir -p "$DATA_DIR" "$CONFIG_DIR" "$AGENTS"
 chmod 700 "$DATA_DIR" "$CONFIG_DIR"
 if [ ! -f "$PGDATA/PG_VERSION" ]; then
+	if lsof -nP -iTCP:"$PG_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+		fail "port $PG_PORT is taken. Run \`PG_PORT=<free port> make setup\`"
+	fi
 	say "creating the Postgres cluster in $PGDATA"
 	pwfile=$(mktemp)
 	chmod 600 "$pwfile"
@@ -158,19 +167,37 @@ done
 # --- Database, with the Docker data on the first run --------------------------------------------
 export PGHOST=localhost PGPORT=$PG_PORT PGUSER=memoryos PGPASSWORD=$password
 if [ -z "$("$PGBIN/psql" -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = 'memoryos'")" ]; then
-	"$PGBIN/psql" -d postgres -qc "CREATE DATABASE memoryos OWNER memoryos"
+	dump=
 	if has_docker_pg; then
 		say "copying the data from the Docker container $DOCKER_PG"
-		docker start "$DOCKER_PG" >/dev/null
 		docker stop "$DOCKER_SERVER" >/dev/null 2>&1 || true
+		docker start "$DOCKER_PG" >/dev/null
+		i=0
+		until docker exec "$DOCKER_PG" pg_isready -q -U memoryos -d memoryos; do
+			i=$((i + 1))
+			[ "$i" -lt 60 ] || fail "the Docker Postgres $DOCKER_PG did not start"
+			sleep 1
+		done
 		mkdir -p -m 700 "$DATA_DIR/backup"
-		dump=$DATA_DIR/backup/memoryos-docker-$(date +%Y-%m-%d).dump
-		docker exec "$DOCKER_PG" pg_dump -U memoryos -d memoryos -Fc >"$dump"
+		dump=$DATA_DIR/backup/memoryos-docker-$(date +%Y-%m-%d-%H%M%S).dump
+		docker exec "$DOCKER_PG" pg_dump -U memoryos -d memoryos -Fc >"$dump" ||
+			fail "pg_dump of $DOCKER_PG failed"
 		chmod 600 "$dump"
-		"$PGBIN/psql" -d postgres -qc "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'memoryos_app') THEN CREATE ROLE memoryos_app NOLOGIN; END IF; END \$\$"
-		"$PGBIN/pg_restore" -d memoryos --exit-on-error "$dump"
+		docker_facts=$(docker exec "$DOCKER_PG" psql -U memoryos -d memoryos -tAc 'SELECT count(*) FROM facts')
 		docker stop "$DOCKER_PG" >/dev/null
-		say "copied $("$PGBIN/psql" -d memoryos -tAc 'SELECT count(*) FROM facts') facts, backup kept at $dump"
+	fi
+	"$PGBIN/psql" -d postgres -qc "CREATE DATABASE memoryos OWNER memoryos"
+	if [ -n "$dump" ]; then
+		"$PGBIN/psql" -d postgres -qc "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'memoryos_app') THEN CREATE ROLE memoryos_app NOLOGIN; END IF; END \$\$"
+		# A half-restored database would make the next run skip the copy, so it is dropped on failure.
+		if ! "$PGBIN/pg_restore" -d memoryos --exit-on-error "$dump"; then
+			"$PGBIN/psql" -d postgres -qc "DROP DATABASE memoryos"
+			fail "restoring $dump failed; nothing was kept, run \`make setup\` again after fixing the error above"
+		fi
+		native_facts=$("$PGBIN/psql" -d memoryos -tAc 'SELECT count(*) FROM facts')
+		[ "$native_facts" = "$docker_facts" ] ||
+			fail "Docker has $docker_facts facts but the native database has $native_facts"
+		say "copied $native_facts facts, the dump is kept at $dump"
 	fi
 fi
 unset PGPASSWORD
@@ -182,13 +209,13 @@ say "applying migrations"
 (set -a; . "$ENV_FILE"; set +a; "$BIN" migrate)
 
 # --- Server -------------------------------------------------------------------------------------
-say "starting the server on $SERVER_ADDR"
-reload "$SERVER_AGENT"
 addr=$(sed -n 's/^MEMORYOS_BIND=//p' "$ENV_FILE")
+say "starting the server on $addr (the first start downloads the models and can take a few minutes)"
+reload "$SERVER_AGENT"
 i=0
 until curl -fs -o /dev/null "http://$addr/readyz"; do
 	i=$((i + 1))
-	[ "$i" -lt 120 ] || fail "the server was not ready after 2 minutes, see $DATA_DIR/server.log"
+	[ "$i" -lt 600 ] || fail "the server was not ready after 10 minutes, see $DATA_DIR/server.log"
 	sleep 1
 done
 say "MemoryOS is running on http://$addr"
