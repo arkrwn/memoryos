@@ -1,46 +1,63 @@
-# Rebuild and restart a local MemoryOS after pulling or changing code: `make` or `make upgrade`.
-# The binary is copied into ~/.cargo/bin rather than symlinked, because a link into target/ would
-# break on the `cargo clean` that ends the upgrade.
+# MemoryOS on macOS, native: Homebrew Postgres 18 + pgvector and `memoryos serve`.
 #
-# The server runs natively: `memoryos serve` with the settings in $(CONFIG_DIR)/server.env, under
-# the launchd agent $(AGENT) when it is loaded, otherwise as a background process logging to
-# $(LOG).
+#   make setup              once per machine: Postgres, the database and the binary
+#   make import-docker      once, to copy the data of a Docker install (Docker must be running)
+#   make start              start Postgres and the server, also after a reboot
+#   make / make upgrade     after pulling new code
+#
+# Postgres listens on localhost only and trusts local connections, so no password is needed.
 
-CONFIG_DIR ?= $(HOME)/.config/memoryos
-DATA_DIR ?= $(HOME)/.local/share/memoryos
-ENV_FILE := $(CONFIG_DIR)/server.env
-LOG := $(DATA_DIR)/server.log
-AGENT := gui/$(shell id -u)/dev.memoryos.server
+PG := $(shell brew --prefix postgresql@18 2>/dev/null)/bin
+DIR := $(HOME)/.local/share/memoryos
+PGDATA := $(DIR)/postgres
+PORT ?= 6432
 BIN := $(HOME)/.cargo/bin/memoryos
-READY_URL ?= http://127.0.0.1:8080/readyz
+PSQL_ARGS := -h localhost -p $(PORT) -U memoryos
 
-.PHONY: upgrade install migrate server clean
+export DATABASE_URL := postgres://memoryos@localhost:$(PORT)/memoryos
+export MEMORYOS_BIND ?= 127.0.0.1:8080
+export RUST_LOG ?= info,opentelemetry=warn,opentelemetry_sdk=warn,hyper=warn
 
-upgrade: install migrate server clean
+.PHONY: upgrade setup import-docker start start-db install
 
-# The `memoryos` command the hooks, the MCP proxy and the server run.
+upgrade: install start-db
+	$(BIN) migrate
+	$(MAKE) start
+	cargo clean
+
+setup: install
+	brew install postgresql@18 pgvector
+	mkdir -p $(DIR)
+	$(PG)/initdb -D $(PGDATA) -U memoryos --auth=trust -E UTF8 --locale=C
+	$(MAKE) start-db
+	$(PG)/createdb $(PSQL_ARGS) memoryos
+	$(BIN) migrate
+	cargo clean
+
+# Replaces the native database with the Docker one, so run it before `make start`.
+import-docker: start-db
+	-docker stop memoryos-memoryos-1
+	docker start memoryos-postgres-1
+	until docker exec memoryos-postgres-1 pg_isready -q -U memoryos; do sleep 1; done
+	$(PG)/dropdb $(PSQL_ARGS) --if-exists memoryos
+	$(PG)/createdb $(PSQL_ARGS) memoryos
+	$(BIN) migrate
+	docker exec memoryos-postgres-1 pg_dump -U memoryos -Fc --data-only --exclude-table-data=_sqlx_migrations memoryos | \
+		$(PG)/pg_restore $(PSQL_ARGS) -d memoryos --data-only --disable-triggers --exit-on-error
+	docker stop memoryos-postgres-1
+	$(PG)/psql $(PSQL_ARGS) -d memoryos -tAc "SELECT count(*) || ' facts copied' FROM facts"
+
+start-db:
+	$(PG)/pg_ctl -D $(PGDATA) status >/dev/null || $(PG)/pg_ctl -D $(PGDATA) -o "-p $(PORT)" -l $(DIR)/postgres.log start
+
+# Starts the server, or restarts it when it is already running.
+start: start-db
+	-pkill -f "$(BIN) serve"
+	nohup $(BIN) serve >> $(DIR)/server.log 2>&1 &
+	until curl -fs -o /dev/null http://$(MEMORYOS_BIND)/readyz; do sleep 1; done
+	@echo "memoryos is running on http://$(MEMORYOS_BIND)"
+
+# The `memoryos` command the hooks, the MCP proxy and the server run. Copied, not symlinked, because
+# a link into target/ would break on `cargo clean`.
 install:
 	cargo install --locked --force --path crates/server
-
-# `memoryos serve` does not migrate, so new migrations are applied before the restart.
-migrate:
-	set -a; . $(ENV_FILE); set +a; $(BIN) migrate
-
-# Restarts the server on the new binary and waits up to 60 s until it is ready.
-server:
-	@if launchctl print $(AGENT) >/dev/null 2>&1; then \
-		launchctl kickstart -k $(AGENT); \
-	else \
-		pkill -f "memoryos serve" || true; \
-		sleep 1; \
-		mkdir -p $(DATA_DIR); \
-		( set -a; . $(ENV_FILE); set +a; nohup $(BIN) serve >>$(LOG) 2>&1 & ); \
-	fi
-	@for i in $$(seq 60); do \
-		curl -fs -o /dev/null $(READY_URL) && echo "memoryos is ready" && exit 0; \
-		sleep 1; \
-	done; \
-	echo "memoryos did not become ready; see $(LOG)"; exit 1
-
-clean:
-	cargo clean
