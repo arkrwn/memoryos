@@ -61,15 +61,14 @@ The server container needs up to 2.5 GiB of memory with both models (`MEMORYOS_M
 `setup` starts Postgres and the server through Compose, creates two keys, and connects the agent over
 `memoryos mcp`, a local stdio proxy. Agent configuration holds no key and no reference to one.
 
-To run the server natively on macOS instead of in Docker, run `make setup` in the checkout. It
-installs the `memoryos` binary, creates a Postgres 18 + pgvector cluster in
-`~/.local/share/memoryos/postgres` on port 6432, writes `~/.config/memoryos/server.env`, copies the
-data and keys over from the Docker install when there is one, and installs launchd agents that keep
-Postgres and the server running. Running it again keeps the data and settings.
+To run natively on macOS instead of in Docker, run `make setup import-docker start` in the checkout
+once: `setup` installs the binary and Homebrew Postgres 18 + pgvector and creates the database on
+localhost:6432, `import-docker` copies the data and keys of the Docker install (leave it out on a new
+machine), and `start` starts the server. After a reboot, run `make start`.
 
 To upgrade after pulling new code, run `make upgrade` (or just `make`) in the checkout. It reinstalls
-the `memoryos` binary, applies migrations, restarts the native server, waits until it is ready, and
-then runs `cargo clean`. Data and keys are kept.
+the `memoryos` binary, applies migrations, restarts the server, and then runs `cargo clean`. Data and
+keys are kept.
 
 | | |
 |---|---|
